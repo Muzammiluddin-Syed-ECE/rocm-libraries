@@ -2403,6 +2403,21 @@ class LogicalScheduler:
                     ))
         return result
 
+    def _make_initD_op(self) -> InlineModuleOp:
+        """Create an InlineModuleOp that zeros accumulator registers (initD).
+
+        For PGR>=1 the op is placed between GR issue and WaitGR in the preloop
+        so the MFMA zeroing instructions execute while global reads are in
+        flight, hiding their latency behind the memory access time. For PGR=0
+        there are no global reads, so this op is the entire preloop and simply
+        zeros the accumulators before the mainloop's first accumulating MFMA.
+        """
+        def _build_initD(emitter):
+            from Tensile.Components.Subtile.Kernel import initVgprTilesToZero
+            return initVgprTilesToZero(emitter.writer, emitter.kernel,
+                                       emitter.dtileInfo)
+        return InlineModuleOp(build=_build_initD, label="initD_overlap")
+
     def build_preloop(self) -> List[List[List[EmittedModule]]]:
         """Build preloop: pipeline initialization sequence before mainloop.
 
@@ -2423,7 +2438,11 @@ class LogicalScheduler:
         Returns [1 partition][1 subIterK][EmittedModules] to match emit() shape.
         """
         if self.config.pgr == 0:
-            self._preloop_emitted = [[[]]]
+            # PGR=0 has no GR/LR pipeline, but the mainloop's first MFMA still
+            # accumulates into D, so the accumulators must be zeroed first.
+            # Emit an initD-only preloop (the PRELOOP itself is still emitted
+            # unconditionally in emitMainAndExitLoops).
+            self._preloop_emitted = [[self._to_emitted([self._make_initD_op()])]]
             return self._preloop_emitted
 
         cfg = self.config
@@ -2441,9 +2460,12 @@ class LogicalScheduler:
             lr_tiles['SA'] = MFMATileRange(0, cfg.lrSA.k, *part0['A'])
             lr_tiles['SB'] = MFMATileRange(0, cfg.lrSB.k, *part0['B'])
 
+        initD_op = self._make_initD_op()
+
         if cfg.pgr == 1:
             emitted = self._to_emitted([
                 *self._make_gr_all_tensors(0, all_tiles),
+                initD_op,
                 WaitGROp(wait_gr_counts=WaitGRCounts()),
                 SyncOp(),
                 *self._make_lr_all_tensors(lr_tiles),
@@ -2453,6 +2475,7 @@ class LogicalScheduler:
             emitted = self._to_emitted([
                 *self._make_gr_all_tensors(0, all_tiles),
                 *self._make_depops_all_tensors(GRIncOp),
+                initD_op,
                 WaitGROp(wait_gr_counts=WaitGRCounts()),
                 SyncOp(),
                 *self._make_lr_all_tensors(lr_tiles),
@@ -2615,12 +2638,18 @@ class LogicalScheduler:
             return emitted_3d
 
         # ── Skip preloop/mainloop/NGLL/NLL when K < DepthU ──
+        # When K < DepthU the preloop (which contains initD) is skipped, so the
+        # accumulators would be left uninitialized for the tail-only path. Route
+        # the skip through a small block that zeros D before falling into the
+        # tail loop. The normal path branches over this block (D is already
+        # zeroed by the preloop and accumulated by the main pipeline).
         endLabel = Label("SkipToEnd", "")
+        tailOnlyInitLabel = Label("InitDForTailOnly", "")
         if not kernel["NoTailLoop"]:
             module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=0,
-                                 comment="K < DepthU? skip to tail loop"))
-            module.add(SCBranchSCC1(labelName=endLabel.getLabelName(),
-                                    comment="K < DepthU: only tail loop runs"))
+                                 comment="K < DepthU? zero D then run tail only"))
+            module.add(SCBranchSCC1(labelName=tailOnlyInitLabel.getLabelName(),
+                                    comment="K < DepthU: preloop skipped, must init D"))
 
         # ── Preloop ──
         module.add(self._emitLoop(writer, kernel, "PRELOOP",
@@ -2709,6 +2738,18 @@ class LogicalScheduler:
             if ui < uf - 2:
                 module.add(SBranch(labelName=endLabel.getLabelName(),
                                    comment="skip other exit paths"))
+
+        # ── Tail-only initD (K < DepthU path) ──
+        # The normal path reaches here having already zeroed+accumulated D, so it
+        # must branch over the re-zero. The explicit branch is required because
+        # the last unroll exit block can fall through to here when uf > 1.
+        if not kernel["NoTailLoop"]:
+            from Tensile.Components.Subtile.Kernel import initVgprTilesToZero
+            module.add(SBranch(labelName=endLabel.getLabelName(),
+                               comment="main pipeline ran: D already valid"))
+            module.add(tailOnlyInitLabel)
+            module.add(initVgprTilesToZero(writer, kernel,
+                                           self._emitter.dtileInfo))
 
         module.add(endLabel)
 
