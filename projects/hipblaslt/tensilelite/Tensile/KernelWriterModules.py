@@ -21,8 +21,9 @@
 ################################################################################
 
 from rocisa.code import Label, Module
-from rocisa.container import vgpr, sgpr, accvgpr, Holder, MemTokenData
-from rocisa.instruction import SBarrier, SBranch, SMovB32, SMovB64, SWaitCnt, SWaitTensorcnt,\
+from rocisa.container import vgpr, sgpr, accvgpr, mgpr, Holder, MemTokenData
+from rocisa.instruction import SBarrier, SBranch, SMovB32, SMovB64, SSetGprIdxOff, SSetGprIdxOn, \
+  SWaitCnt, SWaitTensorcnt, \
   VAccvgprReadB32, VAccvgprWriteB32, VFmaF32, VFmaF64, VLShiftLeftB64, VMovB32, \
   VMovRelsD2B32, VMulF32, VMulF64, VMulLOU32, VMulPKF16
 from rocisa.functions import BranchIfNotZero
@@ -241,6 +242,29 @@ def mapAcctoArchRegs(kernel, maxAgpr=256, write=False, spilledVgprBase=None):
   complexMultiplier = 2 if kernel["ProblemType"]["DataType"].isComplex() else 1
   itemList = [None] * kernel["MIRegPerOut"] * complexMultiplier * len(acc2arch)
   accImOffset = accVgprImagNumOffset(kernel)
+
+  # gfx950 CompactLoopStore acc-read: gfx950 lacks v_movrelsd_2_b32 but supports VGPR
+  # Index Mode. Wrapping a read in s_set_gpr_idx_on(SRC0)/off makes ONLY the SRC0
+  # operand's register index M0-relative at runtime -- the same source-relative effect
+  # v_movrelsd_2_b32 gives (StreamK.py notes M0 offsets the *source* index). Verified on
+  # gfx950 hardware that this indexes BOTH the VGPR source (MIArchVgpr:true, v_mov_b32)
+  # AND the AGPR source (MIArchVgpr:false, v_accvgpr_read_b32) -- so the production
+  # accvgpr path compacts too, without the MIArchVgpr:true VGPR-budget ceiling.
+  # The CLS loop header drives M0 (CLSm0Base, stepped by m0Step) so one body covers the
+  # thread tile. Only SRC0 is tagged: the dst (store staging reg) is the fully unrolled
+  # base and must NOT be M0-offset (gpr_idx DST/SRC0,DST corrupts D at M0>0). The bracket
+  # is per-move on purpose: block-scoping the whole acc-read Module drops the trailing
+  # _off (the module is sliced/replicated by the downstream CLS store loop).
+  clsIdxGfx950 = (not write) and kernel.get("CompactLoopStore", False) \
+                 and kernel["ISA"][:2] == (9, 5)
+  def wrapCLSIdx(readInst, destIdx):
+    m = Module("CLSIdxAccRead vreg[%u]" % destIdx)
+    m.add(SSetGprIdxOn(src=mgpr(0), mode="SRC0",
+                       comment="CLS gfx950: enable M0-relative index (SRC0)"))
+    m.add(readInst)
+    m.add(SSetGprIdxOff(comment="CLS gfx950: leave index mode"))
+    return m
+
   for i in range(len(acc2arch)):
     for cm in range(complexMultiplier):
       for r in range(kernel["MIRegPerOut"]):
@@ -269,31 +293,41 @@ def mapAcctoArchRegs(kernel, maxAgpr=256, write=False, spilledVgprBase=None):
                                              src=vgpr(Holder(name="ValuC")),
                                              comment="copy vreg[%u] to MI out reg" % destIdx)
             else:
-              itemList[destIdx] = VMovB32(dst=vgpr(Holder(name="ValuC")),
-                                              src=spilledVgpr,
-                                              comment="copy MI out reg to vreg[%u]" % destIdx)
+              rd = VMovB32(dst=vgpr(Holder(name="ValuC")),
+                           src=spilledVgpr,
+                           comment="copy MI out reg to vreg[%u]%s" % (destIdx, " (src M0-indexed)" if clsIdxGfx950 else ""))
+              itemList[destIdx] = wrapCLSIdx(rd, destIdx) if clsIdxGfx950 else rd
           else:
             if write:
               itemList[destIdx] = VAccvgprWriteB32(dst=accStr,
                                                         src=vgpr(Holder(name="ValuC")),
                                                         comment="copy vreg[%u] to acc" % destIdx)
             else:
-              itemList[destIdx] = VAccvgprReadB32(dst=vgpr(Holder(name="ValuC")),
-                                                      src=accStr,
-                                                      comment="copy acc to vreg[%u]" % destIdx)
+              # gfx950 CLS: bracket so the AGPR source index is M0-relative (verified on
+              # HW to index accvgpr reads) -- compacts the MIArchVgpr:false production path.
+              rd = VAccvgprReadB32(dst=vgpr(Holder(name="ValuC")),
+                                   src=accStr,
+                                   comment="copy acc to vreg[%u]%s" % (destIdx, " (src M0-indexed)" if clsIdxGfx950 else ""))
+              itemList[destIdx] = wrapCLSIdx(rd, destIdx) if clsIdxGfx950 else rd
         else:
           if write:
             itemList[destIdx] = VMovB32(dst=vgpr("ValuC+%u"%srcIdx),
                                              src=vgpr(Holder(name="ValuC")),
                                              comment="copy vreg[%u] to MI out reg" % destIdx)
           elif kernel.get("CompactLoopStore", False):
-            # CompactLoopStore: use v_movrelsd_2_b32 so the dst VGPR index is offset
-            # by M0 at runtime. The CLS countdown loop (later commit) drives M0 per
-            # iter so one "copy MI out reg" body covers multiple MI accumulator
-            # slices. Non-CLS keeps v_mov_b32 verbatim.
-            itemList[destIdx] = VMovRelsD2B32(dst=vgpr(Holder(name="ValuC")),
-                                             src=vgpr("ValuC+%u"%srcIdx),
-                                             comment="copy MI out reg to vreg[%u]" % destIdx)
+            if clsIdxGfx950:
+              # gfx950: bracket the plain v_mov_b32 so the SRC0 VGPR index is M0-relative.
+              rd = VMovB32(dst=vgpr(Holder(name="ValuC")),
+                           src=vgpr("ValuC+%u"%srcIdx),
+                           comment="copy MI out reg to vreg[%u] (src M0-indexed)" % destIdx)
+              itemList[destIdx] = wrapCLSIdx(rd, destIdx)
+            else:
+              # gfx10+ CompactLoopStore: use v_movrelsd_2_b32 so the dst VGPR index is
+              # offset by M0 at runtime. The CLS countdown loop drives M0 per iter so
+              # one "copy MI out reg" body covers multiple MI accumulator slices.
+              itemList[destIdx] = VMovRelsD2B32(dst=vgpr(Holder(name="ValuC")),
+                                               src=vgpr("ValuC+%u"%srcIdx),
+                                               comment="copy MI out reg to vreg[%u]" % destIdx)
           else:
             itemList[destIdx] = VMovB32(dst=vgpr(Holder(name="ValuC")),
                                              src=vgpr("ValuC+%u"%srcIdx),

@@ -749,7 +749,11 @@ class GlobalWriteBatchWriter:
     CLS=0 codegen is bit-for-bit unchanged. Pair with _epilogScratchFree.
     """
     if self.kernel["CompactLoopStore"]:
-      return self.parentWriter.sgprPool.checkOutAligned(n, 1)
+      # A 64-bit+ scratch operand (e.g. the wave64 edge lane-mask pair, n == 2 ==
+      # laneSGPRCount, used by edgeProtectCode's v_cmp/s_and_b64) MUST be even-aligned;
+      # otherwise the pool can hand back an odd pair like s[49:50] and the assembler
+      # rejects it with "invalid register alignment". Align n>1 to 2 (n==1 stays 1).
+      return self.parentWriter.sgprPool.checkOutAligned(n, 2 if n > 1 else 1)
     return self.tmpSgpr
 
   def _epilogScratchFree(self, sgprIdx):

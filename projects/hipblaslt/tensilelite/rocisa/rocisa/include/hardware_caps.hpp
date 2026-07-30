@@ -476,6 +476,14 @@ inline std::map<std::string, int>
     // probe the assembler and gate CompactLoopStore on this cap in Solution.py.
     rv["HasMovRelsD2B32"] = tryAssembler(isaVersion, assemblerPath, "v_movrelsd_2_b32 v0, v1", isDebug);
 
+    // s_set_gpr_idx_on/off: gfx8/gfx9 VGPR Index Mode (M0-relative VGPR operand
+    // selection). Present on gfx950 (which lacks v_movrelsd_2_b32) and the
+    // mechanism the gfx950 CompactLoopStore acc-read uses instead. CLS is gated
+    // in Solution.py on HasMovRelsD2B32 OR HasVgprIndexMode.
+    rv["HasVgprIndexMode"]
+        = tryAssembler(isaVersion, assemblerPath, "s_set_gpr_idx_on s0, gpr_idx(SRC0)", isDebug)
+          && tryAssembler(isaVersion, assemblerPath, "s_set_gpr_idx_off", isDebug);
+
     rv["s_delay_alu"]
         = tryAssembler(isaVersion, assemblerPath, "s_delay_alu instid0(VALU_DEP_1)", isDebug);
     rv["HasVgprMSB"] = tryAssembler(isaVersion, assemblerPath, "s_set_vgpr_msb 0", isDebug);

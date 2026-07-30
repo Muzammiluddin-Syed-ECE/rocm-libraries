@@ -2606,8 +2606,12 @@ class Solution(collections.abc.Mapping):
         return
 
     if state["CompactLoopStore"]:
-      if not isaInfoMap[isa].asmCaps["HasMovRelsD2B32"]:
-        reject(state, printRejectionReason, "This arch does not support CompactLoopStore (no v_movrelsd_2_b32)")
+      # CompactLoopStore needs runtime M0-relative VGPR addressing for the shared
+      # store body. gfx10+ provides v_movrelsd_2_b32 (HasMovRelsD2B32); gfx950 lacks
+      # it but provides VGPR Index Mode (HasVgprIndexMode, s_set_gpr_idx_on/off),
+      # which KernelWriterModules.mapAcctoArchRegs emits instead on gfx950.
+      if not (isaInfoMap[isa].asmCaps["HasMovRelsD2B32"] or isaInfoMap[isa].asmCaps["HasVgprIndexMode"]):
+        reject(state, printRejectionReason, "This arch supports neither v_movrelsd_2_b32 nor VGPR index mode for CompactLoopStore")
         return
 
     # MX scale layout + transport derivation and validation. See

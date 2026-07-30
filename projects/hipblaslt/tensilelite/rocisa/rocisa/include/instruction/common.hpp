@@ -5799,6 +5799,102 @@ namespace rocisa
         }
     };
 
+    // s_set_gpr_idx_on / s_set_gpr_idx_off: gfx8/gfx9 VGPR Index Mode. While
+    // "on", the operand(s) named by `mode` (e.g. "SRC0", "DST", "SRC0,DST") of
+    // every following instruction have effective VGPR index base + M0, until
+    // "off". gfx950 lacks v_movrelsd_2_b32 but supports index mode, so gfx950
+    // CompactLoopStore wraps a plain v_mov_b32 acc-read in on/off to get the
+    // same M0-relative effect (the CLS loop header already drives M0). Modeled
+    // on SSetPrior (Instruction subclass with a custom toString); `src` is the
+    // index source (m0 idiom: keep M0[7:0], set the mask via the immediate).
+    struct SSetGprIdxOn : public Instruction
+    {
+        SSetGprIdxOn(const std::shared_ptr<Container>& src,
+                     const std::string&                mode,
+                     const std::string&                comment = "")
+            : Instruction(InstType::INST_NOTYPE, comment)
+            , src(src)
+            , mode(mode)
+        {
+            setInst("s_set_gpr_idx_on");
+        }
+
+        SSetGprIdxOn(const SSetGprIdxOn& other)
+            : Instruction(other)
+            , src(other.src)
+            , mode(other.mode)
+        {
+        }
+
+        std::shared_ptr<Item> clone() const override
+        {
+            return std::make_shared<SSetGprIdxOn>(*this);
+        }
+
+        std::vector<InstructionInput> getParams() const override
+        {
+            return {src};
+        }
+
+        std::vector<InstructionInput> getDstParams() const override
+        {
+            return {};
+        }
+
+        std::vector<InstructionInput> getSrcParams() const override
+        {
+            return {src};
+        }
+
+        std::string toString() const override
+        {
+            return formatWithComment(instStr + " " + src->toString() + ", gpr_idx(" + mode + ")");
+        }
+
+    private:
+        std::shared_ptr<Container> src;
+        std::string                mode;
+    };
+
+    struct SSetGprIdxOff : public Instruction
+    {
+        SSetGprIdxOff(const std::string& comment = "")
+            : Instruction(InstType::INST_NOTYPE, comment)
+        {
+            setInst("s_set_gpr_idx_off");
+        }
+
+        SSetGprIdxOff(const SSetGprIdxOff& other)
+            : Instruction(other)
+        {
+        }
+
+        std::shared_ptr<Item> clone() const override
+        {
+            return std::make_shared<SSetGprIdxOff>(*this);
+        }
+
+        std::vector<InstructionInput> getParams() const override
+        {
+            return {};
+        }
+
+        std::vector<InstructionInput> getDstParams() const override
+        {
+            return {};
+        }
+
+        std::vector<InstructionInput> getSrcParams() const override
+        {
+            return {};
+        }
+
+        std::string toString() const override
+        {
+            return formatWithComment(instStr);
+        }
+    };
+
     struct _VMovB64 : public CommonInstruction
     {
         _VMovB64(const std::shared_ptr<Container>& dst,

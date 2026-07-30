@@ -2138,6 +2138,27 @@ void common_inst(nb::module_ m_common)
             return new rocisa::VMovRelsD2B32(self);
         });
 
+    nb::class_<rocisa::SSetGprIdxOn, rocisa::Instruction>(m_common, "SSetGprIdxOn")
+        .def(nb::init<const std::shared_ptr<rocisa::Container>&,
+                      const std::string&,
+                      const std::string&>(),
+             nb::arg("src"),
+             nb::arg("mode"),
+             nb::arg("comment") = "")
+        .def("getParams", &rocisa::SSetGprIdxOn::getParams)
+        .def("__str__", &rocisa::SSetGprIdxOn::toString)
+        .def("__deepcopy__", [](const rocisa::SSetGprIdxOn& self, nb::dict&) {
+            return new rocisa::SSetGprIdxOn(self);
+        });
+
+    nb::class_<rocisa::SSetGprIdxOff, rocisa::Instruction>(m_common, "SSetGprIdxOff")
+        .def(nb::init<const std::string&>(), nb::arg("comment") = "")
+        .def("getParams", &rocisa::SSetGprIdxOff::getParams)
+        .def("__str__", &rocisa::SSetGprIdxOff::toString)
+        .def("__deepcopy__", [](const rocisa::SSetGprIdxOff& self, nb::dict&) {
+            return new rocisa::SSetGprIdxOff(self);
+        });
+
     nb::class_<rocisa::_VMovB64, rocisa::CommonInstruction>(m_common, "_VMovB64")
         .def(nb::init<const std::shared_ptr<rocisa::Container>&,
                       const InstructionInput&,
