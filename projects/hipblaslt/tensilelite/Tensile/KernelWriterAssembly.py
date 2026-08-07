@@ -8485,10 +8485,10 @@ class KernelWriterAssembly(KernelWriter):
           if vtile.regList.is_vgpr:
             spilledVgprBase = vtile.regList.indices[0]
             break
-      self.codes.accVgprRead = mapAcctoArchRegs(kernel, self.states.maxLimitAgprs, write=False, spilledVgprBase=spilledVgprBase)
+      self.codes.accVgprRead = mapAcctoArchRegs(kernel, self.states.asmCaps, self.states.maxLimitAgprs, write=False, spilledVgprBase=spilledVgprBase)
       if (kernel["StreamK"] > 0 and kernel["StreamKAtomic"] == 0) or \
          ((kernel["GlobalSplitU"] == -1 or kernel["GlobalSplitU"] > 0) and (kernel["GlobalSplitUAlgorithm"] == "MultipleBufferSingleKernel" or kernel["AdaptiveGemmGSUA"] == 1)):
-        self.codes.accVgprWrite = mapAcctoArchRegs(kernel, self.states.maxLimitAgprs, write=True, spilledVgprBase=spilledVgprBase)  # same spilledVgprBase
+        self.codes.accVgprWrite = mapAcctoArchRegs(kernel, self.states.asmCaps, self.states.maxLimitAgprs, write=True, spilledVgprBase=spilledVgprBase)  # same spilledVgprBase
       if kernel["MIArchVgpr"]:
         module.addComment1("Multiply MI out register with Alpha -> C Vgpr register")
         self.codes.mulAlphaMultipleBuffer = moveMIoutToArch(kernel, self.states.startVgprAlphaTmp)

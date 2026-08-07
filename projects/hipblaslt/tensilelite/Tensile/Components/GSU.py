@@ -1232,6 +1232,10 @@ class GSUOn(GSU):
             module.add(SWaitCnt(vlcnt=0, vscnt=0, comment="Wait previous batch write over"))
         if codeAccVgprRead is not None and kernel["LocalSplitU"] == 1:
             regsPerScalar = writer.states.bpeCinternal // writer.states.bpr # register per scalar
+            # Bare on purpose under CompactLoopStore: this batch loop walks the FULL
+            # numBatches, so the reads are consumed linearly outside the CLS loop and
+            # their source indices must NOT be M0-relative. See clsUsesVgprIndexMode in
+            # KernelWriterModules for the bracket-iff-inside-the-CLS-loop rule.
             # loop over store instructions within one batch
             for elementIdx in range(0, len(batchElements)):
                 # loop over scalars within one store instruction
@@ -2104,6 +2108,9 @@ class GSUOn(GSU):
         # last gsu wg accvgpr read
         if codeAccVgprRead is not None and kernel["LocalSplitU"] == 1:
             regsPerScalar = writer.states.bpeCinternal // writer.states.bpr # register per scalar
+            # Bare on purpose under CompactLoopStore: full-list linear consumption
+            # outside the CLS loop, so no index-mode bracket -- see
+            # clsUsesVgprIndexMode in KernelWriterModules.
             # loop over store instructions within one batch
             batchNumAccRegs = len(batchElements) * gwvw * regsPerScalar
             vmcntForSummation = int(batchNumAccRegs / gwvw)

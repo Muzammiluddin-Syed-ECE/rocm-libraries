@@ -50,7 +50,7 @@ from ..AsmStoreState import StoreState
 from ..AsmAddressCalculation import AddrCalculation
 from ..Components.PackData import formatting, PackData_F16, PackData_BF16, PackData_FLOAT8, PackData_FLOAT8_fnuz
 from rocisa.instruction import ECvtF16toF32, ECvtPkFP8toF32, ECvtPkBF8toF32
-from ..KernelWriterModules import hasSequentialValuC
+from ..KernelWriterModules import hasSequentialValuC, clsWrapIdxCluster
 
 from math import ceil, log2
 
@@ -1190,13 +1190,20 @@ class GlobalWriteBatchWriter:
         tmpStartVgprValuC = self.parentWriter.states.c.startVgprValu
         self.parentWriter.states.c.startVgprValu = 0
         module.add(RegSet("v", "vgprValuC", 0))
+      # This batch runs inside the CompactLoopStore countdown loop and therefore pops
+      # only the numBatchesCLS-truncated prefix of the read list, reaching the
+      # remaining accumulator slices through M0. Collect the batch's reads into one
+      # cluster so clsWrapIdxCluster can put a single index-mode bracket around it on
+      # an index-mode arch (a no-op on every other configuration).
+      accReadCluster = Module("AccVgprReadCluster")
       # loop over store instructions within one batch
       for elementIdx in range(len(self.batchElements)):
         # loop over scalars within one store instruction
         for vi in range(self.gwvw):
           # loop over registers within one scalar
           for rIdx in range(0, regsPerScalar):
-            module.add(replaceHolder(self.codeAccVgprRead.popFirstItem(), self.ss.elementSumIdx[elementIdx]*regsPerScalar + regsPerScalar*vi + rIdx - self.parentWriter.states.c.startVgprValu))
+            accReadCluster.add(replaceHolder(self.codeAccVgprRead.popFirstItem(), self.ss.elementSumIdx[elementIdx]*regsPerScalar + regsPerScalar*vi + rIdx - self.parentWriter.states.c.startVgprValu))
+      module.add(clsWrapIdxCluster(self.kernel, self.parentWriter.states.asmCaps, accReadCluster))
 
       if self.kernel["MIArchVgpr"] and self.kernel["LocalSplitU"] > 1:
         self.parentWriter.states.c.startVgprValu = tmpStartVgprValuC

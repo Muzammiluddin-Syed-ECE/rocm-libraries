@@ -1136,7 +1136,7 @@ def _run_storeD(cfg, tmp_path, size_i, size_j, mi_wave_group=None,
 
     tmp_v = writer.vgprPool.checkOut(1, "tmp_init", preventOverflow=False)
 
-    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.maxLimitAgprs, write=False)
+    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.asmCaps, kw.states.maxLimitAgprs, write=False)
     store_indices_mod = kw.notLocalSplitUGlobalWriteIndices(kernel)
     kw.states.c.startVgprValu = 0
     store_write_mod, _ = kw.notLocalSplitUGlobalWrite(kernel, tPA=None, tPB=None)
@@ -1790,7 +1790,7 @@ def _run_storeD_beta(cfg, tmp_path, size_i, size_j, mi_wave_group=None, dump_asm
 
     tmp_v = writer.vgprPool.checkOut(1, "tmp_v", preventOverflow=False)
 
-    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.maxLimitAgprs, write=False)
+    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.asmCaps, kw.states.maxLimitAgprs, write=False)
     store_indices_mod = kw.notLocalSplitUGlobalWriteIndices(kernel)
     kw.states.c.startVgprValu = 0
     store_write_mod, _ = kw.notLocalSplitUGlobalWrite(kernel, tPA=None, tPB=None)
@@ -2029,7 +2029,7 @@ def _run_storeD_sav_bias(cfg, tmp_path, size_i, size_j, mi_wave_group=None,
     vaddr = writer.vgprPool.checkOut(1, "vaddr", preventOverflow=False)
     vtmp2 = writer.vgprPool.checkOut(1, "vtmp2", preventOverflow=False)
 
-    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.maxLimitAgprs, write=False)
+    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.asmCaps, kw.states.maxLimitAgprs, write=False)
     store_indices_mod = kw.notLocalSplitUGlobalWriteIndices(kernel)
     kw.states.c.startVgprValu = 0
     store_write_mod, _ = kw.notLocalSplitUGlobalWrite(kernel, tPA=None, tPB=None)
@@ -2286,7 +2286,7 @@ def _run_storeD_cload_pagefault(cfg, tmp_path, size_i, size_j, mi_wave_group=Non
 
     tmp_v = writer.vgprPool.checkOut(1, "tmp_v", preventOverflow=False)
 
-    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.maxLimitAgprs, write=False)
+    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.asmCaps, kw.states.maxLimitAgprs, write=False)
     store_indices_mod = kw.notLocalSplitUGlobalWriteIndices(kernel)
     kw.states.c.startVgprValu = 0
     store_write_mod, _ = kw.notLocalSplitUGlobalWrite(kernel, tPA=None, tPB=None)

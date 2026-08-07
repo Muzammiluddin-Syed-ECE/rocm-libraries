@@ -1702,19 +1702,24 @@ class StreamK(Component):
         # if kernel.enabledSetPrioSplitLDS:
         #     kStr += inst("s_setprio", "0", "")
         if codeAccVgprRead is not None and kernel["LocalSplitU"] == 1:
-            # CompactLoopStore makes accVgprRead use v_movrelsd_2_b32 (src VGPR
-            # index offset by M0) so the same body can cover the full thread
-            # tile inside a CLS loop. The StreamK partials-write path runs
-            # OUTSIDE that CLS loop, but reuses the same precomputed
-            # writer.codes.accVgprRead module -- M0 still holds whatever the
-            # last CLS loop left in it (sgprWorkGroup2 + step), so the source
-            # VGPR index gets a random offset and the partials wrote into D
-            # come out scrambled. Force M0=0 here so v_movrelsd_2_b32 behaves
-            # like the plain v_mov_b32 the non-CLS path used to emit.
+            # Under CompactLoopStore the acc-read is M0-relative (v_movrelsd_2_b32 on
+            # gfx10+, a bare read inside an s_set_gpr_idx_on(SRC0) bracket on an
+            # index-mode arch) so one body can cover the full thread tile inside a CLS
+            # loop. The StreamK partials-write path runs OUTSIDE that CLS loop but
+            # reuses the same precomputed writer.codes.accVgprRead module -- M0 still
+            # holds whatever the last CLS loop left in it (sgprWorkGroup2 + step), so a
+            # v_movrelsd_2_b32 source index gets a random offset and the partials
+            # written into D come out scrambled. Force M0=0 so it behaves like the plain
+            # v_mov_b32 the non-CLS path used to emit.
             if kernel.get("CompactLoopStore", False):
                 module.add(SMovB32(dst=mgpr(0), src=0,
                     comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
             regsPerScalar = writer.states.bpeCinternal // writer.states.bpr # register per scalar
+            # Bare on purpose: this consumes the FULL read list linearly, outside the
+            # CLS loop, so the source indices are already literal. Bracketing them in
+            # index mode would be a no-op given the M0 reset above while making
+            # otherwise M0-immune reads depend on it -- see clsUsesVgprIndexMode in
+            # KernelWriterModules for the bracket-iff-inside-the-CLS-loop rule.
             # loop over store instructions within one batch
             for elementIdx in range(0, len(batchElements)):
                 # loop over scalars within one store instruction
@@ -2201,13 +2206,15 @@ class StreamK(Component):
         #     kStr += inst("s_setprio", "0", "")
         if codeAccVgprRead is not None and kernel["LocalSplitU"] == 1:
             # Same M0 reset as partialsWriteBatch: the SK fixup path runs after
-            # the CLS loop has left M0 = sgprWorkGroup2+step. accVgprRead is the
-            # precomputed v_movrelsd_2_b32 module (when CompactLoopStore=True),
-            # which would pick up that stale M0 and reorder accumulator vregs.
+            # the CLS loop has left M0 = sgprWorkGroup2+step. With CompactLoopStore
+            # the precomputed accVgprRead module is M0-relative (v_movrelsd_2_b32 on
+            # gfx10+), so it would pick up that stale M0 and reorder accumulator vregs.
             if kernel.get("CompactLoopStore", False):
                 module.add(SMovB32(dst=mgpr(0), src=0,
                     comment="reset M0 for v_movrelsd_2_b32 outside CLS loop"))
             regsPerScalar = writer.states.bpeCinternal // writer.states.bpr # register per scalar
+            # Bare on purpose, exactly as in partialsWriteBatch: full-list linear
+            # consumption outside the CLS loop, so no index-mode bracket.
             # loop over store instructions within one batch
             for elementIdx in range(0, len(batchElements)):
                 # loop over scalars within one store instruction

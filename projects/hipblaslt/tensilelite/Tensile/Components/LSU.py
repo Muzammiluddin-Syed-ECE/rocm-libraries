@@ -371,6 +371,10 @@ class LSUOn(LSU):
                                 # TODO: hpa_half, int8
                                     assert(0) # unsupported data type, need to modify here and LSU write/read code
                     
+                    # Bare on purpose under CompactLoopStore: the popped reads are only
+                    # inspected for their source index to rebuild a write, never emitted,
+                    # and they are consumed linearly outside the CLS loop -- see
+                    # clsUsesVgprIndexMode in KernelWriterModules.
                     if kernel["GlobalSplitUAlgorithm"] == "MultipleBufferSingleKernel":
                         if not kernel["MIArchVgpr"]:
                             # write to accvgpr

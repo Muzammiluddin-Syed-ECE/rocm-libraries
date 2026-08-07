@@ -233,37 +233,110 @@ def accVgprImagNumOffset(kernel):
   return len(acc2arch) * kernel["MIRegPerOut"]
 
 ##############################################################################
+# CompactLoopStore acc-read via VGPR Index Mode (block-scoped brackets)
+#
+# CompactLoopStore needs the acc-read SOURCE register index to be M0-relative so
+# that one store body can cover several accumulator slices. gfx10+ gets that from
+# v_movrelsd_2_b32; an arch that lacks it but has VGPR Index Mode (gfx950) emits a
+# BARE read instead and makes it M0-relative by bracketing it in
+# s_set_gpr_idx_on(SRC0) ... s_set_gpr_idx_off. Solution.py admits a
+# CompactLoopStore solution on exactly that pair of capabilities, so the mechanism
+# is selected from the same capabilities here (see clsUsesVgprIndexMode).
+#
+# WHO EMITS THE BRACKET -- the load-bearing rule:
+#
+#   A consumer of codes.accVgprRead must bracket its reads IFF it runs inside the
+#   CLS countdown loop, i.e. it pops only the numBatchesCLS-truncated PREFIX of the
+#   read list and relies on M0 to reach the remaining slices. GlobalWriteBatch is
+#   the only such consumer today.
+#
+#   A consumer that pops the FULL read list linearly, OUTSIDE the CLS loop, must
+#   emit the reads BARE. Its source indices are already the literal ones it needs,
+#   and a bracket would make an otherwise M0-immune read depend on whatever M0
+#   holds -- on GFX9 M0 is also the LDS base/limit register. StreamK
+#   (partialsWriteBatch / fixupBatch), GSU (partialWriteBatch /
+#   lastGsuWgReduction) and LSU are bare on purpose for this reason.
+#
+# The bracket lives at the consumer, not in the acc-read Module built by
+# mapAcctoArchRegs, because that Module is sliced/replicated item-by-item
+# downstream -- a single closing _off baked at its end would simply be lost.
+#
+# clsWrapIdxCluster() is the only supported way to emit the bracket. While index
+# mode is on, EVERY VALU SRC0 in the bracketed region is M0-relative, not just the
+# acc-reads, so the helper asserts that nothing else made it into the cluster.
+##############################################################################
+
+# Name given to the acc-read Module when its reads are M0-relative-by-bracket, so
+# that the property is visible to anyone inspecting codes.accVgprRead.
+CLS_M0_RELATIVE_READS = "AccVgprRead.M0Relative"
+
+def clsUsesVgprIndexMode(kernel, asmCaps):
+  """True when the CompactLoopStore acc-read is a bare, index-mode-bracketed read.
+
+  Mirrors the capability pair Solution.py gates CompactLoopStore on, so an arch can
+  never pass that gate and then be handed an instruction it does not implement.
+  """
+  return kernel["CompactLoopStore"] and not asmCaps["HasMovRelsD2B32"] \
+         and asmCaps["HasVgprIndexMode"]
+
+def clsIdxModeOn(comment=None):
+  """Open one VGPR index-mode bracket for an acc-read cluster (SRC0 only)."""
+  return SSetGprIdxOn(src=mgpr(0), mode="SRC0",
+                      comment=comment or "CLS: enable M0-relative index (SRC0)")
+
+def clsIdxModeOff(comment=None):
+  """Close the VGPR index-mode bracket around an acc-read cluster."""
+  return SSetGprIdxOff(comment=comment or "CLS: leave index mode")
+
+def clsWrapIdxCluster(kernel, asmCaps, cluster: Module) -> Module:
+  """Wrap one contiguous acc-read cluster in a single VGPR index-mode bracket.
+
+  `cluster` is returned unchanged when index mode is not the acc-read mechanism or
+  when nothing was popped into it, so a caller can never emit a dangling or empty
+  bracket. Emptiness is read off the cluster itself rather than restated from a
+  trip count: the number of reads is len(batchElements) * gwvw * regsPerScalar, and
+  regsPerScalar is an integer division that can be 0.
+  """
+  if not clsUsesVgprIndexMode(kernel, asmCaps):
+    return cluster
+  items = cluster.items()
+  if not items:
+    return cluster
+  for item in items:
+    assert isinstance(item, (VAccvgprReadB32, VMovB32)), \
+      "only acc-reads may sit inside a CLS index-mode bracket (every SRC0 in it " \
+      "is M0-relative), got %s" % type(item).__name__
+  wrapped = Module("CLSIdxAccReadCluster")
+  wrapped.add(clsIdxModeOn())
+  wrapped.appendModule(cluster)
+  wrapped.add(clsIdxModeOff())
+  return wrapped
+
+##############################################################################
 # MapAcctoArch
 # function to map MFMA Acc  Registers to Arch VGPR register
 ##############################################################################
-def mapAcctoArchRegs(kernel, maxAgpr=256, write=False, spilledVgprBase=None):
+def mapAcctoArchRegs(kernel, asmCaps, maxAgpr=256, write=False, spilledVgprBase=None):
   acc2arch, _ = accToArchMapper(kernel)
 
   complexMultiplier = 2 if kernel["ProblemType"]["DataType"].isComplex() else 1
   itemList = [None] * kernel["MIRegPerOut"] * complexMultiplier * len(acc2arch)
   accImOffset = accVgprImagNumOffset(kernel)
 
-  # gfx950 CompactLoopStore acc-read: gfx950 lacks v_movrelsd_2_b32 but supports VGPR
-  # Index Mode. Wrapping a read in s_set_gpr_idx_on(SRC0)/off makes ONLY the SRC0
-  # operand's register index M0-relative at runtime -- the same source-relative effect
-  # v_movrelsd_2_b32 gives (StreamK.py notes M0 offsets the *source* index). Verified on
-  # gfx950 hardware that this indexes BOTH the VGPR source (MIArchVgpr:true, v_mov_b32)
-  # AND the AGPR source (MIArchVgpr:false, v_accvgpr_read_b32) -- so the production
-  # accvgpr path compacts too, without the MIArchVgpr:true VGPR-budget ceiling.
-  # The CLS loop header drives M0 (CLSm0Base, stepped by m0Step) so one body covers the
-  # thread tile. Only SRC0 is tagged: the dst (store staging reg) is the fully unrolled
-  # base and must NOT be M0-offset (gpr_idx DST/SRC0,DST corrupts D at M0>0). The bracket
-  # is per-move on purpose: block-scoping the whole acc-read Module drops the trailing
-  # _off (the module is sliced/replicated by the downstream CLS store loop).
-  clsIdxGfx950 = (not write) and kernel.get("CompactLoopStore", False) \
-                 and kernel["ISA"][:2] == (9, 5)
-  def wrapCLSIdx(readInst, destIdx):
-    m = Module("CLSIdxAccRead vreg[%u]" % destIdx)
-    m.add(SSetGprIdxOn(src=mgpr(0), mode="SRC0",
-                       comment="CLS gfx950: enable M0-relative index (SRC0)"))
-    m.add(readInst)
-    m.add(SSetGprIdxOff(comment="CLS gfx950: leave index mode"))
-    return m
+  # CompactLoopStore acc-read on an index-mode arch (gfx950): the read is emitted
+  # BARE here and made M0-relative by the s_set_gpr_idx_on(SRC0) bracket the store
+  # consumer puts around the whole cluster -- see the block comment above
+  # clsUsesVgprIndexMode for who brackets and why the bracket cannot live here.
+  # Index mode makes ONLY the SRC0 operand's register index M0-relative, which is the
+  # same source-relative effect v_movrelsd_2_b32 gives (StreamK.py notes M0 offsets
+  # the *source* index). Verified on gfx950 hardware that it indexes BOTH the VGPR
+  # source (MIArchVgpr:true, v_mov_b32) AND the AGPR source (MIArchVgpr:false,
+  # v_accvgpr_read_b32) -- so the production accvgpr path compacts too, without the
+  # MIArchVgpr:true VGPR-budget ceiling. The CLS loop header drives M0 (CLSm0Base,
+  # stepped by m0Step) so one body covers the thread tile. Only SRC0 is bracketed: the
+  # dst (store staging reg) is the fully unrolled base and must NOT be M0-offset
+  # (gpr_idx DST / SRC0,DST corrupts D at M0>0).
+  clsIdxMode = clsUsesVgprIndexMode(kernel, asmCaps) and (not write)
 
   for i in range(len(acc2arch)):
     for cm in range(complexMultiplier):
@@ -293,34 +366,33 @@ def mapAcctoArchRegs(kernel, maxAgpr=256, write=False, spilledVgprBase=None):
                                              src=vgpr(Holder(name="ValuC")),
                                              comment="copy vreg[%u] to MI out reg" % destIdx)
             else:
-              rd = VMovB32(dst=vgpr(Holder(name="ValuC")),
-                           src=spilledVgpr,
-                           comment="copy MI out reg to vreg[%u]%s" % (destIdx, " (src M0-indexed)" if clsIdxGfx950 else ""))
-              itemList[destIdx] = wrapCLSIdx(rd, destIdx) if clsIdxGfx950 else rd
+              itemList[destIdx] = VMovB32(dst=vgpr(Holder(name="ValuC")),
+                                             src=spilledVgpr,
+                                             comment="copy MI out reg to vreg[%u]%s" % (destIdx, " (src M0-indexed)" if clsIdxMode else ""))
           else:
             if write:
               itemList[destIdx] = VAccvgprWriteB32(dst=accStr,
                                                         src=vgpr(Holder(name="ValuC")),
                                                         comment="copy vreg[%u] to acc" % destIdx)
             else:
-              # gfx950 CLS: bracket so the AGPR source index is M0-relative (verified on
-              # HW to index accvgpr reads) -- compacts the MIArchVgpr:false production path.
-              rd = VAccvgprReadB32(dst=vgpr(Holder(name="ValuC")),
-                                   src=accStr,
-                                   comment="copy acc to vreg[%u]%s" % (destIdx, " (src M0-indexed)" if clsIdxGfx950 else ""))
-              itemList[destIdx] = wrapCLSIdx(rd, destIdx) if clsIdxGfx950 else rd
+              # CLS index mode: the surrounding bracket emitted by the store consumer
+              # makes this AGPR source index M0-relative (verified on HW to index
+              # accvgpr reads) -- compacts the MIArchVgpr:false path too.
+              itemList[destIdx] = VAccvgprReadB32(dst=vgpr(Holder(name="ValuC")),
+                                                        src=accStr,
+                                                        comment="copy acc to vreg[%u]%s" % (destIdx, " (src M0-indexed)" if clsIdxMode else ""))
         else:
           if write:
             itemList[destIdx] = VMovB32(dst=vgpr("ValuC+%u"%srcIdx),
                                              src=vgpr(Holder(name="ValuC")),
                                              comment="copy vreg[%u] to MI out reg" % destIdx)
-          elif kernel.get("CompactLoopStore", False):
-            if clsIdxGfx950:
-              # gfx950: bracket the plain v_mov_b32 so the SRC0 VGPR index is M0-relative.
-              rd = VMovB32(dst=vgpr(Holder(name="ValuC")),
-                           src=vgpr("ValuC+%u"%srcIdx),
-                           comment="copy MI out reg to vreg[%u] (src M0-indexed)" % destIdx)
-              itemList[destIdx] = wrapCLSIdx(rd, destIdx)
+          elif kernel["CompactLoopStore"]:
+            if clsIdxMode:
+              # CLS index mode: the surrounding bracket emitted by the store consumer
+              # makes this plain v_mov_b32's SRC0 VGPR index M0-relative.
+              itemList[destIdx] = VMovB32(dst=vgpr(Holder(name="ValuC")),
+                                             src=vgpr("ValuC+%u"%srcIdx),
+                                             comment="copy MI out reg to vreg[%u] (src M0-indexed)" % destIdx)
             else:
               # gfx10+ CompactLoopStore: use v_movrelsd_2_b32 so the dst VGPR index is
               # offset by M0 at runtime. The CLS countdown loop drives M0 per iter so
@@ -332,7 +404,10 @@ def mapAcctoArchRegs(kernel, maxAgpr=256, write=False, spilledVgprBase=None):
             itemList[destIdx] = VMovB32(dst=vgpr(Holder(name="ValuC")),
                                              src=vgpr("ValuC+%u"%srcIdx),
                                              comment="copy MI out reg to vreg[%u]" % destIdx)
-  imod = Module("AccVgpr{}".format("Write" if write else "Read"))
+  # Tag the read Module when its items only mean the right thing inside an index-mode
+  # bracket, so the property is discoverable from codes.accVgprRead itself.
+  imod = Module(CLS_M0_RELATIVE_READS if clsIdxMode else
+                "AccVgpr{}".format("Write" if write else "Read"))
   imod.setItems(itemList)
   return imod
 
