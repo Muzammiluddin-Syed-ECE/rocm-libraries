@@ -14,12 +14,6 @@
 # itself structural / config-driven (the gfx1250 CLS YAMLs skip gfx950; the
 # gfx950 store harness in test_storeD_roundtrip.py sets CompactLoopStore=False).
 #
-# TODO: a subtile CLS-ON kernel is not yet numerically correct from codegen
-# alone -- the store SRD for the A1 (second store) sub-batch is still emitted in
-# the pre-CLS order, which faults with hipErrorIllegalAddress once the loop
-# compacts. Until that reorder moves into codegen, only the layout/structure
-# properties below (which ARE fully determined by codegen) can be asserted here.
-#
 # Properties pinned, and why each one matters:
 #   * compaction fired         -- a CLS body whose counter starts > 1 is the
 #                                 whole point; iterCount == 1 everywhere means
@@ -40,6 +34,14 @@
 #                                 only if M0 starts at 0 and steps uniformly.
 #   * non-compacting edge      -- a tile whose outerTT1 does not divide
 #                                 numBatches must still emit well-formed code.
+#   * SRD advance self-contained -- CLS normally carries the next row increment
+#                                 in s[stmp] across incrementToNextRow calls.
+#                                 The subtile store/load bodies emitted between
+#                                 two calls claim that same scratch as the wave64
+#                                 exec mask, so on the subtile path the increment
+#                                 must be computed immediately before the s_add
+#                                 that consumes it. Getting this wrong advances
+#                                 the SRD by a lane mask -> hipErrorIllegalAddress.
 #
 # Usage:
 #   pytest test_cls_gfx950_subtile_codegen.py -v
@@ -182,11 +184,54 @@ _RE_M0BASE_INIT = re.compile(r"s\[sgprCLSm0Base\],\s*0x0")
 _RE_M0BASE_STEP = re.compile(r"s_add_u32\s+s\[sgprCLSm0Base\],\s*s\[sgprCLSm0Base\],\s*(\d+)")
 
 
+# An incToNextRow SRD advance and the two instruction forms that may legally
+# produce the value it consumes: a stride compute (s_mul/s_lshl off a Stride
+# sgpr) or an explicit zero (the "row 0, no advance" seed).
+_RE_SRD_ADVANCE = re.compile(
+    r"^\s*s_add_u32 s\[sgprSrd([CD])\+0\], s\[sgprSrd\1\+0\], (s\d+)\b.*incToNextRow")
+_RE_STRIDE_COMPUTE = re.compile(r"^\s*s_(?:mul_i32|lshl_b32) s\d+, s\[sgprStride")
+_RE_ZERO_WRITE = re.compile(r"^\s*s_mov_b32 s\d+, 0\s*(?://.*)?$")
+
+
 def _counts(asm):
     on = len(_RE_IDX_ON.findall(asm))
     off = len(_RE_IDX_OFF.findall(asm))
     reads = len(_RE_ACC_READ.findall(asm))
     return on, off, reads
+
+
+def _writes_sgpr(line, reg):
+    """True if `line` writes scalar register `reg` (single dest or b64 pair).
+
+    The b64 form matters: the subtile exec mask is written as a wave64 pair
+    (s_mov_b64/s_lshr_b64 s[N:N+1]), which clobbers both halves.
+    """
+    n = int(reg[1:])
+    code = line.split("//")[0]
+    if re.match(rf"^\s*s_\w+ {reg}\s*,", code):
+        return True
+    pair = re.match(r"^\s*s_\w+ s\[(\d+):(\d+)\]\s*,", code)
+    return bool(pair and int(pair.group(1)) <= n <= int(pair.group(2)))
+
+
+def _srd_advance_producers(asm):
+    """Pair every incToNextRow SRD advance with the value it actually adds.
+
+    Returns [(lineno, reg, producer_line)], where producer_line is the nearest
+    preceding instruction that writes the consumed register -- i.e. what the
+    hardware really adds to the SRD, not what the emitter intended.
+    """
+    lines = asm.splitlines()
+    sites = []
+    for i, raw in enumerate(lines):
+        m = _RE_SRD_ADVANCE.match(raw)
+        if not m:
+            continue
+        reg = m.group(2)
+        producer = next((lines[j] for j in range(i - 1, -1, -1)
+                         if _writes_sgpr(lines[j], reg)), None)
+        sites.append((i + 1, reg, producer))
+    return sites
 
 
 def _counter_inits(asm):
@@ -579,3 +624,199 @@ class TestComputeCLSLayoutSubtile:
         # by the countdown loop and must not be compacted.
         bpb, iterCount, _ = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches=8)
         assert iterCount == 1 and bpb == 8
+
+
+class TestSubtileSrdAdvanceIsSelfContained:
+    """The store/load SRD must be advanced by a stride, never by leftover scratch.
+
+    Under CompactLoopStore incrementToNextRow normally software-pipelines the
+    row increment: call N leaves the increment call N+1 needs in s[stmp]. On the
+    subtile path that carrier does not survive -- the paired/scalar store bodies
+    emitted between two calls reuse s[stmp] (and s[stmp+1]) as the wave64 exec
+    mask and as address scratch. The subtile sites therefore have to compute
+    their increment immediately before the s_add that consumes it.
+
+    A regression here is not a codegen-quality nit: the SRD gets advanced by a
+    lane mask, the address walks off the buffer, and the kernel dies with
+    hipErrorIllegalAddress once the CLS loop compacts.
+    """
+
+    @pytest.mark.parametrize("cls", [False, True], ids=["cls_off", "cls_on"])
+    @pytest.mark.parametrize("use_bf16", [False, True], ids=["f32", "bf16"])
+    @pytest.mark.parametrize("mt_a,mt_b,depth_u", COMPACTING_CONFIGS,
+                             ids=[f"{a}x{b}" for a, b, _ in COMPACTING_CONFIGS])
+    def test_srd_advance_consumes_a_stride_not_scratch(self, mt_a, mt_b, depth_u,
+                                                      use_bf16, cls):
+        """Every SRD advance adds a freshly computed stride (or an explicit 0).
+
+        This is the property the post-assembly cls_subtile_stridefix.py used to
+        establish by hand: walk back from each `s_add_u32 s[sgprSrdX+0], ..., sN`
+        to the nearest write of sN and require it to be a stride compute or a
+        zero seed. Anything else (an exec-mask `s_and`, a waveN-stride constant,
+        an `s_mov_b64` lane pair) means the advance consumes scratch.
+        """
+        asm, _ = _build_subtile_store_asm(mt_a, mt_b, depth_u, cls=cls,
+                                          use_bf16=use_bf16)
+        sites = _srd_advance_producers(asm)
+        assert sites, "expected at least one incToNextRow SRD advance"
+        for lineno, reg, producer in sites:
+            assert producer is not None, (
+                f"SRD advance at line {lineno} consumes {reg}, which is never "
+                f"written -- the increment is undefined")
+            assert (_RE_STRIDE_COMPUTE.match(producer)
+                    or _RE_ZERO_WRITE.match(producer)), (
+                f"SRD advance at line {lineno} consumes {reg}, whose nearest "
+                f"prior write is neither a stride compute nor an explicit zero: "
+                f"{producer.strip()!r}. The SRD would advance by scratch "
+                f"(-> hipErrorIllegalAddress once the CLS loop compacts).")
+
+    @pytest.mark.parametrize("use_bf16", [False, True], ids=["f32", "bf16"])
+    def test_cls_on_matches_cls_off_advance_count(self, use_bf16):
+        """Turning CLS on must not drop or duplicate an SRD advance.
+
+        The fix reorders instructions within a site; it must not change how many
+        times the SRD is stepped, or D lands at the wrong rows.
+        """
+        off, _ = _build_subtile_store_asm(*COMPACTING_CONFIGS[0], cls=False,
+                                          use_bf16=use_bf16)
+        on, _ = _build_subtile_store_asm(*COMPACTING_CONFIGS[0], cls=True,
+                                         use_bf16=use_bf16)
+        n_off = len(_srd_advance_producers(off))
+        n_on = len(_srd_advance_producers(on))
+        # CLS may add exactly one extra leading seed advance (the chain seed that
+        # forceinitrow0 opens); it must never remove one.
+        assert n_on in (n_off, n_off + 1), (
+            f"CLS changed the SRD advance count: off={n_off} on={n_on}")
+
+
+class TestIncrementToNextRowSelfContainedStride:
+    """Direct tests of the incrementToNextRow emit order.
+
+    incrementToNextRow only reads `self.rowInc`, the bpe, and a few kernel keys,
+    so it can be exercised without building a whole KernelWriter -- the same way
+    TestComputeCLSLayoutSubtile calls computeCLSLayout as a pure function.
+    """
+
+    STMP = 40
+    BPE = 2          # bf16 destination
+    ROWS = 16        # subtile mBlockSize
+
+    @classmethod
+    def _emit(cls, clsOn, rowInc, selfContained, tc="D"):
+        from types import SimpleNamespace
+        from Tensile.AsmAddressCalculation import AddrCalculation
+
+        addrCalc = AddrCalculation.__new__(AddrCalculation)
+        addrCalc.rowInc = rowInc
+        addrCalc.kernelWriter = SimpleNamespace(
+            states=SimpleNamespace(bpeCexternal=cls.BPE,
+                                   indexChars=list("IJKLMNOP")))
+        kernel = {
+            "CompactLoopStore": clsOn,
+            "PackedC1IndicesX": [1],          # -> Stride<tc>J
+            "_GlobalAccumulation": None,
+            "WorkGroupReduction": False,
+        }
+        ss = SimpleNamespace(optSrdIncForRow=1)
+        mod = addrCalc.incrementToNextRow(kernel, tc, ss, cls.STMP,
+                                          forceinitrow0=1,
+                                          selfContainedStride=selfContained)
+        return [ln for ln in str(mod).splitlines() if ln.strip()]
+
+    @staticmethod
+    def _index_of(lines, needle):
+        for i, ln in enumerate(lines):
+            if needle in ln:
+                return i
+        return -1
+
+    def test_cls_delayed_primer_computes_after_the_add(self):
+        """Default CLS: the s_add consumes a value primed by an earlier call, and
+        the stride compute at the end primes the next one."""
+        lines = self._emit(clsOn=True, rowInc=self.ROWS, selfContained=False)
+        add = self._index_of(lines, "s_add_u32")
+        mul = self._index_of(lines, "s_mul_i32")
+        assert add >= 0 and mul >= 0, lines
+        assert add < mul, f"expected the delayed primer (add before mul): {lines}"
+
+    @pytest.mark.parametrize("clsOn", [False, True], ids=["cls_off", "cls_on"])
+    def test_self_contained_computes_before_the_add(self, clsOn):
+        """selfContainedStride: the stride is computed first, so the s_add cannot
+        consume anything another emitter left in s[stmp]."""
+        lines = self._emit(clsOn=clsOn, rowInc=self.ROWS, selfContained=True)
+        add = self._index_of(lines, "s_add_u32")
+        mul = self._index_of(lines, "s_mul_i32")
+        assert add >= 0 and mul >= 0, lines
+        assert mul < add, f"expected mul before add: {lines}"
+        assert sum("s_mul_i32" in ln for ln in lines) == 1, (
+            f"the trailing primer must be gone -- a second stride compute would "
+            f"leave a stale value for the next site to pick up: {lines}")
+
+    def test_self_contained_scales_by_the_calls_own_rows(self):
+        """The increment is this call's own rowInc * bpe, not a look-ahead."""
+        lines = self._emit(clsOn=True, rowInc=self.ROWS, selfContained=True)
+        mul = [ln for ln in lines if "s_mul_i32" in ln]
+        assert len(mul) == 1, lines
+        assert f", {self.ROWS * self.BPE}" in mul[0], (
+            f"expected the stride scaled by rowInc({self.ROWS}) * bpe({self.BPE}) "
+            f"= {self.ROWS * self.BPE}: {mul[0]!r}")
+
+    def test_self_contained_row_zero_advances_by_nothing(self):
+        """rowInc == 0 must produce a real zero, not a bpe-scaled stride.
+
+        The shared stride builder folds numRows 0 and 1 into the same
+        "scale by BPE" arm, which is correct for 1 and a whole spurious row for
+        0. A self-contained seed site has to add exactly 0.
+        """
+        lines = self._emit(clsOn=True, rowInc=0, selfContained=True)
+        add = self._index_of(lines, "s_add_u32")
+        assert add >= 0, lines
+        pre = lines[:add]
+        assert any(re.search(rf"s_mov_b32 s{self.STMP}, 0\b", ln) for ln in pre), (
+            f"expected an explicit zero increment before the s_add: {lines}")
+        assert not any("s_lshl" in ln or "s_mul" in ln for ln in pre), (
+            f"row 0 must not scale a stride: {lines}")
+
+    def test_cls_off_is_unchanged_by_the_new_flag(self):
+        """CLS-off already computed before the add; the flag must be inert there."""
+        base = self._emit(clsOn=False, rowInc=self.ROWS, selfContained=False)
+        flagged = self._emit(clsOn=False, rowInc=self.ROWS, selfContained=True)
+        assert base == flagged, (base, flagged)
+
+
+class TestSubtileSrdAdvanceCallSites:
+    """The two emitters that step an SRD across subtile store bodies must opt out
+    of the CLS delayed-primer chain. Pinned at the source level because the
+    C-load site only fires on the beta path, which the store-module harness above
+    does not build -- so nothing else in this file would notice it regressing.
+    """
+
+    @staticmethod
+    def _source_of(module_name, class_name, method_name):
+        import importlib
+        import inspect
+        mod = importlib.import_module(module_name)
+        owner = getattr(mod, class_name) if class_name else mod
+        return inspect.getsource(getattr(owner, method_name))
+
+    def test_deferred_subtile_store_srd_inc_is_self_contained(self):
+        """GlobalWriteBatch defers the sba=0 SrdD advance past the paired store
+        that clobbers the scratch pair, so it must not use the chain."""
+        src = self._source_of("Tensile.Components.GlobalWriteBatch",
+                              "GlobalWriteBatchWriter", "_emitNonatomicAdd")
+        calls = re.findall(
+            r"_subtilePendingSrdDInc\s*=\s*addrCalc\.incrementToNextRow\([^)]*\)", src)
+        assert len(calls) == 1, f"expected exactly one deferred SrdD advance: {calls}"
+        assert "selfContainedStride=True" in calls[0], (
+            "the deferred subtile SrdD advance must pass selfContainedStride=True; "
+            "without it the s_add consumes the exec mask left in s[tmpS01]")
+
+    def test_readinput_srd_inc_is_self_contained_on_subtile(self):
+        """readInput's C/E/Gate advance carries its increment in the same scratch
+        pair the subtile store uses for the exec mask."""
+        src = self._source_of("Tensile.KernelWriterAssembly",
+                              "KernelWriterAssembly", "readInput")
+        assert "incrementToNextRow" in src
+        assert 'selfContainedStride=kernel["UseSubtileImpl"]' in src, (
+            "readInput must opt the subtile load-SRD advance out of the CLS "
+            "delayed-primer chain")

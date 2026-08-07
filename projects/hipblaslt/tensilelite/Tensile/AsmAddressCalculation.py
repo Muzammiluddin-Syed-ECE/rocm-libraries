@@ -917,7 +917,8 @@ class AddrCalculation:
         return module
 
     def incrementToNextRow(self, kernel, tc, ss, stmp, forceinitrow0=0,
-                           overrideAfterPrimerRows=0, bpeType=None, dst=-1):
+                           overrideAfterPrimerRows=0, bpeType=None, dst=-1,
+                           selfContainedStride=False):
         """
         Generate code to move to the next row(s)
         If optSrdIncForRow, this will move the SRD forward
@@ -942,6 +943,18 @@ class AddrCalculation:
         Legacy path (CompactLoopStore=False): emit stride compute BEFORE s_add
         (each call self-contained, gated by rowInc != 0). `forceinitrow0=0`
         and `overrideAfterPrimerRows=0` defaults keep legacy behaviour.
+
+        `selfContainedStride=True` opts a single call OUT of the CLS delayed
+        chain and back onto the legacy self-contained form (stride compute
+        BEFORE s_add, using this call's own numRows, no AFTER-primer). It is
+        required at any site where s[stmp] cannot survive from one call to the
+        next. The subtile store path is such a site: the paired/scalar stores
+        emitted between two calls reuse s[stmp] as ordinary scratch (the
+        wave64 exec mask in `GlobalWriteBatch._emitAlign8ExecMask`, the
+        waveN-stride constant in the paired-store address setup), so the
+        primer written by call N is long gone by the time call N+1's s_add
+        reads it -- the store SRD then advances by whatever scratch value
+        happens to be there instead of by a row stride.
 
         """
 
@@ -989,10 +1002,23 @@ class AddrCalculation:
                                     comment="incToNextRow: Scale by BPE"))
                     return sc
 
-                # Legacy (non-CompactLoopStore): stride compute BEFORE s_add,
-                # using the call's own numRows.
-                if not kernel["CompactLoopStore"]:
-                    module.add(_buildStrideCompute(numRows))
+                # The delayed primer only applies to CLS sites that can carry
+                # s[stmp] to the next call; `selfContainedStride` opts a call
+                # back onto the legacy self-contained form (see docstring).
+                clsDelayedPrimer = kernel["CompactLoopStore"] and not selfContainedStride
+
+                # Legacy (and self-contained CLS): stride compute BEFORE s_add,
+                # using the call's own numRows. numRows == 0 is only reachable
+                # here via forceinitrow0 (the CLS chain seed); it must advance
+                # by nothing, and _buildStrideCompute cannot express that --
+                # its fallback arm scales by bpe, which is right for numRows==1
+                # but a whole spurious row for numRows==0.
+                if not clsDelayedPrimer:
+                    if numRows:
+                        module.add(_buildStrideCompute(numRows))
+                    else:
+                        module.add(SMovB32(dst=sgpr(stmp), src=0,
+                                    comment="incToNextRow: row 0, no advance"))
 
                 if dst == -1:
                     dstLow = "Srd%s+0"%(tc)
@@ -1027,7 +1053,7 @@ class AddrCalculation:
                 # so elt-(N+1)'s s_add reads exactly its own advance. Without
                 # override, primer uses elt-N's own numRows (off-by-one for
                 # CLS, but kept as the documented fallback).
-                if kernel["CompactLoopStore"]:
+                if clsDelayedPrimer:
                     primerRows = overrideAfterPrimerRows if overrideAfterPrimerRows else numRows
                     module.add(_buildStrideCompute(primerRows))
 

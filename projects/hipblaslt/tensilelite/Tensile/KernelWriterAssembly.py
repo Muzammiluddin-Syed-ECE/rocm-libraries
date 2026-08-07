@@ -17096,10 +17096,17 @@ class KernelWriterAssembly(KernelWriter):
     # CLS uses tmpS01+1 so the C-load chain primer does not trash D-store's
     # chain (which uses tmpS01). Non-CLS uses tmpS01 for all tcs (= baseline).
     # `forceinitrow0=1` opens the same gate inside incrementToNextRow.
+    #
+    # On the subtile path neither s[tmpS01] nor s[tmpS01+1] survives between two
+    # of these calls: the subtile store bodies emitted in between claim the pair
+    # as the wave64 exec mask (GlobalWriteBatch._emitAlign8ExecMask), so the
+    # C-load chain would advance SrdC by a lane mask -> hipErrorIllegalAddress
+    # on the beta path. Opt those sites out of the chain entirely.
     if (ss.optSrdIncForRow and (addrCalc.rowInc or (kernel["CompactLoopStore"] and elementIdx == 0 and batchIdx == 0))) and not isWorkspace:
       _stmp = (tmpS01 + 1) if (tc == 'C' and kernel["CompactLoopStore"]) else tmpS01
       module.add(addrCalc.incrementToNextRow(kernel, tc, ss, _stmp, forceinitrow0=1, bpeType=bpeType,
-                                             overrideAfterPrimerRows=overrideAfterPrimerRows))
+                                             overrideAfterPrimerRows=overrideAfterPrimerRows,
+                                             selfContainedStride=kernel["UseSubtileImpl"]))
 
     if dataType.isHalf():
       hi16 = 0 if (self.states.HHH_WMMA or tc == 'Gate') else (vc0 % 2)

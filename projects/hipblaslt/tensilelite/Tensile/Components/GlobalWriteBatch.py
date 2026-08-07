@@ -2206,8 +2206,16 @@ class GlobalWriteBatchWriter:
               self.storesIssued += 1
           else:
             # sba=0 element (even tt0): defer SRD row increment until after N-group label.
+            # `selfContainedStride=True`: this site must not join the CLS
+            # delayed-primer chain. The paired/scalar subtile stores emitted
+            # between two of these calls reuse tmpS01 as ordinary scratch (the
+            # exec mask in _emitAlign8ExecMask, the waveN stride in the paired
+            # address setup), so a primer left in s[tmpS01] is clobbered before
+            # the next s_add consumes it and the store SRD would advance by a
+            # scratch value instead of a row stride (-> hipErrorIllegalAddress).
             if self.ss.optSrdIncForRow and addrCalc.rowInc:
-              self._subtilePendingSrdDInc = addrCalc.incrementToNextRow(self.kernel, "D", self.ss, self.tmpS01)
+              self._subtilePendingSrdDInc = addrCalc.incrementToNextRow(self.kernel, "D", self.ss, self.tmpS01,
+                                                                       selfContainedStride=True)
             partnerElementIdx = elementIdx + 1
             partnerExists = (partnerElementIdx < len(self.batchElements) and
                              self.batchElements[partnerElementIdx][1] == tt0 + 1)
