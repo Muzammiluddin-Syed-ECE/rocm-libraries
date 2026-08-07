@@ -59,6 +59,16 @@ class SWaitCntEx(SWaitCnt):
 
 
 
+def _dataTypeIs16bit(kernel):
+    """True when A/B elements are 16-bit (bf16 or fp16).
+
+    These share the AB_B16 geometry: 2 K-elements packed per 32-bit vgpr, so
+    a K-boundary can land mid-vgpr and needs half-masking.
+    """
+    dtype = kernel["ProblemType"]["DataTypeA"]
+    return dtype.isBFloat16() or dtype.isHalf()
+
+
 def _zigzag_order(rows, cols):
     """Return (row, col) pairs in boustrophedon (zigzag/snake) order.
 
@@ -423,8 +433,8 @@ class InstructionEmitter:
         Only two vgprs survive past this routine and into emit_mask_k:
           * self._tail_vDiff           — rem - laneK_0 (for subIterK=n the
             effective diff is diff - n*MatrixInstK, folded into cmp constants)
-          * self._tail_boundaryMask[4] — BF16 only; precomputed boundary masks
-            indexed by vgpr i, derived from d = rem % 8
+          * self._tail_boundaryMask[4] — 16-bit (bf16/fp16) only; precomputed
+            boundary masks indexed by vgpr i, derived from d = rem % 8
 
         """
         numMIInUnroll, dividerFortidInK = self._mfma_K_constants()
@@ -461,11 +471,11 @@ class InstructionEmitter:
 
         self._tail_boundaryMask = None
         laneSGPRCount = writer.states.laneSGPRCount
-        if self.kernel["ProblemType"]["DataTypeA"].isBFloat16():
+        if _dataTypeIs16bit(self.kernel):
             halfMaskVgpr = writer.vgprPool.checkOut(1, "tail_halfMask")
             module.add(VMovB32(
                 dst=vgpr(halfMaskVgpr), src="0x0000FFFF",
-                comment="BF16 half-mask: keep K0 (low 16b), zero K1 (high 16b)"))
+                comment="16-bit half-mask: keep K0 (low 16b), zero K1 (high 16b)"))
 
             # Precompute the boundary masks from d = rem % numMIInUnroll.
             # The boundary-mask pattern (which vgprs are full/half/zero)
@@ -475,7 +485,7 @@ class InstructionEmitter:
             # subIterK has effective_diff ≡ rem (mod numMIInUnroll). So all
             # boundary lanes share the same mask pattern (one per vgpr held
             # per lane: numMIInUnroll // kStride masks).
-            kStride = 2  # BF16: 2 K-elements packed per 32-bit vgpr
+            kStride = 2  # 16-bit: 2 K-elements packed per 32-bit vgpr
             assert numMIInUnroll % kStride == 0, \
                 f"numMIInUnroll ({numMIInUnroll}) must be a multiple of kStride ({kStride})"
             numBoundaryMasks = numMIInUnroll // kStride
@@ -524,11 +534,11 @@ class InstructionEmitter:
         effective per-lane diff is diff - n*MatrixInstK, folded into the
         cmp immediates (no per-call sub).
 
-        BF16 (kStride=2 K positions per vgpr) builds a per-vgpr 3-state mask
-        from the precomputed boundary masks (full / boundary[i] / zero).
-        Non-BF16 (e.g. FP4) builds a single 2-state mask shared across all
+        16-bit types (kStride=2 K positions per vgpr) build a per-vgpr 3-state
+        mask from the precomputed boundary masks (full / boundary[i] / zero).
+        Narrower types (e.g. FP4) build a single 2-state mask shared across all
         vgprs, assuming rem aligns to the per-lane K stride (true for
-        rem=32 with FP4 MIK=128). A boundary inside a non-BF16 vgpr would
+        rem=32 with FP4 MIK=128). A boundary inside a narrower vgpr would
         need per-byte/nibble handling.
         """
         assert self._tail_vDiff is not None, \
@@ -540,8 +550,8 @@ class InstructionEmitter:
         kBaseConst = subIterK * kernel["MatrixInstK"]
 
         laneSGPRCount = writer.states.laneSGPRCount
-        isBF16 = kernel["ProblemType"]["DataTypeA"].isBFloat16()
-        kStride = 2  # BF16: 2 elements packed per 32-bit vgpr (low=K0, high=K1)
+        is16bit = _dataTypeIs16bit(kernel)
+        kStride = 2  # 16-bit: 2 elements packed per 32-bit vgpr (low=K0, high=K1)
 
         module = Module()
 
@@ -561,7 +571,7 @@ class InstructionEmitter:
 
             def _emit_cmp(cmpCls, literal, comment):
                 # VOPC inline range is -16..64; stage out-of-range via scratch sgpr
-                # (e.g. BF16 MI_K=32 subIterK>=2, or FP4 MI_K=128 subIterK>=1).
+                # (e.g. 16-bit MI_K=32 subIterK>=2, or FP4 MI_K=128 subIterK>=1).
                 if -16 <= literal <= 64:
                     module.add(cmpCls(
                         dst=sgpr(maskSgpr, laneSGPRCount),
@@ -578,7 +588,7 @@ class InstructionEmitter:
                             src0=vgpr(self._tail_vDiff), src1=sgpr(litSgpr),
                             comment=comment))
 
-            if isBF16:
+            if is16bit:
                 # 3-way per (lane, subIterK), 2 cmps shared across all i:
                 #   sFull = effective_diff_n >= numMIInUnroll → -1
                 #   sZero = effective_diff_n <= 0            → 0
@@ -644,13 +654,13 @@ class InstructionEmitter:
                                 dst=vgpr(v), src0=vgpr(v), src1=vgpr(maskVgprs[i]),
                                 comment=f"mask {label}[{i}] (K=[{i*kStride},{i*kStride+kStride-1}])"))
 
-            # Scale-mask reuse (non-BF16 hasScale only): AND the scale
+            # Scale-mask reuse (non-16-bit hasScale only): AND the scale
             # vgprs with the data mask we just built. Redundant when
             # host zero-padding leaves OOB scale bytes at 0x00 (0x00
             # AND 0 = 0x00) but kept to stay explicit under any input
             # pattern.
             scaleStride = self.config.lrSA.k if self.hasScale else 0
-            if (not isBF16) and self.hasScale \
+            if (not is16bit) and self.hasScale \
                     and (self.vgprTilesSA or self.vgprTilesSB) \
                     and scaleStride > 0 and (subIterK % scaleStride == 0):
                 for tensor, tilesList in (('SA', self.vgprTilesSA),

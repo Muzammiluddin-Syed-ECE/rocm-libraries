@@ -1060,6 +1060,25 @@ def _selectF8F6F4InstType(kernel):
 
 
 ##################################################
+# Pick the MFMAInstruction instType for the 16-bit V_MFMA_F32_16X16X32_<T>
+# family. Both bf16 and fp16 route to the AB_B16 geometries in Solution.py,
+# so the opcode must follow the data type rather than assuming bf16.
+##################################################
+def _select16bitInstType(kernel):
+  pt = kernel.get("ProblemType") or {}
+  aType = pt.get("DataTypeA")
+  bType = pt.get("DataTypeB")
+  if aType is not None and bType is not None:
+    if aType.isHalf() and bType.isHalf():
+      return InstType.INST_F16
+    if aType.isBFloat16() and bType.isBFloat16():
+      return InstType.INST_BF16
+  raise RuntimeError(
+      f"No 16-bit MFMA instruction for A = {aType}, B = {bType} "
+      "(mixed fp16/bf16 inputs have no matching v_mfma_f32_16x16x32_* opcode)\n")
+
+
+##################################################
 # Subroutine to generate MMA Instruction
 # Given RegisterTileInfo inputs for A,B,C,D operands
 # emit corresponding mfma instruction
@@ -1117,8 +1136,8 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
                                    mxsa=vgpr(unitScaleVgpr), mxsb=vgpr(unitScaleVgpr), \
                                    comment=comment))
   else:
-    # BF16: 16x16x32
-    module.add(MFMAInstruction(instType=InstType.INST_BF16, accType=InstType.INST_F32, variant=[16,16,miK,1], mfma1k=False, \
+    # BF16 / FP16: 16x16x32
+    module.add(MFMAInstruction(instType=_select16bitInstType(kernel), accType=InstType.INST_F32, variant=[16,16,miK,1], mfma1k=False, \
                                acc=dAccAlias(vgprDStart,opDSize), \
                                a=aOperand, \
                                b=bOperand, \

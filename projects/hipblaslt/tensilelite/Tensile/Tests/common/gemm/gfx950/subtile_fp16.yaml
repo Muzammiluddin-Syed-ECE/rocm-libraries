@@ -1,0 +1,258 @@
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250] # not supported by arch
+
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  PrintSolutionRejectionReason: True
+  NumElementsToValidate: -1
+  MinimumRequiredVersion: 5.0.0
+  PrintLevel: 3
+  Device: 0
+  CMakeBuildType: Release
+  KernelTime: True
+  MaxWorkspaceSize: 13421772800
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  DataInitTypeC: 3
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 2
+  DataInitTypeBias: 1
+  BoundsCheck: 0
+  KeepBuildTmp: True
+  CpuThreads: 1
+  RotatingBufferSize: 0
+
+# FP16 (Half) A/B inputs under UseSubtileImpl.
+#
+# The subtile MFMA emitter hardcoded v_mfma_f32_16x16x32_bf16 for every
+# non-MX 16-bit kernel, so fp16 inputs were multiplied as bf16 bit patterns
+# and every output element was wrong. K is kept small enough that the f32
+# accumulator stays inside the fp16 range, so any inf in the output is a
+# real defect rather than legitimate saturation.
+
+BenchmarkProblems:
+  ########################################
+  # HHS TN — no bias, DU = 2*MI_K = 64
+  #
+  # Wave tile coverage: symmetric, asymmetric, odd, and the 1x1/2x2/4x1/1x4
+  # wave groups. Problem sizes cover full tiles, mult-of-32 edges, and odd
+  # M,N. K is always a multiple of DU (no tail loop) — the tail loop gets its
+  # own sweep below.
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      ActivationFuncCall: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          # 1x1 wave group
+          - [16, 16, 32, 1,  1, 2, 2,  1, 1]  # MT 32x32
+          # 2x2 wave group — symmetric
+          - [16, 16, 32, 1,  1, 4, 4,  2, 2]  # MT 128x128
+          - [16, 16, 32, 1,  1, 8, 8,  2, 2]  # MT 256x256
+          - [16, 16, 32, 1,  1, 10, 10, 2, 2] # MT 320x320 (multi-partition)
+          # 2x2 wave group — asymmetric / odd wavetile
+          - [16, 16, 32, 1,  1, 3, 4,  2, 2]  # MT 96x128  (odd M wavetile)
+          - [16, 16, 32, 1,  1, 6, 4,  2, 2]  # MT 192x128 (odd M wavetile)
+          - [16, 16, 32, 1,  1, 1, 4,  2, 2]  # MT 32x128  (MIWT 1x4)
+          - [16, 16, 32, 1,  1, 4, 2,  2, 2]  # MT 128x64  (MIWT 4x2)
+          # 4x1 and 1x4 wave groups
+          - [16, 16, 32, 1,  1, 2, 6,  4, 1]  # MT 128x96  (odd N wavetile)
+          - [16, 16, 32, 1,  1, 6, 4,  1, 4]  # MT 96x256  (odd M wavetile)
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]                  # 2*MI_K = 2*32
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          # Full-tile sizes (K = 1×DU .. 4×DU)
+          - Exact: [128, 128, 1,  64]   # K = 1*DU (minimum)
+          - Exact: [128, 128, 1, 128]   # K = 2*DU
+          - Exact: [256, 256, 1, 192]   # K = 3*DU
+          - Exact: [320, 320, 1, 128]   # full tile for MT 320x320
+          # Mult-of-32 edges: M,N not multiples of macro tile
+          - Exact: [96,  96,  1, 128]   # 3*32, edge for MT >= 128
+          - Exact: [160, 160, 1, 128]   # 5*32, edge for MT >= 192
+          - Exact: [224, 224, 1, 128]   # 7*32, edge for MT >= 256
+          - Exact: [352, 352, 1, 128]   # 11*32, edge for MT >= 384
+          # Asymmetric M vs N
+          - Exact: [96,  256, 1, 128]   # M edge, N full tile
+          - Exact: [256,  96, 1, 128]   # M full tile, N edge
+          # Odd M,N not aligned to 32 (fp16 has no alignment restriction)
+          - Range: [[17, 32, 113], [17, 32, 113], [1], [128]]  # 17,49,81,113
+          - Range: [[33, 64, 161], [33, 64, 161], [1], [128]]  # 33,97,161
+
+  ########################################
+  # HHS TN — TAIL loop sweep (bias + ScaleAlphaVec + hipblaslt_all)
+  #
+  # Sweeps K = 1..128 (step 1), exercising every tail-loop remainder for
+  # DU=64 and DU=128. This is the coverage that the fp16 tail-loop paths
+  # previously lacked entirely: the K-boundary half-mask (2 fp16 elements
+  # packed per 32-bit vgpr) and the boundary DTL fixup load for the trailing
+  # 16-bit element lost to an OOB dwordx4 global read.
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: true
+      TransposeB: false
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: hipblaslt_all
+      ActivationFuncCall: True
+      UseBias: 1
+      BiasDataTypeList: [h]
+      UseScaleAlphaVec: 1
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1,  1, 4, 4,  2, 2]  # MT 128x128
+          - [16, 16, 32, 1,  1, 10, 10, 2, 2] # MT 320x320 (multi-partition)
+          - [16, 16, 32, 1,  1, 3, 4,  2, 2]  # MT 96x128  (odd-M wavetile: sub-lane mask × per-wave layout)
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [1]
+        - ActivationFuncCall: [false]
+        - DepthU: [64, 128]
+        - TransposeLDS: [1]
+        - StreamK: [3]
+        - StaggerU: [0]
+        - 1LDSBuffer: [0]
+        - NonTemporalD: [4]
+        - SourceSwap: [true]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [4]
+        - UseSubtileImpl: [true]
+        - UseCustomMainLoopSchedule: [0]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Range: [[400], [400], [1], [1, 1, 128]]
+        - BiasTypeArgs: ['h']
+
+  ########################################
+  # HHS TN — bias + ScaleAlphaVec + hipblaslt_all activations
+  #
+  # Mirrors the configuration that first exposed the wrong MFMA opcode
+  # (fp16 dest through the 16-bit paired dwordx4 subtile store).
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: h
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: hipblaslt_all
+      UseBias: 1
+      BiasDataTypeList: [s]
+      UseScaleAlphaVec: 1
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1,  1, 4, 4,  2, 2]  # MT 128x128
+          - [16, 16, 32, 1,  1, 8, 8,  2, 2]  # MT 256x256
+          - [16, 16, 32, 1,  1, 3, 4,  2, 2]  # MT 96x128  (odd M wavetile)
+          - [16, 16, 32, 1,  1, 1, 4,  2, 2]  # MT 32x128  (MIWT 1x4)
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - ActivationFuncCall: [true]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [128, 128, 1, 128]
+          - Exact: [160, 160, 1, 128]   # edge: M,N not a multiple of macro tile
+        - BiasTypeArgs: ['s']
+        - ActivationArgs:
+          - [Enum: none]
+          - [Enum: relu]
+          - [Enum: gelu]
+
+  ########################################
+  # HSS TN — FP16 input, F32 output
+  #
+  # mBlockSize=16 for f32 dest, so this takes the regular (non-16-bit)
+  # subtile store while still exercising the fp16 MFMA and local-read path.
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: h
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: hipblaslt_all
+      UseBias: 1
+      BiasDataTypeList: [s]
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1,  1, 2, 2,  1, 1]  # MT 32x32   (1x1 WG)
+          - [16, 16, 32, 1,  1, 4, 4,  2, 2]  # MT 128x128
+          - [16, 16, 32, 1,  1, 3, 4,  2, 2]  # MT 96x128  (odd M wavetile)
+          - [16, 16, 32, 1,  1, 2, 6,  4, 1]  # MT 128x96  (4x1 WG)
+        - PrefetchGlobalRead: [0, 1, 2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [64]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [128, 128, 1, 128]
+          - Exact: [160, 160, 1, 128]
+          - Exact: [96,  256, 1, 128]
+          - Range: [[17, 32, 113], [17, 32, 113], [1], [128]]
+        - BiasTypeArgs: ['s']
+        - ActivationArgs:
+          - [Enum: none]
+          - [Enum: relu]

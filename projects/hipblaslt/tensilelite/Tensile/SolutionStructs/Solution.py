@@ -1012,6 +1012,15 @@ class Solution(collections.abc.Mapping):
       if state["DepthU"] % duUnit != 0:
         reject(state, printRejectionReason, f"UseSubtileImpl=1 support only DepthU multiple of {numSubIterK} * MatrixInstK * LocalSplitU")
 
+      # bf16 and fp16 both map to the AB_B16 geometries, but the 16-bit MFMA
+      # family has no mixed-input opcode and the subtile path does not convert
+      # between them, so reject the pair here rather than failing in codegen.
+      dtypeA = state["ProblemType"]["DataTypeA"]
+      dtypeB = state["ProblemType"]["DataTypeB"]
+      if (dtypeA.isHalf() and dtypeB.isBFloat16()) or (dtypeA.isBFloat16() and dtypeB.isHalf()):
+        reject(state, printRejectionReason, "UseSubtileImpl=1 has no mixed fp16/bf16 MFMA instruction")
+        return
+
       for tc in ('A', 'B'):
         dtype = state["ProblemType"][f"DataType{tc}"]
         tlu = state["ProblemType"].get(f"TLU{tc}", False)

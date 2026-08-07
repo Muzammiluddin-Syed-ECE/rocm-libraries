@@ -4992,8 +4992,8 @@ class KernelWriterAssembly(KernelWriter):
   ##############################################################################
   # Combined A+B tail-loop boundary DTL load.
   #
-  # For bf16 + subtile + odd K_rem, the regular dwordx4 GR at the K-boundary
-  # straddles an OOB dword; HW zeroes the dword and the trailing 16-bit K
+  # For 16-bit (bf16/fp16) + subtile + odd K_rem, the regular dwordx4 GR at
+  # the K-boundary straddles an OOB dword; HW zeroes the dword and the 16-bit K
   # element is lost. This helper discovers the lane that owns that element
   # (per-lane swizzled vaddrs live in sharedVgprGROffset[i]) and issues a
   # single-lane buffer_load_ushort lds:1 into the correct LDS slot for both
@@ -5010,7 +5010,8 @@ class KernelWriterAssembly(KernelWriter):
         return False
       if tc not in ("A", "B"):
         return False
-      if not kernel["ProblemType"]["DataType"].isBFloat16():
+      dtype = kernel["ProblemType"]["DataType"]
+      if not (dtype.isBFloat16() or dtype.isHalf()):
         return False
       if self.states.groOffsetInMacroTile != 1:
         return False
@@ -5026,7 +5027,7 @@ class KernelWriterAssembly(KernelWriter):
       return True
 
     assert _eligible(tPA) and _eligible(tPB), \
-      "tailLoopBoundaryDtlLoadAB requires bf16/subtile eligibility for both A and B"
+      "tailLoopBoundaryDtlLoadAB requires 16-bit/subtile eligibility for both A and B"
 
     # Both eligible — emit shared K math once, then per-tensor M/load blocks.
     loopCounterName = self.loopCounterName(kernel, self.states.unrollIdx)
@@ -5034,9 +5035,9 @@ class KernelWriterAssembly(KernelWriter):
     depthU          = kernel["DepthU"]
     laneMaskCount   = self.states.laneSGPRCount
 
-    # K-side geometry is identical for A and B in the bf16 subtile path.
+    # K-side geometry is identical for A and B in the 16-bit subtile path.
     bpe          = int(tPA["bpeGR"])
-    elemsPerLane = 16 // bpe  # bf16 -> 8
+    elemsPerLane = 16 // bpe  # 16-bit -> 8
     tileInfoA       = self.states.a.tileInfo
     subtileKElems   = int(tileInfoA.subtileShape[1]) * int(tileInfoA.mmaTileShape[1])
     def _isPow2(n): return n > 0 and (n & (n - 1)) == 0

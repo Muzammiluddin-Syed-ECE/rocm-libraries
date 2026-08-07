@@ -2980,15 +2980,16 @@ class LogicalScheduler:
             'B': MFMATileRange(0, numK, 0, cfg.numMFMATilesN),
         }
         preamble.extend(self._make_gr_all_tensors(0, all_tiles))
-        # bf16-only: an OOB dwordx4 load can corrupt the trailing 16-bit
-        # element at the K-boundary (buffer instructions enforce dword
+        # 16-bit only (bf16/fp16): an OOB dwordx4 load can corrupt the trailing
+        # 16-bit element at the K-boundary (buffer instructions enforce dword
         # granularity on OOB). We patch it with a 16-bit DTL load. Wider
         # dtypes (e.g. fp4 read at K=32 granularity) don't have this issue,
         # so we skip emission entirely for them.
         # TDM uses tensor_load_to_lds, not buffer instructions, so the
         # dword-granularity OOB corruption does not apply.
         hasTDM = self._kernel.get("enableTDMA") and self._kernel.get("enableTDMB")
-        if self._kernel["ProblemType"]["DataTypeA"].isBFloat16() and not hasTDM:
+        _dtypeA = self._kernel["ProblemType"]["DataTypeA"]
+        if (_dtypeA.isBFloat16() or _dtypeA.isHalf()) and not hasTDM:
             # We need to wait for other SIMD before placing the DTL load
             # (as we'll write twice to this address : OOB Zero then fixup load)
             preamble.append(SyncOp())

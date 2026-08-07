@@ -264,6 +264,35 @@ def test_BF16_path_unchanged(writer):
     assert "cbsz" not in asm and "blgp" not in asm
 
 
+# ---- FP16 (must not borrow the BF16 opcode) -------------------------------
+def test_FP16_emits_f16_mfma(writer):
+    """fp16 A/B must select v_mfma_f32_16x16x32_f16.
+
+    The opcode used to be hardcoded to bf16 for every miK==32 kernel, which
+    silently multiplied fp16 bit patterns as bf16 and produced garbage output.
+    """
+    kernel = _mkKernel("H", "H", miK=32, sourceSwap=False)  # 'H' = Half
+    tA = _mkTile(0, 4, writer.vgprPool)
+    tB = _mkTile(8, 4, writer.vgprPool)
+    tC = _mkTile(16, 4, writer.vgprPool)
+    tD = _mkTile(32, 4, writer.vgprPool)
+    asm = str(emitMfmaInstruction(writer, kernel, tA, tB, tC, tD))
+    assert "v_mfma_f32_16x16x32_f16" in asm
+    assert "bf16" not in asm
+    assert "v_mfma_scale" not in asm
+
+
+def test_mixed_16bit_inputs_rejected(writer):
+    """There is no v_mfma_f32_16x16x32_* taking one fp16 and one bf16 operand."""
+    kernel = _mkKernel("H", "B", miK=32, sourceSwap=False)
+    tA = _mkTile(0, 4, writer.vgprPool)
+    tB = _mkTile(8, 4, writer.vgprPool)
+    tC = _mkTile(16, 4, writer.vgprPool)
+    tD = _mkTile(32, 4, writer.vgprPool)
+    with pytest.raises(RuntimeError):
+        emitMfmaInstruction(writer, kernel, tA, tB, tC, tD)
+
+
 # ---- Pool-aliasing dispatch unchanged for F8 ------------------------------
 def test_F8_uses_accvgpr_alias_when_D_in_agpr_pool(writer):
     """When MIArchVgpr=False AND D's pool is the agprPool, the F8 path must
