@@ -625,6 +625,154 @@ class TestComputeCLSLayoutSubtile:
         bpb, iterCount, _ = GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches=8)
         assert iterCount == 1 and bpb == 8
 
+    @pytest.mark.parametrize("mi_wave_tile", [[1, 1], [2, 4], [4, 4], [8, 4], [4, 8]])
+    @pytest.mark.parametrize("source_swap", [False, True])
+    @pytest.mark.parametrize("num_batches", [1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 16])
+    def test_layout_always_covers_every_batch(self, mi_wave_tile, source_swap,
+                                              num_batches):
+        """batchesPerCLSBody * iterCount must equal numBatches, for every arm.
+
+        notLocalSplitUGlobalWrite emits only batchesPerCLSBody batches and the
+        CLS countdown re-executes exactly that body, so any layout whose
+        coverage falls short of numBatches drops whole batches of stores from
+        the kernel -- with no diagnostic, just missing output.
+        """
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        kernel = self._subtile_kernel(mi_wave_tile)
+        kernel["SourceSwap"] = source_swap
+        bpb, iterCount, _ = GlobalWriteBatchWriter.computeCLSLayout(kernel, num_batches)
+        assert bpb * iterCount == num_batches, (bpb, iterCount, num_batches)
+
+
+class TestComputeCLSLayoutSourceSwap:
+    """Pure-function tests of the SourceSwap arm, case (c) of computeCLSLayout.
+
+    Case (c) is selected by outerTT1 == 1, VW1 == 1 and SourceSwap. It is
+    reachable from in-tree configs: Tests/common/gemm/gfx12/bf16_CLS_gfx1250.yaml
+    forks CompactLoopStore=True x SourceSwap=[True,False] over MatrixInstruction
+    rows whose MIWaveTile[1] is 1, and VectorWidthB resolves to 1 there
+    (Solution.py halves the candidate width until MIWaveTile[1] % vw == 0).
+
+    With outerTT1 == VW1 == 1 the SourceSwap branch of accToArchMapper collapses
+    to
+        dst = vw0 + VW0*(bIdx0 + BM*(wgIdx0 + outerTT0*(tIdx + OPM*bIdx1)))
+        src = tIdx + OPM*(bIdx0 + BM*(bIdx1 + BN*(vw0 + VW0*wgIdx0)))
+    so with matrixInstBN == 1 the outermost (slowest) dst dim is tIdx, of extent
+    OutputsPerMFMA1B and src stride 1. A CLS body is a prefix of the element
+    list re-executed with M0 shifted, so tIdx is the only dim the loop can
+    iterate, the iteration extent is OutputsPerMFMA1B, and m0Step is 1.
+    """
+
+    @staticmethod
+    def _kernel(mi_wave_tile, vwa=1, nepbs=0, wave=WAVESIZE_64, mi=(16, 16),
+                bm=1, bn=1):
+        return {
+            "EnableMatrixInstruction": True,
+            "VectorWidthA": vwa,
+            "VectorWidthB": 1,
+            "MIWaveTile": list(mi_wave_tile),
+            "MatrixInstM": mi[0],
+            "MatrixInstN": mi[1],
+            "MatrixInstBM": bm,
+            "MatrixInstBN": bn,
+            "WavefrontSize": wave,
+            "NumElementsPerBatchStore": nepbs,
+            "SourceSwap": True,
+            "StoreRemapVectorWidth": 0,
+            "StreamK": 0,
+        }
+
+    def test_default_num_elements_per_batch_store_does_not_raise(self):
+        """NumElementsPerBatchStore == 0 is the default and must be harmless.
+
+        The arm used to guard on `NEPBS % inner_dims == 0`, which is true for
+        NEPBS == 0, and then divided numBatches by NEPBS -- so every CLS +
+        SourceSwap solution that left NumElementsPerBatchStore at its default
+        died in codegen with ZeroDivisionError.
+        """
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        kernel = self._kernel([4, 1], nepbs=0)
+        for numBatches in (1, 3, 4, 8, 12):
+            bpb, iterCount, m0Step = GlobalWriteBatchWriter.computeCLSLayout(
+                kernel, numBatches)
+            assert bpb * iterCount == numBatches
+            assert m0Step >= 1
+
+    @pytest.mark.parametrize("nepbs", [0, 1, 2, 4, 8, 12])
+    def test_layout_does_not_depend_on_num_elements_per_batch_store(self, nepbs):
+        """NumElementsPerBatchStore caps the batch size upstream (it is one of
+        the clamps that produce numBatches in refineOccupancy); it is not an
+        extent of the accumulator layout, so it must not select the iteration
+        dim. The old arm divided a *batch* count by this *element* count."""
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        base = self._kernel([4, 1], nepbs=0)
+        variant = self._kernel([4, 1], nepbs=nepbs)
+        for numBatches in (1, 2, 4, 8, 12, 16):
+            assert (GlobalWriteBatchWriter.computeCLSLayout(base, numBatches)
+                    == GlobalWriteBatchWriter.computeCLSLayout(variant, numBatches))
+
+    def test_iterates_tidx_with_unit_m0_step(self):
+        """16x16 MI on wave64 gives OutputsPerMFMA1B == 4, so a numBatches that
+        is a multiple of 4 compacts 4x with a unit M0 step."""
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        kernel = self._kernel([4, 1])
+        assert GlobalWriteBatchWriter.computeCLSLayout(kernel, 8) == (2, 4, 1)
+        assert GlobalWriteBatchWriter.computeCLSLayout(kernel, 4) == (1, 4, 1)
+
+    def test_no_compaction_when_tidx_extent_does_not_divide_numbatches(self):
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        kernel = self._kernel([4, 1])            # tIdx extent 4
+        bpb, iterCount, _ = GlobalWriteBatchWriter.computeCLSLayout(kernel, 10)
+        assert (bpb, iterCount) == (10, 1)
+
+    def test_matrix_inst_bn_above_one_stays_single_iteration(self):
+        """matrixInstBN > 1 puts bIdx1 outside tIdx in dst, so a tIdx-sized body
+        is no longer a prefix of the element list and must not compact."""
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        kernel = self._kernel([4, 1], bn=2)
+        _, iterCount, _ = GlobalWriteBatchWriter.computeCLSLayout(kernel, 8)
+        assert iterCount == 1
+
+    @pytest.mark.parametrize("mi_wave_tile,vwa,wave",
+                             [([1, 1], 1, WAVESIZE_64),
+                              ([2, 1], 2, WAVESIZE_64),
+                              ([4, 1], 1, WAVESIZE_64),
+                              ([8, 1], 4, WAVESIZE_64),
+                              ([1, 1], 1, 32),
+                              ([2, 1], 2, 32),
+                              ([4, 1], 4, 32)])
+    @pytest.mark.parametrize("num_batches", [1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 24, 32])
+    def test_m0_step_reaches_the_slice_the_loop_claims(self, mi_wave_tile, vwa,
+                                                      wave, num_batches):
+        """The M0 step must be exactly the acc-src delta between consecutive
+        bodies, checked against the real accToArchMapper.
+
+        This is the property that makes `s_set_gpr_idx_on m0` land on iteration
+        j's accumulator slice: for every read position p in the body,
+        arch2acc[p + j*readsPerBody] == arch2acc[p] + j*m0Step. Pinning it
+        against the mapping (rather than against a number) is what catches an
+        m0Step derived from an unrelated quantity.
+        """
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        from Tensile.KernelWriterModules import accToArchMapper, getAccToArchLen
+
+        kernel = self._kernel(mi_wave_tile, vwa=vwa, wave=wave)
+        bpb, iterCount, m0Step = GlobalWriteBatchWriter.computeCLSLayout(
+            kernel, num_batches)
+        assert bpb * iterCount == num_batches
+        if iterCount == 1:
+            return
+        _, arch2acc = accToArchMapper(kernel)
+        accLen = getAccToArchLen(kernel)
+        assert accLen % iterCount == 0, (accLen, iterCount)
+        readsPerBody = accLen // iterCount
+        for p in range(readsPerBody):
+            for it in range(1, iterCount):
+                assert arch2acc[p + it * readsPerBody] == arch2acc[p] + it * m0Step, (
+                    f"m0Step {m0Step} does not reach slice {it} from read {p}: "
+                    f"src({p + it * readsPerBody})={arch2acc[p + it * readsPerBody]} "
+                    f"vs src({p})+{it}*{m0Step}={arch2acc[p] + it * m0Step}")
+
 
 class TestSubtileSrdAdvanceIsSelfContained:
     """The store/load SRD must be advanced by a stride, never by leftover scratch.

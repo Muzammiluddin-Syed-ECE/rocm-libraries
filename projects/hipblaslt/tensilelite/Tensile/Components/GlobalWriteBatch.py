@@ -50,7 +50,7 @@ from ..AsmStoreState import StoreState
 from ..AsmAddressCalculation import AddrCalculation
 from ..Components.PackData import formatting, PackData_F16, PackData_BF16, PackData_FLOAT8, PackData_FLOAT8_fnuz
 from rocisa.instruction import ECvtF16toF32, ECvtPkFP8toF32, ECvtPkBF8toF32
-from ..KernelWriterModules import hasSequentialValuC, clsWrapIdxCluster
+from ..KernelWriterModules import hasSequentialValuC, clsWrapIdxCluster, getAccToArchLen
 
 from math import ceil, log2
 
@@ -276,7 +276,7 @@ class GlobalWriteBatchWriter:
     Which dim is the CLS iter dim depends on the output layout:
       (a) outerTT1  > 1, VW1 == 1            : iter = wgIdx1, step = OPM*BM*BN*VW0*outerTT0*VW1
       (b) outerTT1 == 1, VW1 > 1, SS=False   : iter = vw1,    step = OPM*BM*BN*VW0*outerTT0
-      (c) outerTT1 == 1, VW1 == 1, SS=True   : iter = tIdx,   step = NEPBS / inner_dims
+      (c) outerTT1 == 1, VW1 == 1, SS=True   : iter = tIdx,   step = 1
     Store paths not covered by the CLS loop (non-MI, StoreRemap, StreamK) and
     non-divisible / non-regular layouts fall back to a single iteration
     (batchesPerCLSBody = numBatches), where m0Step is dead.
@@ -296,7 +296,6 @@ class GlobalWriteBatchWriter:
     matrixInstBM = 1 if (kernel["MatrixInstM"] == 4) else kernel["MatrixInstBM"]
     matrixInstBN = 1 if (kernel["MatrixInstN"] == 4) else kernel["MatrixInstBN"]
     OPM   = miM_ * miN_ // kernel["WavefrontSize"]
-    NEPBS = kernel["NumElementsPerBatchStore"]
 
     if outerTT1 > 1 and VW1 == 1:
       m0Step = OPM * matrixInstBM * matrixInstBN * VW0 * outerTT0 * VW1
@@ -307,10 +306,22 @@ class GlobalWriteBatchWriter:
       if numBatches % VW1 == 0:
         batchesPerBody = max(1, numBatches // VW1)
     elif outerTT1 == 1 and VW1 == 1 and kernel["SourceSwap"]:
+      # With outerTT1 == VW1 == 1 the SourceSwap dst formula in accToArchMapper
+      # collapses to
+      #   dst = vw0 + VW0*(bIdx0 + BM*(wgIdx0 + outerTT0*(tIdx + OPM*bIdx1)))
+      # so tIdx is the outermost (slowest) dst dim whenever matrixInstBN == 1,
+      # and its src stride is 1 (src = tIdx + OPM*(...)). A CLS body is a prefix
+      # of the element list re-executed with M0 shifted, so only the outermost
+      # dim can be the iter dim: matrixInstBN > 1 puts bIdx1 outside tIdx and
+      # must stay at a single iteration.
+      # inner_dims is every dst dim below tIdx, so getAccToArchLen/inner_dims is
+      # OutputsPerMFMA1B read back from the acc->arch mapping itself instead of
+      # recomputed (the miT form of OPM above disagrees on a non-square MI).
       inner_dims = VW0 * outerTT0 * matrixInstBM * matrixInstBN
-      if NEPBS % inner_dims == 0:
-        m0Step = max(1, NEPBS // inner_dims)
-        batchesPerBody = max(1, ceil(numBatches / NEPBS))
+      iterExtent = getAccToArchLen(kernel) // inner_dims
+      if matrixInstBN == 1 and iterExtent > 1 and numBatches % iterExtent == 0:
+        m0Step = 1
+        batchesPerBody = max(1, numBatches // iterExtent)
 
     # StoreRemap / StreamK store paths are not covered by the CLS loop: force a
     # single iteration (body = all batches). m0Step is left as derived above to
@@ -319,6 +330,12 @@ class GlobalWriteBatchWriter:
       batchesPerBody = numBatches
 
     iterCount = max(1, numBatches // batchesPerBody)
+    # notLocalSplitUGlobalWrite emits only batchesPerCLSBody batches and the CLS
+    # countdown re-executes exactly that body, so a layout whose coverage misses
+    # numBatches silently drops (or duplicates) whole batches of stores.
+    assert batchesPerBody * iterCount == numBatches, \
+      "CLS layout covers %u of %u batches (body=%u, iters=%u)" \
+      % (batchesPerBody * iterCount, numBatches, batchesPerBody, iterCount)
     return batchesPerBody, iterCount, m0Step
 
   @staticmethod
