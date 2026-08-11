@@ -47,8 +47,13 @@
 #   pytest test_cls_gfx950_subtile_codegen.py -v
 ################################################################################
 
+import ast
+import functools
+import importlib
+import inspect
 import os
 import re
+import shutil
 import sys
 
 import pytest
@@ -67,39 +72,185 @@ CAPS_INDEX_MODE = {"HasMovRelsD2B32": False, "HasVgprIndexMode": True}   # gfx95
 CAPS_MOVRELS = {"HasMovRelsD2B32": True, "HasVgprIndexMode": False}      # gfx10+
 
 
-def _gfx950_cls_supported():
-    """True if rocisa exposes the CLS index-mode instructions and gfx950 asm.
+# ---------------------------------------------------------------------------
+# Preconditions, and why they are graded rather than uniformly skipped.
+#
+# This file used to hang entirely off one module-level
+# `skipif(not _gfx950_cls_supported())`, where _gfx950_cls_supported() returned
+# False for BOTH "this rocisa has no CLS bindings" and "this box has no gfx950
+# assembler". Either one made every test in the file vanish and CI still report
+# green -- a stale rocisa silently deleted the whole suite.
+#
+# The two conditions are not the same kind of thing, so they are graded:
+#
+#   * MISSING rocisa CLS BINDINGS -> hard error at import (collection error).
+#     SSetGprIdxOn/Off are unconditional rocisa bindings: every rocisa built
+#     from this tree has them, no capability or platform gates them, and nothing
+#     about the host can make their absence legitimate. Their absence therefore
+#     means a stale or broken install, never an unsupported platform, and the
+#     only safe response is to be loud. Skipping here is what let 259 tests
+#     disappear unnoticed.
+#
+#   * NO gfx950 ASSEMBLER (no amdclang++) -> skip, and only the classes that
+#     actually render assembly. Building a store module needs rocisa's asm-caps
+#     probe, which needs the assembler binary; a host without it genuinely
+#     cannot run those tests. But most of this file does not render assembly at
+#     all -- the computeCLSLayout math, the incrementToNextRow emitter, the
+#     acc-read copy-site discovery and the source-level rules are pure Python --
+#     so those keep running. A missing assembler now costs a clearly-reported
+#     subset, not the whole file.
+#
+#   * ASSEMBLER PRESENT BUT rocisa INIT FAILED -> hard error. amdclang++ exists
+#     yet the gfx950 assembler would not initialise: that is a broken toolchain,
+#     not an unsupported one.
+#
+# test_cls_index_mode_bindings_are_importable and
+# test_assembler_gated_classes_are_marked below are deliberately NOT gated on
+# anything, so this file can never again collect zero tests.
+# ---------------------------------------------------------------------------
 
-    The gfx950 CLS acc-read uses s_set_gpr_idx_on/off (VGPR Index Mode). Those
-    rocisa bindings (SSetGprIdxOn/Off) are only present in a rocisa built with
-    the CLS codegen; a stale rocisa cannot even import KernelWriterModules.
+CLS_BINDING_NAMES = ("SSetGprIdxOn", "SSetGprIdxOff")
+
+
+def _classify_assembler(has_amdclang, init_error):
+    """Grade the gfx950 assembler probe into ('active'|'unsupported'|'broken').
+
+    Split out from the probe itself so the decision is testable without a
+    toolchain: see TestPreconditionSemantics.
     """
-    try:
-        from rocisa.instruction import SSetGprIdxOn, SSetGprIdxOff  # noqa: F401
-    except ImportError:
-        return False
+    if init_error is None:
+        return "active", None
+    if not has_amdclang:
+        return "unsupported", (
+            "no gfx950 assembler on this host (amdclang++ not found); the "
+            "assembly-rendering CLS tests cannot run here. Underlying error: %s"
+            % (init_error,))
+    return "broken", (
+        "amdclang++ is present but the gfx950 assembler failed to initialise, "
+        "which is a broken toolchain rather than an unsupported one: %s"
+        % (init_error,))
+
+
+def _import_cls_bindings(rocisa_instruction=None):
+    """Import the rocisa CLS index-mode bindings. Returns (module, error_text).
+
+    `rocisa_instruction` is injectable so the stale-install detection can be
+    tested against a stub; it cannot be simulated through sys.modules, because
+    `import rocisa.instruction` resolves through the already-bound parent
+    package attribute.
+    """
+    if rocisa_instruction is None:
+        try:
+            import rocisa.instruction as rocisa_instruction
+        except ImportError as exc:
+            return None, "rocisa.instruction is not importable: %s" % (exc,)
+    missing = [n for n in CLS_BINDING_NAMES if not hasattr(rocisa_instruction, n)]
+    if missing:
+        return None, (
+            "rocisa at %s is missing the CompactLoopStore index-mode bindings %s"
+            % (getattr(rocisa_instruction, "__file__", "<unknown>"), missing))
+    return rocisa_instruction, None
+
+
+_CLS_BINDINGS, _CLS_BINDINGS_ERROR = _import_cls_bindings()
+if _CLS_BINDINGS_ERROR is not None:
+    raise RuntimeError(
+        "gfx950 CompactLoopStore tests cannot run: %s. These bindings are "
+        "unconditional in rocisa, so this is a stale/broken rocisa build and "
+        "not an unsupported platform -- rebuild rocisa (`invoke rocisa`). "
+        "Failing loudly on purpose: skipping here silently deleted the whole "
+        "CLS suite while CI reported green." % (_CLS_BINDINGS_ERROR,))
+
+
+def _probe_gfx950_assembler():
     try:
         from gpu_test_helpers import init_rocisa
         init_rocisa(target="gfx950", wavesize=WAVESIZE_64)
         from rocisa import rocIsa
-        caps = rocIsa.getInstance().getAsmCaps()
-        # any well-known gfx9 asm cap proves the assembler initialised for gfx950
-        return bool(caps)
-    except (ImportError, RuntimeError, OSError):
-        # no assembler / no rocisa build for gfx950: skip rather than error
-        return False
+        if not rocIsa.getInstance().getAsmCaps():
+            return "rocisa reported no gfx950 asm caps"
+    except (ImportError, RuntimeError, OSError) as exc:
+        return "%s: %s" % (type(exc).__name__, exc)
+    return None
 
 
-pytestmark = pytest.mark.skipif(
-    not _gfx950_cls_supported(),
-    reason="rocisa lacks gfx950 CLS index-mode bindings / assembler",
+_ASM_STATE, _ASM_STATE_REASON = _classify_assembler(
+    has_amdclang=bool(shutil.which("amdclang++") or os.path.exists("/usr/bin/amdclang++")),
+    init_error=_probe_gfx950_assembler(),
+)
+if _ASM_STATE == "broken":
+    raise RuntimeError("gfx950 CompactLoopStore tests cannot run: %s" % (_ASM_STATE_REASON,))
+
+# Applied per class rather than as a module-level pytestmark: see the comment
+# block above. Every class that renders assembly must carry it, and
+# test_assembler_gated_classes_are_marked enforces that.
+requires_gfx950_assembler = pytest.mark.skipif(
+    _ASM_STATE != "active", reason=str(_ASM_STATE_REASON))
+
+# Classes whose tests render assembly (directly or via mapAcctoArchRegs) and so
+# need the gfx950 assembler. The rest of the file is pure Python.
+ASSEMBLER_GATED_CLASSES = (
+    "TestGfx950SubtileCLSCodegen",
+    "TestAccVgprReadMechanismSelection",
+    "TestClsIdxClusterHelper",
+    "TestSubtileSrdAdvanceIsSelfContained",
+    "TestIncrementToNextRowSelfContainedStride",
 )
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _rocisa_once():
+    """Point rocisa at gfx950/wave64 for the whole module.
+
+    Tolerates a missing assembler so the pure-Python classes still run: the
+    classes that need it are gated by `requires_gfx950_assembler`.
+    """
+    if _ASM_STATE != "active":
+        return
     from gpu_test_helpers import init_rocisa
     init_rocisa(target="gfx950", wavesize=WAVESIZE_64)
+
+
+# ---------------------------------------------------------------------------
+# Ungated sentinels: these two run on every host, in every tier. They are the
+# reason this file can no longer be reduced to zero collected tests.
+# ---------------------------------------------------------------------------
+
+def test_cls_index_mode_bindings_are_importable():
+    """The CLS bracket instructions exist and render as the ISA spells them.
+
+    Ungated on purpose. If rocisa goes stale this is the test that fails; the
+    import-time guard above turns the missing-binding case into a collection
+    error, and this pins the rendering so a binding that exists but emits the
+    wrong mnemonic/operand is caught too. Needs no assembler: constructing and
+    rendering an instruction is pure rocisa.
+    """
+    from rocisa.container import mgpr
+    on = str(_CLS_BINDINGS.SSetGprIdxOn(src=mgpr(0), mode="SRC0", comment="sentinel"))
+    off = str(_CLS_BINDINGS.SSetGprIdxOff(comment="sentinel"))
+    assert "s_set_gpr_idx_on" in on, on
+    assert "gpr_idx(SRC0)" in on, on
+    assert "m0" in on, "the index-mode source must be M0: %s" % (on,)
+    assert "s_set_gpr_idx_off" in off, off
+
+
+def test_assembler_gated_classes_are_marked():
+    """Every assembly-rendering class carries `requires_gfx950_assembler`.
+
+    The gate moved from one module-level pytestmark to per-class marks so a
+    missing assembler no longer deletes the pure-Python half of the file. That
+    trades one landmine for another -- a new class forgetting the mark -- so the
+    mapping is asserted rather than trusted.
+    """
+    module = sys.modules[__name__]
+    declared = {name for name, obj in vars(module).items()
+                if name.startswith("Test") and inspect.isclass(obj)}
+    unknown = set(ASSEMBLER_GATED_CLASSES) - declared
+    assert not unknown, "ASSEMBLER_GATED_CLASSES names classes that do not exist: %s" % (unknown,)
+    for name in ASSEMBLER_GATED_CLASSES:
+        marks = getattr(vars(module)[name], "pytestmark", [])
+        assert any(m.name == "skipif" for m in marks), (
+            "%s renders assembly but is not gated on the gfx950 assembler" % (name,))
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +273,22 @@ COMPACTING_CONFIGS = [
 # Non-compacting subtile tile: outerTT1 (=8) does NOT divide numBatches here, so
 # every CLS body stays iterCount == 1 -- must still be well-formed.
 NONCOMPACTING_CONFIG = (128, 256, 64)
+
+# Tiles used by the A1 SRD-advance assertions. The deferred
+# selfContainedStride=True SrdD advance that A1 added lives on the 16-bit subtile
+# store path (GlobalWriteBatch._emitNonatomicAdd, under `if is16bitSubtile`), so
+# it is reachable only on the bf16 parametrizations -- the f32 assembly is
+# byte-identical with and without it. With COMPACTING_CONFIGS alone that put the
+# entire store half of A1 on 2 of 12 parametrizations, and dropping bf16 from the
+# list would have silently un-covered it. These five tiles give it ten
+# (5 tiles x cls_on/cls_off), and add the odd-MIWaveTile[0] geometries that route
+# through the unpaired "orphan" subtile store.
+A1_CONFIGS = COMPACTING_CONFIGS + [
+    (96, 128, 64),    # MIWaveTile [3, 4] -- odd, orphan store path
+    (160, 128, 64),   # MIWaveTile [5, 4] -- odd, orphan store path
+    (256, 256, 64),   # MIWaveTile [8, 8] -- 7 row-group transitions, not 3
+]
+A1_CONFIG_IDS = [f"{a}x{b}" for a, b, _ in A1_CONFIGS]
 
 
 def _build_subtile_store_asm(mt_a, mt_b, depth_u, cls, mi_wave_group=None,
@@ -169,6 +336,23 @@ def _build_subtile_store_asm(mt_a, mt_b, depth_u, cls, mi_wave_group=None,
     return "\n".join(parts), kernel
 
 
+@functools.lru_cache(maxsize=None)
+def _store_asm(mt_a, mt_b, depth_u, cls, mi_wave_group=None, use_bf16=False,
+               mi_arch_vgpr=False):
+    """Memoized _build_subtile_store_asm.
+
+    The builder is deterministic (verified: rebuilding a config after building
+    others yields byte-identical text), and the widened parametrizations below
+    ask for the same six or so modules many times over. Callers must not mutate
+    the returned kernel dict.
+    """
+    asm, kernel = _build_subtile_store_asm(
+        mt_a, mt_b, depth_u, cls,
+        mi_wave_group=list(mi_wave_group) if mi_wave_group else None,
+        use_bf16=use_bf16, mi_arch_vgpr=mi_arch_vgpr)
+    return asm, kernel
+
+
 # ---- small assembly-string measurement helpers ----
 
 _RE_IDX_ON = re.compile(r"s_set_gpr_idx_on")
@@ -187,10 +371,25 @@ _RE_M0BASE_STEP = re.compile(r"s_add_u32\s+s\[sgprCLSm0Base\],\s*s\[sgprCLSm0Bas
 # An incToNextRow SRD advance and the two instruction forms that may legally
 # produce the value it consumes: a stride compute (s_mul/s_lshl off a Stride
 # sgpr) or an explicit zero (the "row 0, no advance" seed).
+#
+# Both signs are matched. incrementToNextRow emits s_sub_u32 when numRows < 0
+# (AsmAddressCalculation.py:1040); the add-only form of this pattern could not
+# see a negative advance at all, so a defect confined to the subtract arm was
+# invisible even in principle. No in-tree config the harness builds emits one
+# today -- TestIncrementToNextRowSelfContainedStride covers the subtract arm
+# directly -- but the predicate no longer looks away if one appears.
 _RE_SRD_ADVANCE = re.compile(
-    r"^\s*s_add_u32 s\[sgprSrd([CD])\+0\], s\[sgprSrd\1\+0\], (s\d+)\b.*incToNextRow")
+    r"^\s*s_(add|sub)_u32 s\[sgprSrd([CD])\+0\], s\[sgprSrd\2\+0\], (s\d+)\b.*incToNextRow")
 _RE_STRIDE_COMPUTE = re.compile(r"^\s*s_(?:mul_i32|lshl_b32) s\d+, s\[sgprStride")
 _RE_ZERO_WRITE = re.compile(r"^\s*s_mov_b32 s\d+, 0\s*(?://.*)?$")
+
+# The two stride-compute forms, with their magnitude operand captured. This is
+# what _RE_STRIDE_COMPUTE deliberately ignores and what a shape-only predicate
+# therefore cannot see: a 2x row stride emits the same s_mul_i32 off the same
+# Stride sgpr and differs only in this operand.
+_RE_STRIDE_MUL = re.compile(r"^\s*s_mul_i32 s\d+, s\[sgprStride\w+\], (\d+)\s*(?://.*)?$")
+_RE_STRIDE_LSHL = re.compile(
+    r"^\s*s_lshl_b32 s\d+, s\[sgprStride\w+\], (?:0x)?([0-9a-fA-F]+)\s*(?://.*)?$")
 
 
 def _counts(asm):
@@ -227,11 +426,61 @@ def _srd_advance_producers(asm):
         m = _RE_SRD_ADVANCE.match(raw)
         if not m:
             continue
-        reg = m.group(2)
+        reg = m.group(3)
         producer = next((lines[j] for j in range(i - 1, -1, -1)
                          if _writes_sgpr(lines[j], reg)), None)
         sites.append((i + 1, reg, producer))
     return sites
+
+
+def _advance_bytes(producer):
+    """How many bytes of stride the producer line actually contributes.
+
+    Returns the multiplier of the row stride in bytes, 0 for an explicit zero
+    seed, or None when the producer is not a recognisable stride source at all
+    (i.e. the advance consumes scratch). The two stride forms encode the amount
+    differently:
+        s_mul_i32  sN, s[sgprStrideDJ], 32   -> 32 bytes  (numRows * bpe)
+        s_lshl_b32 sN, s[sgprStrideDJ], 0x1  -> 2 bytes   (1 row, scaled by bpe)
+    """
+    if producer is None:
+        return None
+    code = producer.split("//")[0].rstrip()
+    m = _RE_STRIDE_MUL.match(code)
+    if m:
+        return int(m.group(1))
+    m = _RE_STRIDE_LSHL.match(code)
+    if m:
+        return 1 << int(m.group(1), 16)
+    if _RE_ZERO_WRITE.match(code):
+        return 0
+    return None
+
+
+def _srd_advance_amounts(asm):
+    """[(lineno, sign, bytes_or_None)] for every incToNextRow SRD advance.
+
+    sign is +1 for the s_add_u32 form and -1 for s_sub_u32.
+    """
+    lines = asm.splitlines()
+    out = []
+    for lineno, reg, producer in _srd_advance_producers(asm):
+        sign = -1 if _RE_SRD_ADVANCE.match(lines[lineno - 1]).group(1) == "sub" else 1
+        out.append((lineno, sign, _advance_bytes(producer)))
+    return out
+
+
+def _moving_advances(asm):
+    """The advances that actually move the SRD, as signed byte amounts.
+
+    Zero-amount sites are excluded: under CLS the first site is a chain seed
+    whose s_add consumes a register that was zeroed in the preamble, so it steps
+    the SRD by nothing. Excluding them is what lets the CLS-on / CLS-off
+    comparison be an equality instead of the `n_off .. n_off + 1` band that the
+    seed forced -- a band which, on f32, the legitimate +1 consumed entirely, so
+    one dropped advance landed back inside it and passed.
+    """
+    return [sign * amount for _, sign, amount in _srd_advance_amounts(asm) if amount]
 
 
 def _counter_inits(asm):
@@ -268,10 +517,147 @@ def _scan_brackets(asm):
     return brackets
 
 
+# ---- acc-read copy-site discovery ----
+#
+# The bare/bracketed rule is about the methods that take their own copy of
+# codes.accVgprRead: that copy is the list a consumer pops reads off, and the
+# copy site is where a bracket would naturally be introduced. Those methods are
+# discovered from the AST instead of being named by hand, because naming them by
+# hand is exactly how the rule came to be enforced against three methods that
+# hold no copy site at all (partialsWriteBatch / fixupBatch / partialWriteBatch
+# / lastGsuWgReduction are the emitters, but the deepcopy lives one level up in
+# partialsWriteProcedure / fixupStep / reductionProcedure).
+
+_ACC_READ_COPY_MODULES = (
+    "Tensile.Components.GSU",
+    "Tensile.Components.StreamK",
+    "Tensile.Components.LSU",
+    "Tensile.KernelWriterAssembly",
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _acc_read_copy_sites():
+    """Every deepcopy of an accVgprRead module, as {(module, qualname): lineno}.
+
+    Walks each store module's AST once (~0.25 s for all four, paid once per
+    session) and records the enclosing function of every `deepcopy(...
+    accVgprRead)` call.
+    """
+    sites = {}
+    for module_name in _ACC_READ_COPY_MODULES:
+        module = importlib.import_module(module_name)
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+
+        def visit(node, prefix):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    qualname = f"{prefix}.{child.name}" if prefix else child.name
+                    if isinstance(child, ast.ClassDef):
+                        visit(child, qualname)
+                        continue
+                    for sub in ast.walk(child):
+                        if not isinstance(sub, ast.Call):
+                            continue
+                        func = sub.func
+                        name = getattr(func, "id", None) or getattr(func, "attr", None)
+                        if name != "deepcopy" or not sub.args:
+                            continue
+                        if "accVgprRead" in ast.unparse(sub.args[0]):
+                            sites[(module_name, qualname)] = sub.lineno
+                    visit(child, qualname)
+                else:
+                    visit(child, prefix)
+
+        visit(tree, "")
+    return sites
+
+
+def _source_of_qualname(module_name, qualname):
+    obj = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        obj = getattr(obj, part)
+    return inspect.getsource(obj)
+
+
+# Tokens that would open or close a CLS index-mode bracket. A bare consumer must
+# contain none of them.
+BRACKET_TOKENS = ("clsWrapIdxCluster", "clsIdxModeOn", "clsIdxModeOff",
+                  "SSetGprIdxOn", "SSetGprIdxOff")
+
+
+# ---- CLS layout: the m0Step property, shared across all three arms ----
+
+def assert_m0_step_reaches_every_slice(kernel, num_batches):
+    """m0Step must be exactly the acc-src delta between consecutive CLS bodies.
+
+    `s_set_gpr_idx_on m0` lands on iteration j's accumulator slice only if, for
+    every read position p in the body,
+        arch2acc[p + j*readsPerBody] == arch2acc[p] + j*m0Step
+    against the real accToArchMapper. A wrong m0Step reads the wrong slice on
+    every iteration past the first: silently wrong D, no fault, no diagnostic.
+
+    Checked against the mapping rather than against a number, so an m0Step
+    derived from an unrelated quantity is caught whatever value it happens to
+    take. Returns True when the layout compacts (so callers can assert they are
+    not vacuously passing), False when iterCount == 1 and m0Step is dead.
+    """
+    from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+    from Tensile.KernelWriterModules import accToArchMapper, getAccToArchLen
+
+    bpb, iterCount, m0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, num_batches)
+    assert bpb * iterCount == num_batches, (bpb, iterCount, num_batches)
+    if iterCount == 1:
+        return False
+    _, arch2acc = accToArchMapper(kernel)
+    accLen = getAccToArchLen(kernel)
+    assert accLen % iterCount == 0, (
+        f"CLS body count {iterCount} does not divide the acc-read list length "
+        f"{accLen}, so the body is not a whole prefix of it")
+    readsPerBody = accLen // iterCount
+    for p in range(readsPerBody):
+        for it in range(1, iterCount):
+            assert arch2acc[p + it * readsPerBody] == arch2acc[p] + it * m0Step, (
+                f"m0Step {m0Step} does not reach slice {it} from read {p}: "
+                f"src({p + it * readsPerBody})={arch2acc[p + it * readsPerBody]} "
+                f"vs src({p})+{it}*{m0Step}={arch2acc[p] + it * m0Step} "
+                f"(numBatches={num_batches}, iterCount={iterCount}, "
+                f"MIWaveTile={kernel['MIWaveTile']}, VW=({kernel['VectorWidthA']},"
+                f"{kernel['VectorWidthB']}), SourceSwap={kernel['SourceSwap']})")
+    return True
+
+
+def cls_layout_kernel(mi_wave_tile, vwa=1, vwb=1, source_swap=False,
+                      wave=WAVESIZE_64, mi=(16, 16), bm=1, bn=1, nepbs=8):
+    """Minimal kernel dict for computeCLSLayout, wide enough for all three arms.
+
+    computeCLSLayout selects on (outerTT1, VW1, SourceSwap), so one factory that
+    can express every combination is what lets the m0Step property be checked on
+    cases (a) and (b) and not just (c).
+    """
+    return {
+        "EnableMatrixInstruction": True,
+        "VectorWidthA": vwa,
+        "VectorWidthB": vwb,
+        "MIWaveTile": list(mi_wave_tile),
+        "MatrixInstM": mi[0],
+        "MatrixInstN": mi[1],
+        "MatrixInstBM": bm,
+        "MatrixInstBN": bn,
+        "WavefrontSize": wave,
+        "NumElementsPerBatchStore": nepbs,
+        "SourceSwap": source_swap,
+        "StoreRemapVectorWidth": 0,
+        "StreamK": 0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
+@requires_gfx950_assembler
 class TestGfx950SubtileCLSCodegen:
     """Structural CLS codegen assertions for the gfx950 subtile store path."""
 
@@ -397,6 +783,7 @@ class TestGfx950SubtileCLSCodegen:
         assert _RE_CLS_BACKEDGE.search(asm) is not None
 
 
+@requires_gfx950_assembler
 class TestAccVgprReadMechanismSelection:
     """mapAcctoArchRegs picks the acc-read mechanism from the same capabilities
     Solution.py gates CompactLoopStore on, and never bakes a bracket into the
@@ -457,6 +844,7 @@ class TestAccVgprReadMechanismSelection:
         assert "M0-indexed" not in text
 
 
+@requires_gfx950_assembler
 class TestClsIdxClusterHelper:
     """clsWrapIdxCluster is the only supported way to open a bracket, so the
     emptiness rule and the 'only acc-reads inside' rule live in it."""
@@ -565,6 +953,109 @@ class TestBareAccVgprReadConsumers:
                               "GlobalWriteBatchWriter", "_prolog")
         assert "clsWrapIdxCluster" in src
         assert "SSetGprIdxOn" not in src
+
+
+class TestAccVgprReadCopySites:
+    """The bare/bracketed rule, enforced on the methods that actually copy the
+    acc-read list rather than on a hand-maintained list of emitter names.
+
+    BARE_CONSUMERS above names the five methods that *emit* reads outside the CLS
+    loop, and greping them is worth keeping -- a bracket named in any of them is
+    wrong. But it is not where the rule can be broken most easily: the
+    `deepcopy(codes.accVgprRead)` that produces the list a consumer pops from
+    happens one level up for three of the five, in methods that list never
+    mentioned (GSUOn.reductionProcedure, StreamK.partialsWriteProcedure,
+    StreamK.fixupStep). A bracket opened at any of those copy sites passed every
+    test in this file.
+
+    On the source-grep question: a real codegen backstop -- building a StreamK,
+    GSU or LSU store module with CLS on and asserting _scan_brackets finds
+    nothing -- would be strictly better, and it is not affordable here.
+    LSUOn.writeReadReduction is reached from KernelWriter's main-body emitter
+    (KernelWriter.py:6611), not from a store entry point, and
+    localSplitUGlobalWriteIndices already wants LSUValidOffset0 /
+    LSUelementsPerLSUWave state that no in-tree GPU-free harness produces;
+    GSU=2 and StreamK=1 both fault inside the store builder for want of
+    _GlobalAccumulation and streamK writer state (verified). Standing all of
+    that up is a per-component harness on the scale of test_storeD_roundtrip's
+    builders, which this suite may not modify, for a rule whose in-loop half is
+    already killed by 13 codegen tests. So the grep stays -- but it is now aimed
+    by the AST at the methods that hold the copy sites, and a new copy site
+    breaks the census below instead of quietly escaping the rule.
+    """
+
+    # Every acc-read copy site, and which side of the bracket rule it is on.
+    # Discovered set is asserted against this, so a new consumer cannot be added
+    # without classifying it.
+    COPY_SITE_ROLES = {
+        # Outside the CLS loop: pops the full read list at literal indices, so a
+        # bracket here would make an M0-immune read depend on M0 -- which on GFX9
+        # is also the LDS base/limit register, i.e. a wrong LDS window (possibly
+        # a fault) in the reduction path rather than merely a wrong value.
+        ("Tensile.Components.GSU", "GSUOn.reductionProcedure"): "bare",
+        ("Tensile.Components.StreamK", "StreamK.partialsWriteProcedure"): "bare",
+        ("Tensile.Components.StreamK", "StreamK.fixupStep"): "bare",
+        ("Tensile.Components.LSU", "LSUOn.writeReadReduction"): "bare",
+        # Inside the CLS loop: pops only the truncated prefix and relies on M0 to
+        # reach the rest, so this one must bracket -- via the shared helper.
+        ("Tensile.KernelWriterAssembly",
+         "KernelWriterAssembly.globalWriteElementBatch"): "in-loop",
+    }
+
+    def test_copy_site_census_is_complete(self):
+        """The discovered copy sites are exactly the classified ones.
+
+        A new `deepcopy(codes.accVgprRead)` anywhere in the store components is a
+        new consumer of the read list, and every consumer is on one side of the
+        bracket rule or the other. Failing here forces that decision instead of
+        letting the new site inherit whichever behaviour it happened to get.
+        """
+        discovered = set(_acc_read_copy_sites())
+        classified = set(self.COPY_SITE_ROLES)
+        assert discovered == classified, (
+            "acc-read copy sites changed.\n"
+            "  new, unclassified: %s\n"
+            "  classified but gone: %s\n"
+            "Each new site must be added to COPY_SITE_ROLES as 'bare' (pops the "
+            "full list outside the CLS loop) or 'in-loop' (pops a prefix and "
+            "relies on M0)."
+            % (sorted(discovered - classified), sorted(classified - discovered)))
+
+    @pytest.mark.parametrize(
+        "module_name,qualname",
+        [k for k, v in COPY_SITE_ROLES.items() if v == "bare"],
+        ids=[k[1] for k, v in COPY_SITE_ROLES.items() if v == "bare"])
+    def test_bare_copy_sites_open_no_bracket(self, module_name, qualname):
+        """No bracket in the method that copies the read list for a bare consumer."""
+        src = _source_of_qualname(module_name, qualname)
+        assert "accVgprRead" in src, (
+            f"{qualname} was discovered as an acc-read copy site but its source "
+            f"does not mention accVgprRead -- the AST walk and the source lookup "
+            f"disagree, so this test is not looking at the code it thinks it is")
+        for token in BRACKET_TOKENS:
+            assert token not in src, (
+                f"{qualname} emits {token} around a copy of codes.accVgprRead: it "
+                f"pops the read list in full outside the CLS loop, so its reads "
+                f"are already at literal indices and must stay M0-immune")
+
+    @pytest.mark.parametrize(
+        "module_name,qualname",
+        [k for k, v in COPY_SITE_ROLES.items() if v == "in-loop"],
+        ids=[k[1] for k, v in COPY_SITE_ROLES.items() if v == "in-loop"])
+    def test_in_loop_copy_site_does_not_open_its_own_bracket(self, module_name, qualname):
+        """The in-loop copy site hands the list on; it must not bracket in place.
+
+        globalWriteElementBatch copies the list and passes it to
+        GlobalWriteBatchWriter, which brackets per contiguous cluster via
+        clsWrapIdxCluster. A bracket opened here instead would wrap the whole
+        batch -- including the non-acc-read instructions between clusters, whose
+        SRC0 would then be M0-relative too.
+        """
+        src = _source_of_qualname(module_name, qualname)
+        for token in ("SSetGprIdxOn", "SSetGprIdxOff", "clsIdxModeOn", "clsIdxModeOff"):
+            assert token not in src, (
+                f"{qualname} open-codes {token}; the bracket belongs to "
+                f"clsWrapIdxCluster at the per-cluster consumer")
 
 
 class TestComputeCLSLayoutSubtile:
@@ -752,28 +1243,109 @@ class TestComputeCLSLayoutSourceSwap:
         arch2acc[p + j*readsPerBody] == arch2acc[p] + j*m0Step. Pinning it
         against the mapping (rather than against a number) is what catches an
         m0Step derived from an unrelated quantity.
+
+        The assertion body now lives in assert_m0_step_reaches_every_slice so
+        cases (a) and (b) can be held to the same property; see
+        TestComputeCLSLayoutM0StepAllArms.
         """
-        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
-        from Tensile.KernelWriterModules import accToArchMapper, getAccToArchLen
-
-        kernel = self._kernel(mi_wave_tile, vwa=vwa, wave=wave)
-        bpb, iterCount, m0Step = GlobalWriteBatchWriter.computeCLSLayout(
-            kernel, num_batches)
-        assert bpb * iterCount == num_batches
-        if iterCount == 1:
-            return
-        _, arch2acc = accToArchMapper(kernel)
-        accLen = getAccToArchLen(kernel)
-        assert accLen % iterCount == 0, (accLen, iterCount)
-        readsPerBody = accLen // iterCount
-        for p in range(readsPerBody):
-            for it in range(1, iterCount):
-                assert arch2acc[p + it * readsPerBody] == arch2acc[p] + it * m0Step, (
-                    f"m0Step {m0Step} does not reach slice {it} from read {p}: "
-                    f"src({p + it * readsPerBody})={arch2acc[p + it * readsPerBody]} "
-                    f"vs src({p})+{it}*{m0Step}={arch2acc[p] + it * m0Step}")
+        assert_m0_step_reaches_every_slice(
+            self._kernel(mi_wave_tile, vwa=vwa, wave=wave), num_batches)
 
 
+class TestComputeCLSLayoutM0StepAllArms:
+    """m0Step held to the accumulator map on ALL THREE arms of computeCLSLayout.
+
+    Case (c) was cross-checked against the real accToArchMapper; cases (a) and
+    (b) were checked against nothing stronger than `m0Step > 0`
+    (test_cls_m0_base_init_and_stride). Injecting `m0Step += 1` on the
+    non-SourceSwap arms therefore left the whole suite green, and a wrong m0Step
+    there means every CLS iteration past the first reads the wrong accumulator
+    slice: D is silently wrong, with no fault and no diagnostic. That is the
+    highest-severity silent failure mode in the feature and the one defect class
+    already found once by hand rather than by a test.
+
+    The arms are selected by (outerTT1, VW1, SourceSwap), which is why the
+    geometries below are grouped that way:
+        (a) outerTT1 >  1, VW1 == 1              -> iter = wgIdx1
+        (b) outerTT1 == 1, VW1 >  1, !SourceSwap -> iter = vw1
+        (c) outerTT1 == 1, VW1 == 1,  SourceSwap -> iter = tIdx  (above)
+    numBatches is swept inside each test rather than parametrized, to keep the
+    property at full coverage without multiplying the reported test count.
+    """
+
+    NUM_BATCHES = (1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 24, 32)
+
+    # (a): outerTT1 == MIWaveTile[1] > 1 with VW1 == 1. Covers both MI shapes,
+    # both wave sizes, and a VectorWidthA > 1 that makes outerTT0 < MIWaveTile[0].
+    CASE_A = [
+        ([1, 2], 1, (16, 16), WAVESIZE_64),
+        ([2, 2], 2, (16, 16), WAVESIZE_64),
+        ([4, 4], 1, (16, 16), WAVESIZE_64),
+        ([8, 4], 2, (16, 16), WAVESIZE_64),
+        ([2, 8], 1, (16, 16), WAVESIZE_64),
+        ([4, 2], 4, (16, 16), WAVESIZE_64),
+        ([4, 4], 1, (32, 32), WAVESIZE_64),
+        ([8, 4], 2, (32, 32), WAVESIZE_64),
+        ([4, 4], 1, (16, 16), 32),
+        ([2, 2], 2, (32, 32), 32),
+    ]
+
+    # (b): outerTT1 == 1 via MIWaveTile[1] == VW1, VW1 > 1, no SourceSwap.
+    CASE_B = [
+        ([1, 2], 1, 2, (16, 16), WAVESIZE_64),
+        ([2, 2], 2, 2, (16, 16), WAVESIZE_64),
+        ([4, 4], 1, 4, (16, 16), WAVESIZE_64),
+        ([8, 4], 4, 4, (16, 16), WAVESIZE_64),
+        ([4, 2], 2, 2, (32, 32), WAVESIZE_64),
+        ([2, 4], 1, 4, (16, 16), 32),
+    ]
+
+    @pytest.mark.parametrize("mi_wave_tile,vwa,mi,wave", CASE_A,
+                             ids=[f"MIWT{t}-VWA{v}-MI{m[0]}x{m[1]}-w{w}"
+                                  for t, v, m, w in CASE_A])
+    def test_case_a_m0_step_reaches_the_slice_the_loop_claims(self, mi_wave_tile,
+                                                              vwa, mi, wave):
+        kernel = cls_layout_kernel(mi_wave_tile, vwa=vwa, vwb=1,
+                                   source_swap=False, mi=mi, wave=wave)
+        compacted = [nb for nb in self.NUM_BATCHES
+                     if assert_m0_step_reaches_every_slice(kernel, nb)]
+        assert compacted, (
+            f"no numBatches in {self.NUM_BATCHES} compacts for MIWaveTile="
+            f"{mi_wave_tile} VWA={vwa} MI={mi} wave={wave}, so this "
+            f"parametrization asserts nothing about m0Step")
+
+    @pytest.mark.parametrize("mi_wave_tile,vwa,vwb,mi,wave", CASE_B,
+                             ids=[f"MIWT{t}-VWA{a}-VWB{b}-MI{m[0]}x{m[1]}-w{w}"
+                                  for t, a, b, m, w in CASE_B])
+    def test_case_b_m0_step_reaches_the_slice_the_loop_claims(self, mi_wave_tile,
+                                                              vwa, vwb, mi, wave):
+        kernel = cls_layout_kernel(mi_wave_tile, vwa=vwa, vwb=vwb,
+                                   source_swap=False, mi=mi, wave=wave)
+        assert kernel["MIWaveTile"][1] // vwb == 1, "not case (b): outerTT1 != 1"
+        compacted = [nb for nb in self.NUM_BATCHES
+                     if assert_m0_step_reaches_every_slice(kernel, nb)]
+        assert compacted, (
+            f"no numBatches in {self.NUM_BATCHES} compacts for MIWaveTile="
+            f"{mi_wave_tile} VWA={vwa} VWB={vwb} MI={mi} wave={wave}, so this "
+            f"parametrization asserts nothing about m0Step")
+
+    @pytest.mark.parametrize("mi_wave_tile,vwa,mi,wave", CASE_A[:4],
+                             ids=[f"MIWT{t}-VWA{v}-MI{m[0]}x{m[1]}-w{w}"
+                                  for t, v, m, w in CASE_A[:4]])
+    def test_case_a_arm_is_the_one_under_test(self, mi_wave_tile, vwa, mi, wave):
+        """Guard the guard: these geometries really do select case (a).
+
+        If a refactor moved the arm boundaries, the case (a) tests above would
+        keep passing while silently exercising some other arm.
+        """
+        kernel = cls_layout_kernel(mi_wave_tile, vwa=vwa, vwb=1, source_swap=False,
+                                   mi=mi, wave=wave)
+        assert kernel["MIWaveTile"][1] // kernel["VectorWidthB"] > 1
+        assert kernel["VectorWidthB"] == 1
+        assert not kernel["SourceSwap"]
+
+
+@requires_gfx950_assembler
 class TestSubtileSrdAdvanceIsSelfContained:
     """The store/load SRD must be advanced by a stride, never by leftover scratch.
 
@@ -791,8 +1363,7 @@ class TestSubtileSrdAdvanceIsSelfContained:
 
     @pytest.mark.parametrize("cls", [False, True], ids=["cls_off", "cls_on"])
     @pytest.mark.parametrize("use_bf16", [False, True], ids=["f32", "bf16"])
-    @pytest.mark.parametrize("mt_a,mt_b,depth_u", COMPACTING_CONFIGS,
-                             ids=[f"{a}x{b}" for a, b, _ in COMPACTING_CONFIGS])
+    @pytest.mark.parametrize("mt_a,mt_b,depth_u", A1_CONFIGS, ids=A1_CONFIG_IDS)
     def test_srd_advance_consumes_a_stride_not_scratch(self, mt_a, mt_b, depth_u,
                                                       use_bf16, cls):
         """Every SRD advance adds a freshly computed stride (or an explicit 0).
@@ -803,8 +1374,7 @@ class TestSubtileSrdAdvanceIsSelfContained:
         zero seed. Anything else (an exec-mask `s_and`, a waveN-stride constant,
         an `s_mov_b64` lane pair) means the advance consumes scratch.
         """
-        asm, _ = _build_subtile_store_asm(mt_a, mt_b, depth_u, cls=cls,
-                                          use_bf16=use_bf16)
+        asm, _ = _store_asm(mt_a, mt_b, depth_u, cls=cls, use_bf16=use_bf16)
         sites = _srd_advance_producers(asm)
         assert sites, "expected at least one incToNextRow SRD advance"
         for lineno, reg, producer in sites:
@@ -818,25 +1388,110 @@ class TestSubtileSrdAdvanceIsSelfContained:
                 f"{producer.strip()!r}. The SRD would advance by scratch "
                 f"(-> hipErrorIllegalAddress once the CLS loop compacts).")
 
+    # -- magnitude, not just shape --
+
+    @pytest.mark.parametrize("cls", [False, True], ids=["cls_off", "cls_on"])
     @pytest.mark.parametrize("use_bf16", [False, True], ids=["f32", "bf16"])
-    def test_cls_on_matches_cls_off_advance_count(self, use_bf16):
-        """Turning CLS on must not drop or duplicate an SRD advance.
+    @pytest.mark.parametrize("mt_a,mt_b,depth_u", A1_CONFIGS, ids=A1_CONFIG_IDS)
+    def test_srd_advance_steps_exactly_one_mi_row_block(self, mt_a, mt_b, depth_u,
+                                                       use_bf16, cls):
+        """Every advance moves the SRD by one MI output block of rows, not two.
 
-        The fix reorders instructions within a site; it must not change how many
-        times the SRD is stepped, or D lands at the wrong rows.
+        test_srd_advance_consumes_a_stride_not_scratch pins the *shape* of the
+        advance -- that it consumes a freshly computed stride rather than
+        scratch -- and deliberately ignores the multiplier. A 2x row stride emits
+        the same s_mul_i32 off the same Stride sgpr and differs only in that
+        operand, so it passed every assertion in this file while stepping D two
+        rows per advance: on a bounds-checked buffer an illegal address,
+        otherwise silent corruption of every row.
+
+        The expectation is derived, not tabulated: one advance carries the SRD
+        across one MatrixInst output block in the coord1 direction, so the byte
+        amount is MatrixInstN * bpe. (Confirmed invariant under MIWaveGroup:
+        [1,1], [2,2], [1,4] and [4,1] all emit the same MatrixInstN * bpe.)
         """
-        off, _ = _build_subtile_store_asm(*COMPACTING_CONFIGS[0], cls=False,
-                                          use_bf16=use_bf16)
-        on, _ = _build_subtile_store_asm(*COMPACTING_CONFIGS[0], cls=True,
-                                         use_bf16=use_bf16)
-        n_off = len(_srd_advance_producers(off))
-        n_on = len(_srd_advance_producers(on))
-        # CLS may add exactly one extra leading seed advance (the chain seed that
-        # forceinitrow0 opens); it must never remove one.
-        assert n_on in (n_off, n_off + 1), (
-            f"CLS changed the SRD advance count: off={n_off} on={n_on}")
+        asm, kernel = _store_asm(mt_a, mt_b, depth_u, cls=cls, use_bf16=use_bf16)
+        bpe = int(kernel["ProblemType"]["DestDataType"].numBytes())
+        expected = kernel["MatrixInstN"] * bpe
+
+        amounts = _srd_advance_amounts(asm)
+        assert amounts, "expected at least one incToNextRow SRD advance"
+        moving = [(lineno, sign * amount) for lineno, sign, amount in amounts if amount]
+        assert moving, (
+            "every SRD advance steps by zero: the store never leaves row 0")
+        for lineno, amount in moving:
+            assert amount == expected, (
+                f"SRD advance at line {lineno} moves the SRD by {amount} bytes, "
+                f"expected {expected} = MatrixInstN({kernel['MatrixInstN']}) * "
+                f"bpe({bpe}). A wrong magnitude lands D in the wrong rows on "
+                f"every subtile CLS kernel.")
+
+        # A zero-amount advance is the CLS delayed-primer chain seed: its s_add
+        # consumes a register the preamble zeroed, so it steps by nothing. There
+        # is at most one, and CLS-off has none. Bounding it is what keeps the
+        # "explicit zero is an acceptable producer" allowance from excusing a
+        # whole run of advances that quietly add nothing -- _RE_ZERO_WRITE
+        # matches any `s_mov_b32 sN, 0` from any emitter, and on the f32 CLS-on
+        # arm the one it matches is `// Init sgpr offset`, not the A1 seed.
+        seeds = [lineno for lineno, sign, amount in amounts if amount == 0]
+        assert len(seeds) <= 1, (
+            f"{len(seeds)} SRD advances add an explicit zero (lines {seeds}); at "
+            f"most one chain seed is legitimate")
+        if not cls:
+            assert not seeds, (
+                f"CLS-off has no delayed-primer chain to seed, so no advance may "
+                f"add zero (lines {seeds})")
+
+    @pytest.mark.parametrize("cls", [False, True], ids=["cls_off", "cls_on"])
+    @pytest.mark.parametrize("use_bf16", [False, True], ids=["f32", "bf16"])
+    @pytest.mark.parametrize("mt_a,mt_b,depth_u", A1_CONFIGS, ids=A1_CONFIG_IDS)
+    def test_srd_advance_count_matches_the_tiles_row_groups(self, mt_a, mt_b, depth_u,
+                                                            use_bf16, cls):
+        """The SRD is stepped once per row-group transition the tile implies.
+
+        A wave owns outerTT1 = MIWaveTile[1] / VectorWidthB groups of rows in the
+        coord1 direction and has to cross between them outerTT1 - 1 times. This
+        is an absolute count, which is what a differential CLS-on-vs-CLS-off
+        comparison cannot be: a drop that hits both arms is invisible to a
+        differential by construction (the audit's a1_drop_advance_both mutant was
+        caught only incidentally, by an emptiness guard, and only on bf16).
+        """
+        asm, kernel = _store_asm(mt_a, mt_b, depth_u, cls=cls, use_bf16=use_bf16)
+        outer_tt1 = kernel["MIWaveTile"][1] // kernel["VectorWidthB"]
+        expected = outer_tt1 - 1
+        moving = _moving_advances(asm)
+        assert len(moving) == expected, (
+            f"expected {expected} SRD advances that move the SRD "
+            f"(outerTT1={outer_tt1} row groups, so outerTT1-1 transitions), got "
+            f"{len(moving)}: {moving}. A missing advance writes two row groups "
+            f"on top of each other; an extra one skips a row group entirely.")
+
+    @pytest.mark.parametrize("use_bf16", [False, True], ids=["f32", "bf16"])
+    @pytest.mark.parametrize("mt_a,mt_b,depth_u", A1_CONFIGS, ids=A1_CONFIG_IDS)
+    def test_cls_does_not_change_the_srd_advance_schedule(self, mt_a, mt_b, depth_u,
+                                                          use_bf16):
+        """CLS must not change which amounts the SRD is stepped by, or how often.
+
+        Replaces test_cls_on_matches_cls_off_advance_count, which compared raw
+        site counts with `n_on in (n_off, n_off + 1)` to make room for the CLS
+        chain seed. That slack was not sound: on f32 the legitimate +1 consumed
+        all of it, so a dropped advance landed back at n_off and passed. Counting
+        only the advances that actually move the SRD identifies the seed by its
+        zero amount instead of by budgeting for it, which turns the band into an
+        equality -- and comparing the amounts, not just how many there are, also
+        catches CLS changing a magnitude while preserving the count.
+        """
+        off, _ = _store_asm(mt_a, mt_b, depth_u, cls=False, use_bf16=use_bf16)
+        on, _ = _store_asm(mt_a, mt_b, depth_u, cls=True, use_bf16=use_bf16)
+        moving_off = sorted(_moving_advances(off))
+        moving_on = sorted(_moving_advances(on))
+        assert moving_on == moving_off, (
+            f"CLS changed the SRD advance schedule: off={moving_off} "
+            f"on={moving_on} (byte amounts, signed; zero-amount chain seeds "
+            f"excluded)")
 
 
+@requires_gfx950_assembler
 class TestIncrementToNextRowSelfContainedStride:
     """Direct tests of the incrementToNextRow emit order.
 
@@ -850,7 +1505,7 @@ class TestIncrementToNextRowSelfContainedStride:
     ROWS = 16        # subtile mBlockSize
 
     @classmethod
-    def _emit(cls, clsOn, rowInc, selfContained, tc="D"):
+    def _emit(cls, clsOn, rowInc, selfContained, tc="D", overrideAfterPrimerRows=0):
         from types import SimpleNamespace
         from Tensile.AsmAddressCalculation import AddrCalculation
 
@@ -868,6 +1523,7 @@ class TestIncrementToNextRowSelfContainedStride:
         ss = SimpleNamespace(optSrdIncForRow=1)
         mod = addrCalc.incrementToNextRow(kernel, tc, ss, cls.STMP,
                                           forceinitrow0=1,
+                                          overrideAfterPrimerRows=overrideAfterPrimerRows,
                                           selfContainedStride=selfContained)
         return [ln for ln in str(mod).splitlines() if ln.strip()]
 
@@ -931,6 +1587,74 @@ class TestIncrementToNextRowSelfContainedStride:
         flagged = self._emit(clsOn=False, rowInc=self.ROWS, selfContained=True)
         assert base == flagged, (base, flagged)
 
+    # -- the delayed primer's look-ahead override --
+
+    @pytest.mark.parametrize("override_rows", [1, 2, 16, 32])
+    def test_override_after_primer_rows_primes_the_next_calls_advance(self, override_rows):
+        """The AFTER primer scales by the override, not by this call's own rowInc.
+
+        In the delayed-primer chain, call N's trailing stride compute is what call
+        N+1's s_add consumes, so it must carry N+1's rowInc. `overrideAfterPrimerRows`
+        is the caller-computed look-ahead that supplies it; without it the primer
+        carries N's own rowInc and every advance is one element behind -- the
+        off-by-one the commit message calls out. Nothing in-tree referenced this
+        parameter from a test, in either direction.
+        """
+        own_rows = self.ROWS
+        assert override_rows != own_rows or override_rows == self.ROWS
+        lines = self._emit(clsOn=True, rowInc=own_rows, selfContained=False,
+                           overrideAfterPrimerRows=override_rows)
+        add = self._index_of(lines, "s_add_u32")
+        assert add >= 0, lines
+        primer = [ln for ln in lines[add:] if "s_mul_i32" in ln or "s_lshl_b32" in ln]
+        assert len(primer) == 1, (
+            f"expected exactly one AFTER primer following the s_add: {lines}")
+        if override_rows > 1:
+            assert f", {override_rows * self.BPE}" in primer[0], (
+                f"expected the primer scaled by overrideAfterPrimerRows"
+                f"({override_rows}) * bpe({self.BPE}) = {override_rows * self.BPE}, "
+                f"not by this call's own rowInc({own_rows}): {primer[0]!r}")
+        else:
+            # numRows == 1 folds into the shift-by-log2(bpe) arm.
+            assert "s_lshl_b32" in primer[0], primer[0]
+
+    def test_override_is_ignored_by_a_self_contained_call(self):
+        """A self-contained call emits no AFTER primer at all, override or not.
+
+        The whole point of selfContainedStride is that nothing is left in s[stmp]
+        for a later call to consume; honouring the look-ahead there would put a
+        stale value back.
+        """
+        plain = self._emit(clsOn=True, rowInc=self.ROWS, selfContained=True)
+        overridden = self._emit(clsOn=True, rowInc=self.ROWS, selfContained=True,
+                                overrideAfterPrimerRows=32)
+        assert plain == overridden, (plain, overridden)
+
+    # -- the negative (s_sub_u32) advance form --
+
+    def test_negative_row_inc_subtracts_its_own_magnitude(self):
+        """rowInc < 0 steps the SRD backwards by |rowInc| * bpe.
+
+        incrementToNextRow emits s_sub_u32 for numRows < 0 and scales the stride
+        by (-numRows) * bpe. No configuration the store harness builds emits this
+        form, so it is unreachable from the assembly predicates and pinned here
+        instead: a sign error would walk the SRD off the front of the buffer.
+        """
+        lines = self._emit(clsOn=True, rowInc=-self.ROWS, selfContained=True)
+        sub = self._index_of(lines, "s_sub_u32")
+        assert sub >= 0, f"expected an s_sub_u32 for a negative rowInc: {lines}"
+        assert self._index_of(lines, "s_add_u32") < 0, (
+            f"a negative advance must not also emit an s_add_u32: {lines}")
+        mul = [ln for ln in lines if "s_mul_i32" in ln]
+        assert len(mul) == 1, lines
+        assert self._index_of(lines, "s_mul_i32") < sub, (
+            f"self-contained: the stride must be computed before the s_sub: {lines}")
+        assert f", {self.ROWS * self.BPE}" in mul[0], (
+            f"expected |rowInc|({self.ROWS}) * bpe({self.BPE}) = "
+            f"{self.ROWS * self.BPE}: {mul[0]!r}")
+        assert "s_subb_u32" in " ".join(lines), (
+            f"the high half of the SRD must borrow: {lines}")
+
 
 class TestSubtileSrdAdvanceCallSites:
     """The two emitters that step an SRD across subtile store bodies must opt out
@@ -968,3 +1692,64 @@ class TestSubtileSrdAdvanceCallSites:
         assert 'selfContainedStride=kernel["UseSubtileImpl"]' in src, (
             "readInput must opt the subtile load-SRD advance out of the CLS "
             "delayed-primer chain")
+
+
+class TestPreconditionSemantics:
+    """The graded precondition logic itself, exercised without a toolchain.
+
+    _classify_assembler encodes the judgement call about which failures are
+    legitimately unsupported and which are broken installs, and that decision is
+    what the old single skipif got wrong. Pinning it here means the semantics are
+    a tested property rather than a comment.
+    """
+
+    def test_working_assembler_is_active(self):
+        assert _classify_assembler(has_amdclang=True, init_error=None)[0] == "active"
+
+    def test_missing_assembler_is_unsupported_not_broken(self):
+        """No amdclang++ at all: a genuine platform limit, so a skip is right."""
+        state, reason = _classify_assembler(has_amdclang=False,
+                                            init_error="RuntimeError: no assembler")
+        assert state == "unsupported"
+        assert "amdclang++ not found" in reason
+        assert "no assembler" in reason, "the underlying error must survive into the skip reason"
+
+    def test_present_but_failing_assembler_is_broken(self):
+        """amdclang++ exists and init still failed: broken toolchain, be loud."""
+        state, reason = _classify_assembler(has_amdclang=True,
+                                            init_error="OSError: bad probe")
+        assert state == "broken"
+        assert "broken toolchain" in reason
+
+    def test_no_assembler_but_init_worked_is_still_active(self):
+        """The probe result wins over the heuristic: if it initialised, it works."""
+        assert _classify_assembler(has_amdclang=False, init_error=None)[0] == "active"
+
+    def test_missing_cls_bindings_are_reported_not_swallowed(self):
+        """A rocisa without SSetGprIdxOn produces an error string, never None.
+
+        The import-time guard turns that string into a RuntimeError; this pins the
+        detection half, which is what has to notice a stale rocisa in the first
+        place.
+        """
+        import types
+        stale = types.ModuleType("rocisa.instruction")
+        stale.__file__ = "/stale/rocisa/instruction.so"
+        module, error = _import_cls_bindings(stale)
+        assert module is None
+        assert "SSetGprIdxOn" in error and "/stale/rocisa" in error
+
+    def test_partially_stale_bindings_are_reported(self):
+        """One of the two bindings missing is just as broken as both."""
+        import types
+        from rocisa.instruction import SSetGprIdxOn
+        half = types.ModuleType("rocisa.instruction")
+        half.__file__ = "/half/rocisa/instruction.so"
+        half.SSetGprIdxOn = SSetGprIdxOn
+        module, error = _import_cls_bindings(half)
+        assert module is None
+        assert "SSetGprIdxOff" in error and "SSetGprIdxOn" not in error
+
+    def test_real_bindings_are_detected(self):
+        module, error = _import_cls_bindings()
+        assert error is None and module is not None
