@@ -49,8 +49,10 @@
 
 import ast
 import functools
+import hashlib
 import importlib
 import inspect
+import json
 import os
 import re
 import shutil
@@ -195,6 +197,7 @@ ASSEMBLER_GATED_CLASSES = (
     "TestClsIdxClusterHelper",
     "TestSubtileSrdAdvanceIsSelfContained",
     "TestIncrementToNextRowSelfContainedStride",
+    "TestClsOffStoreGolden",
 )
 
 
@@ -651,6 +654,80 @@ def cls_layout_kernel(mi_wave_tile, vwa=1, vwb=1, source_swap=False,
         "StoreRemapVectorWidth": 0,
         "StreamK": 0,
     }
+
+
+# ---- CLS-off assembly golden ----
+
+GOLDEN_PATH = os.path.join(SCRIPT_DIR, "test_data",
+                           "cls_gfx950_cls_off_store.golden.json")
+GOLDEN_UPDATE_ENV = "CLS_GOLDEN_UPDATE"
+
+
+def _normalize_asm(asm):
+    """Canonical instruction text: no comments, no blank lines, no indentation.
+
+    Comments are dropped because they carry emitter-internal wording that churns
+    without changing a single emitted bit; everything else is kept, including
+    labels and register numbers, so a real codegen change cannot hide.
+    """
+    out = []
+    for raw in asm.splitlines():
+        line = raw.split("//")[0].strip()
+        if not line or line.startswith("/*"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _asm_fingerprint(asm):
+    """{digest, instructions, opcodes} for a normalized module.
+
+    Three levels on purpose, so a mismatch says *what* moved rather than only
+    that something did:
+      * digest      -- sha256 of the canonical text: catches any change at all,
+                       including an operand or register renumbering.
+      * instructions -- how many instructions were emitted: catches a change in
+                       code size.
+      * opcodes     -- per-mnemonic histogram: catches a change in instruction
+                       mix, and is the part a human can actually diff in review.
+    """
+    text = _normalize_asm(asm)
+    opcodes = {}
+    instructions = 0
+    for line in text.splitlines():
+        head = line.split()[0]
+        if head.endswith(":") or head.startswith("."):
+            continue          # label or assembler directive, not an instruction
+        instructions += 1
+        opcodes[head] = opcodes.get(head, 0) + 1
+    return {
+        "digest": hashlib.sha256(text.encode()).hexdigest(),
+        "instructions": instructions,
+        "opcodes": dict(sorted(opcodes.items())),
+    }
+
+
+def _load_golden():
+    with open(GOLDEN_PATH) as fh:
+        return json.load(fh)
+
+
+def _describe_fingerprint_diff(expected, actual):
+    """Human-readable account of which of the three levels moved."""
+    notes = []
+    if expected["instructions"] != actual["instructions"]:
+        notes.append("instruction count %d -> %d"
+                     % (expected["instructions"], actual["instructions"]))
+    exp_ops, act_ops = expected["opcodes"], actual["opcodes"]
+    deltas = {op: act_ops.get(op, 0) - exp_ops.get(op, 0)
+              for op in set(exp_ops) | set(act_ops)
+              if act_ops.get(op, 0) != exp_ops.get(op, 0)}
+    if deltas:
+        notes.append("opcode deltas %s" % (dict(sorted(deltas.items())),))
+    elif expected["digest"] != actual["digest"]:
+        notes.append("same instruction mix but different operands/order "
+                     "(digest %s -> %s)" % (expected["digest"][:12], actual["digest"][:12]))
+    return "; ".join(notes) or "no difference"
 
 
 # ---------------------------------------------------------------------------
@@ -1692,6 +1769,104 @@ class TestSubtileSrdAdvanceCallSites:
         assert 'selfContainedStride=kernel["UseSubtileImpl"]' in src, (
             "readInput must opt the subtile load-SRD advance out of the CLS "
             "delayed-primer chain")
+
+
+# Tiles the CLS-off golden covers: both compacting shapes and the
+# non-compacting one, each at f32 and bf16.
+GOLDEN_CONFIGS = COMPACTING_CONFIGS + [NONCOMPACTING_CONFIG]
+
+
+@requires_gfx950_assembler
+class TestClsOffStoreGolden:
+    """CLS-OFF assembly non-regression golden.
+
+    Every shipped logic file sets CompactLoopStore: false, so CLS-off is the
+    production path -- and CLS-off shares the store emitter with CLS-on. Nothing
+    in-tree noticed a CLS change perturbing it: the characterization codegen
+    suite snapshots an order-invariant {basename, err} digest, so a CLS-off
+    assembly change that still assembles cleanly produces an identical golden.
+    The "the CLS-off assembly is byte-identical to before" claims in the commit
+    messages were established by a human running a diff, with no automated
+    successor. This is that successor.
+
+    Why a fingerprint and not a text snapshot: the CLS-off subtile store is
+    1100-2900 instructions per config, so a full text snapshot would be ~12k
+    lines of golden that no reviewer can read and that churns on any unrelated
+    store-emitter change. The fingerprint keeps the diagnostic value where it is
+    useful -- a per-mnemonic histogram a reviewer can diff, plus an instruction
+    count -- and puts the exactness in a sha256 of the canonical text, so nothing
+    slips through.
+
+    REGENERATING (deliberately, after reviewing what moved):
+
+        cd projects/hipblaslt/tensilelite
+        CLS_GOLDEN_UPDATE=1 python -m pytest \\
+            Tensile/Tests/unit/test_cls_gfx950_subtile_codegen.py \\
+            -k ClsOffStoreGolden -q
+
+    That rewrites test_data/cls_gfx950_cls_off_store.golden.json. Read the diff
+    before committing it: an opcode delta on the CLS-off path means the
+    production store changed for kernels that never enable CLS.
+    """
+
+    @pytest.mark.parametrize("use_bf16", [False, True], ids=["f32", "bf16"])
+    @pytest.mark.parametrize("mt_a,mt_b,depth_u", GOLDEN_CONFIGS,
+                             ids=[f"{a}x{b}" for a, b, _ in GOLDEN_CONFIGS])
+    def test_cls_off_assembly_matches_the_golden(self, mt_a, mt_b, depth_u, use_bf16):
+        key = "%dx%d-%s" % (mt_a, mt_b, "bf16" if use_bf16 else "f32")
+        asm, _ = _store_asm(mt_a, mt_b, depth_u, cls=False, use_bf16=use_bf16)
+        actual = _asm_fingerprint(asm)
+
+        if os.environ.get(GOLDEN_UPDATE_ENV):
+            golden = _load_golden() if os.path.exists(GOLDEN_PATH) else {}
+            golden[key] = actual
+            with open(GOLDEN_PATH, "w") as fh:
+                json.dump(golden, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            pytest.skip("%s set: rewrote %s[%s]" % (GOLDEN_UPDATE_ENV,
+                                                    os.path.basename(GOLDEN_PATH), key))
+
+        golden = _load_golden()
+        assert key in golden, (
+            "no CLS-off golden for %s; regenerate with %s=1 (see the class "
+            "docstring)" % (key, GOLDEN_UPDATE_ENV))
+        expected = golden[key]
+        assert actual == expected, (
+            "CLS-off subtile store assembly changed for %s: %s.\n"
+            "CLS-off is the production path (every shipped logic file has "
+            "CompactLoopStore: false), so this is a change to kernels that never "
+            "enable CLS. If it is intended, regenerate with %s=1 and review the "
+            "golden diff." % (key, _describe_fingerprint_diff(expected, actual),
+                              GOLDEN_UPDATE_ENV))
+
+    def test_golden_covers_every_config_and_nothing_else(self):
+        """The golden file has exactly one entry per parametrization.
+
+        A golden that silently loses an entry degrades to "no coverage for that
+        config" without failing anything, which is the failure mode this whole
+        file is trying to stop repeating.
+        """
+        expected = {"%dx%d-%s" % (a, b, dt)
+                    for a, b, _ in GOLDEN_CONFIGS for dt in ("f32", "bf16")}
+        assert set(_load_golden()) == expected
+
+    def test_golden_fingerprint_is_sensitive_to_a_single_instruction(self):
+        """The fingerprint would actually notice a one-instruction perturbation.
+
+        A golden nobody has checked can be a golden of the wrong thing. This
+        proves the comparison is live by perturbing the rendered text rather than
+        the emitter: dropping one instruction must move all three levels.
+        """
+        asm, _ = _store_asm(*COMPACTING_CONFIGS[0], cls=False, use_bf16=False)
+        lines = asm.splitlines()
+        victim = next(i for i, ln in enumerate(lines)
+                      if ln.strip().startswith("v_") and "//" in ln)
+        perturbed = "\n".join(lines[:victim] + lines[victim + 1:])
+        base, changed = _asm_fingerprint(asm), _asm_fingerprint(perturbed)
+        assert changed["digest"] != base["digest"]
+        assert changed["instructions"] == base["instructions"] - 1
+        assert changed["opcodes"] != base["opcodes"]
+        assert "instruction count" in _describe_fingerprint_diff(base, changed)
 
 
 class TestPreconditionSemantics:
