@@ -106,6 +106,46 @@ test_categories:
     labels:
       - "ffm-quick"
 
+  # gfx950 CompactLoopStore (CLS) common-GEMM tests. Like ffm-quick these build and
+  # run kernels through the client, so they need the same TensileLite-specific
+  # conftest options; unlike ffm-quick they need real gfx950 silicon (the feature
+  # under test is the gfx950 s_set_gpr_idx_on acc-read, which the gfx1250 CLS configs
+  # do not use — those take the v_movrelsd_2_b32 path and are marked skip-gfx950).
+  #
+  # These are separate opt-in categories rather than additions to quick/standard
+  # (documented above as host-only, and there is no gfx950 GPU runner in the PR path)
+  # or to comprehensive/full (whose test_paths deliberately exclude Tensile/Tests/common;
+  # adding it there would pull in every gfx950 GEMM YAML, not just the CLS ones).
+  #
+  # Selection is by the cls_gfx950 / cls_gfx950_smoke marks the YAMLs declare in
+  # TestParameters (registered in pytest.ini). The per-arch skip-gfxXXXX marks in
+  # those YAMLs make them no-ops if either category is ever pointed at another arch.
+  cls-gfx950-smoke:
+    description: "gfx950 CompactLoopStore smoke: MT320x64, beta==0 and beta!=0"
+    test_paths:
+      - "Tensile/Tests/common"
+    pytest_markers:
+      - "cls_gfx950_smoke"
+    pytest_args:
+      - "--prebuilt-client={ROCM_PATH}/libexec/hipblaslt/tensilelite/tensilelite-client"
+      - "--global-parameters=LibraryFormat='msgpack'"
+      - "--tensile-options=--cxx-compiler,{ROCM_PATH}/bin/amdclang++"
+    labels:
+      - "cls-gfx950-smoke"
+
+  cls-gfx950:
+    description: "gfx950 CompactLoopStore full matrix: MT320x64 + MT256x320, both beta arms"
+    test_paths:
+      - "Tensile/Tests/common"
+    pytest_markers:
+      - "cls_gfx950"
+    pytest_args:
+      - "--prebuilt-client={ROCM_PATH}/libexec/hipblaslt/tensilelite/tensilelite-client"
+      - "--global-parameters=LibraryFormat='msgpack'"
+      - "--tensile-options=--cxx-compiler,{ROCM_PATH}/bin/amdclang++"
+    labels:
+      - "cls-gfx950"
+
 execution_settings:
   # TensileLite GPU unit tests assemble/run kernels and the legacy runner ran
   # them serially; pytest-xdist worker isolation (HIP_VISIBLE_DEVICES) is set up
@@ -121,3 +161,9 @@ execution_settings:
     comprehensive: 25200  # 7 hours
     full: 28800           # 8 hours
     ffm-quick: 2700       # 45 minutes
+    # Each cls-gfx950* test is one YAML config's build+validate round trip. Measured
+    # on 8x MI355X with a prebuilt client: ~9 s per MT320x64 config, ~9 s per
+    # MT256x320 config, 27 s wall for all four serially (parallel_workers: 1).
+    # 600 s per test leaves ~60x headroom for a cold toolchain or a slower runner.
+    cls-gfx950-smoke: 600  # 10 minutes
+    cls-gfx950: 600        # 10 minutes

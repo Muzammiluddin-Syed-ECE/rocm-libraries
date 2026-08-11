@@ -1,0 +1,100 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# gfx950 subtile CompactLoopStore (CLS) -- on-hardware numerical coverage, beta == 0,
+# MT256x320 (the wide-N tile, 34 index-mode brackets and 6 SrdC advance sites).
+#
+# Second tile of the gfx950 CLS hardware matrix. MT320x64 (the smoke pair) is not a
+# substitute: the subtile SRD advance emits a different number of C-load sites per tile,
+# and MT320x64 tolerates a reverted readInput advance at either beta while MT256x320
+# faults at beta != 0. Whether a store-path defect is visible is tile-dependent, so the
+# matrix needs both geometries.
+#
+# beta == 0 half; the beta != 0 half is cls_subtile_mt256x320_beta1_gfx950.yaml. Keep
+# the two files' ForkParameters in sync so they remain a pure beta A/B.
+#
+# Axes covered here: beta == 0, edge and non-edge problem shapes, CompactLoopStore
+# off vs on, UseSubtileImpl forked on.
+#
+# Kernel class copied from the known-good gfx950 subtile recipe: F4BS MXFP4 ->
+# BF16 TN with bias and activation, MIArchVgpr False (accvgpr reads, i.e. the
+# index-mode bracket), StreamK 0 (required or computeCLSLayout cannot compact).
+# MatrixInstruction [16,16,128,1, 1,8,10, 2,2] -> MT_M = 16*8*2 = 256,
+# MT_N = 16*10*2 = 320, iterCount(outerTT1) = 2.
+#
+# Marks: cls_gfx950 selects the whole gfx950 CLS hardware set. Deliberately not in
+# the cls_gfx950_smoke subset -- this tile is the expensive one.
+TestParameters:
+  marks: [cls_gfx950, skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250] # gfx950 index-mode CLS only
+
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  PrintSolutionRejectionReason: True
+  NumElementsToValidate: -1
+  MinimumRequiredVersion: 5.0.0
+  PrintLevel: 3
+  Device: 0
+  CMakeBuildType: Release
+  KernelTime: True
+  MaxWorkspaceSize: 13421772800
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  DataInitTypeC: 0
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 0
+  DataInitTypeBias: 1
+  DataInitTypeMXSA: 3
+  DataInitTypeMXSB: 3
+  MXScaleFormat: 1
+  BoundsCheck: 0
+  CpuThreads: 1
+  RotatingBufferSize: 0
+
+BenchmarkProblems:
+  -
+    - # ProblemType -- F4BS TN block-scaled MXFP4 -> BF16, bias + activation
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: hipblaslt_all
+      UseBias: 1
+      BiasDataTypeList: [s]
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1, 8, 10,  2, 2]   # MT256x320
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [0]
+        - DepthU: [256]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+        - MIArchVgpr: [False]
+        - CompactLoopStore: [False, True]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          # non-edge: exactly one MT256x320 macro tile, K == DepthU
+          - Exact: [256, 320, 1, 256]
+          # edge: M and N are multiples of the MX block but not of the macro tile,
+          # so both free dimensions leave a partial tile and the deferred edge
+          # store batches execute.
+          - Exact: [224, 288, 1, 256]
+        - BiasTypeArgs: ['s']
+        - ActivationArgs:
+          - [Enum: none]
+          - [Enum: relu]
