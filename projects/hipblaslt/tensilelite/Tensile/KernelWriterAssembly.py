@@ -16389,7 +16389,8 @@ class KernelWriterAssembly(KernelWriter):
         # re-executed via the runtime loop.
         # For non-CLS, numBatchesCLS == numBatches so behaviour is unchanged.
         if kernel["CompactLoopStore"]:
-          numBatchesCLS = GlobalWriteBatchWriter.computeBatchesPerCLSBody(kernel, numBatches)
+          numBatchesCLS = GlobalWriteBatchWriter.computeBatchesPerCLSBody(
+            kernel, numBatches, self.states.maxLimitAgprs)
         else:
           numBatchesCLS = numBatches
 

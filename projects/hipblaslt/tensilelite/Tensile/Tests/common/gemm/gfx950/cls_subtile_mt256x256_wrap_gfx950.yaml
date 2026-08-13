@@ -1,0 +1,109 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# gfx950 subtile CompactLoopStore (CLS) -- the CLS body row wrap, on hardware.
+#
+# Regression for a missing inter-iteration row advance. On the subtile store
+# path the D SRD (16-bit paired store) and the C SRD (beta load) advance rows
+# with a self-contained incrementToNextRow instead of joining the CLS
+# delayed-primer chain, because s[stmp] cannot survive between two of their
+# calls. A compacted body that does not itself cross a row therefore left both
+# SRDs standing still, and every CLS iteration past the first rewrote the first
+# iteration's rows. GlobalWriteBatch._emitCLSBodyRowWrap emits that advance at
+# the body's close; this config FAILS on any build without it.
+#
+# Why this tile, specifically: the wrap is only reachable when the *non-edge*
+# store path compacts, which needs its batch count to be a multiple of
+# outerTT1 > 1. MIWaveTile [16,4] gives outerTT1 = 4 and a non-edge body of 4
+# batches, so all four non-edge variants run at iterCount 4. It is also the
+# exact boundary of the accumulator-spill gate that
+# cls_subtile_mt288x256_accspill_gfx950.yaml covers from the other side:
+# 16*4*4 = 256 MI outputs fill the AGPR file without overflowing it, so this
+# tile still compacts and the gate is proven not to be over-broad.
+#
+# beta != 0 (DataInitTypeC / DataInitTypeBeta) so the C-side wrap runs too; it
+# is the only arm in which the beta load's SRD advance is live.
+#
+# Kernel class is the known-good gfx950 subtile recipe: F4BS MXFP4 -> BF16 TN
+# with bias and activation, MIArchVgpr False (accvgpr reads, i.e. the index-mode
+# bracket), StreamK 0 and GlobalSplitU 1 (required or computeCLSLayout cannot
+# compact). The CompactLoopStore False arm makes any failure attributable to CLS.
+#
+# Marks: cls_gfx950 selects the whole gfx950 CLS hardware set. See
+# test_categories.yaml.
+TestParameters:
+  marks: [cls_gfx950, skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-gfx1250] # gfx950 index-mode CLS only
+
+GlobalParameters:
+  SyncsPerBenchmark: 0
+  PrintSolutionRejectionReason: True
+  NumElementsToValidate: -1
+  MinimumRequiredVersion: 5.0.0
+  PrintLevel: 3
+  Device: 0
+  CMakeBuildType: Release
+  KernelTime: True
+  MaxWorkspaceSize: 13421772800
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  DataInitTypeC: 3
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 1
+  DataInitTypeBias: 1
+  DataInitTypeMXSA: 3
+  DataInitTypeMXSB: 3
+  MXScaleFormat: 1
+  BoundsCheck: 0
+  CpuThreads: 1
+  RotatingBufferSize: 0
+
+BenchmarkProblems:
+  -
+    - # ProblemType -- F4BS TN block-scaled MXFP4 -> BF16, bias + activation
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: hipblaslt_all
+      UseBias: 1
+      BiasDataTypeList: [s]
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1, 16, 4,  1, 4]   # MT256x256, 256 accumulators
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [256]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0]
+        - GlobalSplitU: [1]
+        - StaggerU: [0]
+        - UseSubtileImpl: [true]
+        - MIArchVgpr: [False]
+        - NonTemporalD: [4]
+        - WorkGroupMapping: [16]
+        - WorkGroupMappingXCC: [1]
+        - CompactLoopStore: [False, True]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          # non-edge: exactly one macro tile, then four of them. The wrap is on
+          # the non-edge store path, which every aligned shape takes.
+          - Exact: [256, 256, 1, 256]
+          - Exact: [512, 512, 1, 256]
+        - BiasTypeArgs: ['s']
+        - ActivationArgs:
+          - [Enum: none]
+          - [Enum: relu]

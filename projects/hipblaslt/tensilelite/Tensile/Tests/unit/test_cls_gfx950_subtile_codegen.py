@@ -605,11 +605,17 @@ def assert_m0_step_reaches_every_slice(kernel, num_batches):
     derived from an unrelated quantity is caught whatever value it happens to
     take. Returns True when the layout compacts (so callers can assert they are
     not vacuously passing), False when iterCount == 1 and m0Step is dead.
+
+    The layout is asked for against an AGPR file that holds the whole tile, so
+    the accumulator-spill gate cannot suppress compaction and silence this
+    property; the gate itself is under test in TestCLSLayoutAccSpillGate.
     """
     from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
     from Tensile.KernelWriterModules import accToArchMapper, getAccToArchLen
 
-    bpb, iterCount, m0Step = GlobalWriteBatchWriter.computeCLSLayout(kernel, num_batches)
+    fitsAllAgprs = getAccToArchLen(kernel) * kernel["MIRegPerOut"]
+    bpb, iterCount, m0Step = GlobalWriteBatchWriter.computeCLSLayout(
+        kernel, num_batches, fitsAllAgprs)
     assert bpb * iterCount == num_batches, (bpb, iterCount, num_batches)
     if iterCount == 1:
         return False
@@ -632,13 +638,20 @@ def assert_m0_step_reaches_every_slice(kernel, num_batches):
 
 
 def cls_layout_kernel(mi_wave_tile, vwa=1, vwb=1, source_swap=False,
-                      wave=WAVESIZE_64, mi=(16, 16), bm=1, bn=1, nepbs=8):
+                      wave=WAVESIZE_64, mi=(16, 16), bm=1, bn=1, nepbs=8,
+                      mi_arch_vgpr=False, data_type="s"):
     """Minimal kernel dict for computeCLSLayout, wide enough for all three arms.
 
     computeCLSLayout selects on (outerTT1, VW1, SourceSwap), so one factory that
     can express every combination is what lets the m0Step property be checked on
     cases (a) and (b) and not just (c).
+
+    It also has to say where the accumulators live: computeCLSLayout refuses to
+    compact a layout whose MI outputs overflow the AGPR file (clsAccSourcesSpill),
+    which reads MIArchVgpr / MIRegPerOut / the input DataType.
     """
+    from Tensile.Common.DataType import DataType
+    dt = DataType(data_type)
     return {
         "EnableMatrixInstruction": True,
         "VectorWidthA": vwa,
@@ -653,6 +666,9 @@ def cls_layout_kernel(mi_wave_tile, vwa=1, vwb=1, source_swap=False,
         "SourceSwap": source_swap,
         "StoreRemapVectorWidth": 0,
         "StreamK": 0,
+        "MIArchVgpr": mi_arch_vgpr,
+        "MIRegPerOut": 1,
+        "ProblemType": {"DataType": dt},
     }
 
 
@@ -1142,23 +1158,9 @@ class TestComputeCLSLayoutSubtile:
 
     @staticmethod
     def _subtile_kernel(mi_wave_tile):
-        # Minimal kernel dict for computeCLSLayout case (a): VW1 == 1, so
-        # outerTT1 == MIWaveTile[1]. 16x16 MI, wave64, no SourceSwap/StreamK.
-        return {
-            "EnableMatrixInstruction": True,
-            "VectorWidthA": 1,
-            "VectorWidthB": 1,
-            "MIWaveTile": list(mi_wave_tile),
-            "MatrixInstM": 16,
-            "MatrixInstN": 16,
-            "MatrixInstBM": 1,
-            "MatrixInstBN": 1,
-            "WavefrontSize": WAVESIZE_64,
-            "NumElementsPerBatchStore": 8,
-            "SourceSwap": False,
-            "StoreRemapVectorWidth": 0,
-            "StreamK": 0,
-        }
+        # computeCLSLayout case (a): VW1 == 1, so outerTT1 == MIWaveTile[1].
+        # 16x16 MI, wave64, no SourceSwap/StreamK.
+        return cls_layout_kernel(mi_wave_tile)
 
     def test_case_a_compacts_when_outertt1_divides_numbatches(self):
         from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
@@ -1234,21 +1236,8 @@ class TestComputeCLSLayoutSourceSwap:
     @staticmethod
     def _kernel(mi_wave_tile, vwa=1, nepbs=0, wave=WAVESIZE_64, mi=(16, 16),
                 bm=1, bn=1):
-        return {
-            "EnableMatrixInstruction": True,
-            "VectorWidthA": vwa,
-            "VectorWidthB": 1,
-            "MIWaveTile": list(mi_wave_tile),
-            "MatrixInstM": mi[0],
-            "MatrixInstN": mi[1],
-            "MatrixInstBM": bm,
-            "MatrixInstBN": bn,
-            "WavefrontSize": wave,
-            "NumElementsPerBatchStore": nepbs,
-            "SourceSwap": True,
-            "StoreRemapVectorWidth": 0,
-            "StreamK": 0,
-        }
+        return cls_layout_kernel(mi_wave_tile, vwa=vwa, vwb=1, source_swap=True,
+                                 wave=wave, mi=mi, bm=bm, bn=bn, nepbs=nepbs)
 
     def test_default_num_elements_per_batch_store_does_not_raise(self):
         """NumElementsPerBatchStore == 0 is the default and must be harmless.
@@ -1420,6 +1409,171 @@ class TestComputeCLSLayoutM0StepAllArms:
         assert kernel["MIWaveTile"][1] // kernel["VectorWidthB"] > 1
         assert kernel["VectorWidthB"] == 1
         assert not kernel["SourceSwap"]
+
+
+class TestCLSLayoutAccSpillGate:
+    """A layout whose accumulators spill out of the AGPR file must not compact.
+
+    mapAcctoArchRegs sources MI output i from accvgpr(i) while i < maxAgprs and
+    from an arch vgpr above that. The CLS body is emitted once, from iteration
+    0's source indices, and re-executed with M0 shifted; M0 shifts a register
+    index but not the register FILE the instruction names. So the moment the
+    tile needs more MI outputs than the AGPR file holds, every iteration that
+    steps a source past the boundary reads an accvgpr whose value is in an arch
+    vgpr -- silently wrong D, no fault. The body is a prefix and M0 only steps
+    forward, so the last iteration always reaches the top of the source space:
+    no body size makes a spilling layout safe, and the gate is unconditional.
+
+    Found on hardware, not here: MIWaveTile [18,4] needs 288 MI outputs against
+    a 256-entry file and corrupted D on every aligned shape. The suite missed it
+    because every tile it exercised (and both on-device tiles) either fit the
+    file or only compacted on store variants their problem shapes never
+    dispatched. These tests are written against the accumulator count rather
+    than against a tile list, so a new tile cannot re-open the hole.
+    """
+
+    # (MIWaveTile, VW0, accumulator count, why this tile is here). OPM is 4 on a
+    # 16x16 MI at wave64, so the count is outerTT1 * outerTT0 * 4.
+    SPILL_TILES = [
+        ([18, 4], 1, 288, "MT288x256, the reported production tile"),
+        ([20, 4], 1, 320, "MT320x256"),
+        ([8, 10], 1, 320, "MT256x320, an on-device-validated tile whose edge "
+                          "store variants compacted past the file"),
+    ]
+    FIT_TILES = [
+        ([16, 4], 1, 256, "MT256x256, exactly fills the file"),
+        ([10, 2], 1, 80, "MT320x64, an on-device-validated tile"),
+        ([4, 4], 1, 64, "small"),
+    ]
+
+    # Includes multiples of 10 so the MIWaveTile[1] == 10 tile has a numBatches
+    # its outerTT1 divides; without one it could never compact for reasons that
+    # have nothing to do with the spill.
+    NUM_BATCHES = (2, 4, 8, 10, 16, 20)
+    MAX_AGPRS = 256
+
+    @staticmethod
+    def _acc_len(kernel):
+        from Tensile.KernelWriterModules import getAccToArchLen
+        return getAccToArchLen(kernel) * kernel["MIRegPerOut"]
+
+    @pytest.mark.parametrize("mi_wave_tile,vwa,accs,why", SPILL_TILES,
+                             ids=[f"MIWT{t}-{n}accs" for t, _, n, _ in SPILL_TILES])
+    def test_spilling_tile_stays_at_one_iteration(self, mi_wave_tile, vwa, accs, why):
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+
+        kernel = cls_layout_kernel(mi_wave_tile, vwa=vwa)
+        assert self._acc_len(kernel) == accs, (why, self._acc_len(kernel))
+        for nb in self.NUM_BATCHES:
+            bpb, iterCount, _ = GlobalWriteBatchWriter.computeCLSLayout(
+                kernel, nb, self.MAX_AGPRS)
+            assert (bpb, iterCount) == (nb, 1), (
+                f"{why}: {accs} accumulators do not fit {self.MAX_AGPRS} agprs, "
+                f"but numBatches={nb} still compacts to body={bpb} x {iterCount}")
+
+    @pytest.mark.parametrize("mi_wave_tile,vwa,accs,why", SPILL_TILES,
+                             ids=[f"MIWT{t}-{n}accs" for t, _, n, _ in SPILL_TILES])
+    def test_only_the_spill_suppresses_those_tiles(self, mi_wave_tile, vwa, accs, why):
+        """The gate, not the divisibility arm, is what stopped them.
+
+        Without this the test above passes vacuously for any tile whose
+        outerTT1 happens not to divide numBatches.
+        """
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+
+        kernel = cls_layout_kernel(mi_wave_tile, vwa=vwa)
+        compacted = [nb for nb in self.NUM_BATCHES
+                     if GlobalWriteBatchWriter.computeCLSLayout(kernel, nb, accs)[1] > 1]
+        assert compacted, (
+            f"{why}: this tile does not compact even with an AGPR file that "
+            f"holds all {accs} of its accumulators, so the spill gate is not "
+            f"what the test above is measuring")
+
+    @pytest.mark.parametrize("mi_wave_tile,vwa,accs,why", FIT_TILES,
+                             ids=[f"MIWT{t}-{n}accs" for t, _, n, _ in FIT_TILES])
+    def test_fitting_tile_still_compacts(self, mi_wave_tile, vwa, accs, why):
+        """The gate is not over-broad: a tile that fits keeps its compaction.
+
+        MIWaveTile [16,4] sits exactly on the boundary at 256 == maxAgprs, so
+        this pins the comparison as strict `>` and not `>=`; the on-device
+        MT256x256 config depends on that.
+        """
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+
+        kernel = cls_layout_kernel(mi_wave_tile, vwa=vwa)
+        assert self._acc_len(kernel) == accs, (why, self._acc_len(kernel))
+        compacted = [nb for nb in self.NUM_BATCHES
+                     if GlobalWriteBatchWriter.computeCLSLayout(
+                         kernel, nb, self.MAX_AGPRS)[1] > 1]
+        assert compacted, (
+            f"{why}: {accs} accumulators fit {self.MAX_AGPRS} agprs, but no "
+            f"numBatches in {self.NUM_BATCHES} compacts any more")
+
+    def test_mi_arch_vgpr_tile_is_not_gated(self):
+        """MIArchVgpr keeps every MI output in one file, so nothing can spill.
+
+        Gating it too would cost compaction on the arch-vgpr path for no reason.
+        """
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+
+        tile, vwa, accs, _ = self.SPILL_TILES[0]
+        kernel = cls_layout_kernel(tile, vwa=vwa, mi_arch_vgpr=True)
+        assert accs > self.MAX_AGPRS
+        compacted = [nb for nb in self.NUM_BATCHES
+                     if GlobalWriteBatchWriter.computeCLSLayout(
+                         kernel, nb, self.MAX_AGPRS)[1] > 1]
+        assert compacted, "MIArchVgpr accumulators cannot spill; do not gate them"
+
+    @pytest.mark.parametrize("mi_wave_tile,vwa,accs,why", SPILL_TILES + FIT_TILES,
+                             ids=[f"MIWT{t}-{n}accs"
+                                  for t, _, n, _ in SPILL_TILES + FIT_TILES])
+    def test_a_compacting_loop_never_steps_past_the_agpr_file(self, mi_wave_tile,
+                                                              vwa, accs, why):
+        """The invariant itself, stated over both tile sets at once.
+
+        Whatever the layout math decides, a loop that runs more than once must
+        not reach a source index the AGPR file does not hold. Asserted against
+        the highest index the acc-read list can name rather than against the
+        gate's own expression, so a gate rewritten in different terms is still
+        held to the same property.
+        """
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+
+        kernel = cls_layout_kernel(mi_wave_tile, vwa=vwa)
+        for nb in self.NUM_BATCHES:
+            _, iterCount, _ = GlobalWriteBatchWriter.computeCLSLayout(
+                kernel, nb, self.MAX_AGPRS)
+            if iterCount == 1:
+                continue
+            assert self._acc_len(kernel) - 1 < self.MAX_AGPRS, (
+                f"{why}: numBatches={nb} compacts to {iterCount} iterations, "
+                f"whose last one reads source {self._acc_len(kernel) - 1} -- "
+                f"outside the {self.MAX_AGPRS}-entry agpr file")
+
+    def test_store_emitter_uses_the_allocated_agpr_budget(self):
+        """The emitter must pass the allocator's budget, not the module default.
+
+        DEFAULT_MAX_AGPRS is a fallback for callers with no allocator state.
+        If the store emitter fell back to it, the gate would silently key off a
+        constant instead of off what the kernel was actually given, so this
+        drives _computeCLSLayout with a stub whose budget is deliberately not
+        the default.
+        """
+        from types import SimpleNamespace
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        from Tensile.KernelWriterModules import DEFAULT_MAX_AGPRS
+
+        tile, vwa, accs, _ = self.SPILL_TILES[0]
+        assert accs > DEFAULT_MAX_AGPRS, "pick a tile the default would gate"
+        stub = SimpleNamespace(
+            kernel=cls_layout_kernel(tile, vwa=vwa),
+            numBatches=4,
+            parentWriter=SimpleNamespace(states=SimpleNamespace(maxLimitAgprs=accs)))
+        _, iterCount, _ = GlobalWriteBatchWriter._computeCLSLayout(stub)
+        assert iterCount > 1, (
+            "the store emitter gated a tile that the kernel's own agpr budget "
+            "holds, so it is reading DEFAULT_MAX_AGPRS instead of "
+            "states.maxLimitAgprs")
 
 
 @requires_gfx950_assembler

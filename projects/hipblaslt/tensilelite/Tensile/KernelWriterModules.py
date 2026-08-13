@@ -270,6 +270,11 @@ def accVgprImagNumOffset(kernel):
 # that the property is visible to anyone inspecting codes.accVgprRead.
 CLS_M0_RELATIVE_READS = "AccVgprRead.M0Relative"
 
+# AGPR file size assumed by callers that have no register-allocator state to read
+# it from. The allocated value is states.maxLimitAgprs
+# (regCaps PhysicalMaxVgpr - MaxVgpr); prefer that wherever it is reachable.
+DEFAULT_MAX_AGPRS = 256
+
 def clsUsesVgprIndexMode(kernel, asmCaps):
   """True when the CompactLoopStore acc-read is a bare, index-mode-bracketed read.
 
@@ -287,6 +292,26 @@ def clsIdxModeOn(comment=None):
 def clsIdxModeOff(comment=None):
   """Close the VGPR index-mode bracket around an acc-read cluster."""
   return SSetGprIdxOff(comment=comment or "CLS: leave index mode")
+
+def clsAccSourcesSpill(kernel, maxAgpr: int) -> bool:
+  """True when the acc-read sources are split across the AGPR file and arch VGPRs.
+
+  mapAcctoArchRegs lays the MI outputs out as one flat source index space and
+  picks the register FILE per index: accvgpr(i) while i < maxAgpr, an arch vgpr
+  above that. M0-relative indexing shifts a register index, never the file, so a
+  CLS body emitted from iteration 0's indices keeps reading the file those
+  indices landed in; an iteration that steps a source past maxAgpr then reads an
+  accvgpr where the value lives in an arch vgpr. Since the body is a prefix of
+  the element list and M0 only ever steps forward, the last iteration reaches
+  the top of the source space -- so a spilling layout can never be re-executed,
+  whatever the body size. See GlobalWriteBatchWriter.computeCLSLayout.
+  """
+  if kernel["MIArchVgpr"] or not kernel["EnableMatrixInstruction"]:
+    return False
+  complexMultiplier = 2 if kernel["ProblemType"]["DataType"].isComplex() else 1
+  # Extent mapAcctoArchRegs allocates its itemList over, i.e. one past the
+  # largest source index it can emit.
+  return getAccToArchLen(kernel) * kernel["MIRegPerOut"] * complexMultiplier > maxAgpr
 
 def clsWrapIdxCluster(kernel, asmCaps, cluster: Module) -> Module:
   """Wrap one contiguous acc-read cluster in a single VGPR index-mode bracket.
@@ -316,7 +341,7 @@ def clsWrapIdxCluster(kernel, asmCaps, cluster: Module) -> Module:
 # MapAcctoArch
 # function to map MFMA Acc  Registers to Arch VGPR register
 ##############################################################################
-def mapAcctoArchRegs(kernel, asmCaps, maxAgpr=256, write=False, spilledVgprBase=None):
+def mapAcctoArchRegs(kernel, asmCaps, maxAgpr=DEFAULT_MAX_AGPRS, write=False, spilledVgprBase=None):
   acc2arch, _ = accToArchMapper(kernel)
 
   complexMultiplier = 2 if kernel["ProblemType"]["DataType"].isComplex() else 1

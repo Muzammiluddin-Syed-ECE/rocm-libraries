@@ -918,7 +918,7 @@ class AddrCalculation:
 
     def incrementToNextRow(self, kernel, tc, ss, stmp, forceinitrow0=0,
                            overrideAfterPrimerRows=0, bpeType=None, dst=-1,
-                           selfContainedStride=False):
+                           selfContainedStride=False, overrideRows=0):
         """
         Generate code to move to the next row(s)
         If optSrdIncForRow, this will move the SRD forward
@@ -956,10 +956,16 @@ class AddrCalculation:
         reads it -- the store SRD then advances by whatever scratch value
         happens to be there instead of by a row stride.
 
+        `overrideRows` replaces this element's own `rowInc` as the advance
+        amount, making the row count a parameter the way `emitCoord1Advance`
+        and `emitRowPtrAdvance` already take it. It exists for the CLS
+        body-end wrap, an advance that belongs to no single element: the step
+        from the body's last row to the first row of the next CLS iteration.
+
         """
 
         module = Module("incrementToNextRow")
-        numRows = self.rowInc
+        numRows = overrideRows if overrideRows else self.rowInc
         tmpBpe = bpeType if bpeType else self.kernelWriter.states.bpeCexternal
         if (tc == 'C' or tc == 'TD') and (kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
             tmpBpe = int(self.kernelWriter.states.bpr * kernel["ProblemType"]["DestDataType"].numRegisters())

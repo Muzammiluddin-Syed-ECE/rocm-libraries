@@ -50,7 +50,8 @@ from ..AsmStoreState import StoreState
 from ..AsmAddressCalculation import AddrCalculation
 from ..Components.PackData import formatting, PackData_F16, PackData_BF16, PackData_FLOAT8, PackData_FLOAT8_fnuz
 from rocisa.instruction import ECvtF16toF32, ECvtPkFP8toF32, ECvtPkBF8toF32
-from ..KernelWriterModules import hasSequentialValuC, clsWrapIdxCluster, getAccToArchLen
+from ..KernelWriterModules import hasSequentialValuC, clsWrapIdxCluster, getAccToArchLen, \
+                                  clsAccSourcesSpill, DEFAULT_MAX_AGPRS
 
 from math import ceil, log2
 
@@ -248,6 +249,35 @@ class GlobalWriteBatchWriter:
   def moduleName(self):
     return "globalWriteBatch (Atomic)" if self.atomic else "globalWriteBatch (Non atomic)"
 
+  @property
+  def isSubtileNonEdge(self) -> bool:
+    """UseSubtileImpl NonEdge store path (the subtile fast path).
+    Excluded for "MultipleBufferSingleKernel" and "MultipleBuffer" (StreamK
+    partial-tile workspace path) -- both write float32 to workspace, not to D.
+    """
+    return bool(
+      self.kernel.get("UseSubtileImpl") and not self.edge
+      and self.kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
+    )
+
+  @property
+  def is16bitSubtile(self) -> bool:
+    """The 16bit paired dwordx4 subtile store path.
+
+    Selects the partner-lane address setup in _emitAdd AND the per-element
+    store dispatch, so the two can never disagree. It also decides which
+    emitter owns the D row advance: this path defers a self-contained
+    incrementToNextRow (see _emitAdd's sba=0 branch) instead of joining the
+    CLS delayed-primer chain -- which is what _emitCLSBodyRowWrap keys on.
+    """
+    return bool(
+      self.isSubtileNonEdge
+      and (self.kernel["ProblemType"]["DestDataType"].isBFloat16() or
+           self.kernel["ProblemType"]["DestDataType"].isHalf())
+      and self.kernel["ProblemType"]["HighPrecisionAccumulate"]
+      and self.kernel["WavefrontSize"] != 32  # wave32: skip permute-based packed store (uses wave64-only ops)
+    )
+
   def getEdgeMovInstType(self):
     return SMovB32 if self.wavelen == 32 else SMovB64
 
@@ -261,7 +291,7 @@ class GlobalWriteBatchWriter:
     return SOrSaveExecB32 if self.wavelen == 32 else SOrSaveExecB64
 
   @staticmethod
-  def computeCLSLayout(kernel, numBatches: int):
+  def computeCLSLayout(kernel, numBatches: int, maxAgprs: int = DEFAULT_MAX_AGPRS):
     """Single source of truth for the CLS loop layout math.
 
     Returns (batchesPerCLSBody, iterCount, m0Step), all derived from ONE shared
@@ -277,8 +307,9 @@ class GlobalWriteBatchWriter:
       (a) outerTT1  > 1, VW1 == 1            : iter = wgIdx1, step = OPM*BM*BN*VW0*outerTT0*VW1
       (b) outerTT1 == 1, VW1 > 1, SS=False   : iter = vw1,    step = OPM*BM*BN*VW0*outerTT0
       (c) outerTT1 == 1, VW1 == 1, SS=True   : iter = tIdx,   step = 1
-    Store paths not covered by the CLS loop (non-MI, StoreRemap, StreamK) and
-    non-divisible / non-regular layouts fall back to a single iteration
+    Store paths not covered by the CLS loop (non-MI, StoreRemap, StreamK),
+    non-divisible / non-regular layouts, and layouts whose accumulators spill out
+    of the `maxAgprs`-entry AGPR file all fall back to a single iteration
     (batchesPerCLSBody = numBatches), where m0Step is dead.
     """
     batchesPerBody = numBatches
@@ -329,6 +360,14 @@ class GlobalWriteBatchWriter:
     if kernel.get("StoreRemapVectorWidth", 0) != 0 or kernel.get("StreamK", 0) != 0:
       batchesPerBody = numBatches
 
+    # Re-executing a body needs every accumulator source in one register file:
+    # M0 shifts a register index, not the file it names. Once the MI outputs
+    # overflow the AGPR file the tail of the source space lives in arch vgprs,
+    # which the M0-stepped reads cannot reach. Single iteration -- the unrolled
+    # body emits each source with its own file and stays correct.
+    if clsAccSourcesSpill(kernel, maxAgprs):
+      batchesPerBody = numBatches
+
     iterCount = max(1, numBatches // batchesPerBody)
     # notLocalSplitUGlobalWrite emits only batchesPerCLSBody batches and the CLS
     # countdown re-executes exactly that body, so a layout whose coverage misses
@@ -339,22 +378,23 @@ class GlobalWriteBatchWriter:
     return batchesPerBody, iterCount, m0Step
 
   @staticmethod
-  def computeBatchesPerCLSBody(kernel, numBatches: int) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches)[0]
+  def computeBatchesPerCLSBody(kernel, numBatches: int, maxAgprs: int = DEFAULT_MAX_AGPRS) -> int:
+    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, maxAgprs)[0]
 
   def _computeBatchesPerCLSBody(self) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches)[0]
+    return self._computeCLSLayout()[0]
 
   @staticmethod
-  def computeCLSIterCount(kernel, numBatches: int) -> int:
+  def computeCLSIterCount(kernel, numBatches: int, maxAgprs: int = DEFAULT_MAX_AGPRS) -> int:
     """CLS loop iter count = numBatches / batchesPerCLSBody. Minimum 1."""
-    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches)[1]
+    return GlobalWriteBatchWriter.computeCLSLayout(kernel, numBatches, maxAgprs)[1]
 
   def _computeCLSIterCount(self) -> int:
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches)[1]
+    return self._computeCLSLayout()[1]
 
   def _computeCLSLayout(self):
-    return GlobalWriteBatchWriter.computeCLSLayout(self.kernel, self.numBatches)
+    return GlobalWriteBatchWriter.computeCLSLayout(
+      self.kernel, self.numBatches, self.parentWriter.states.maxLimitAgprs)
 
   def emit(self) -> Module:
     assert self._checkAtomicPreconditions()
@@ -406,6 +446,7 @@ class GlobalWriteBatchWriter:
           # cinRowPtr/coutRowPtrD adds inline. This also makes the look-ahead cover
           # coutRowPtrE / coutRowPtrBias / packed-C1 for free (same conditions).
           module.add(addrCalc.emitRowPtrAdvance(self.kernel, self.ss, self.tmpS01, rowInc, lookahead=True))
+        module.add(self._emitCLSBodyRowWrap(rowInc))
 
       clsLabel = getattr(self.ss, "_clsLoopLabel", None)
       if clsLabel is not None and (self._computeBatchesPerCLSBody() - 1 == self.batchIdx) and self.ss.elementAddr:
@@ -757,6 +798,53 @@ class GlobalWriteBatchWriter:
       if _ri != 0:
         return _ri
     return self.inter_iter_rowInc
+
+  def _emitCLSBodyRowWrap(self, rowInc: int) -> Module:
+    """The CLS body's closing row advance for optSrdIncForRow tensors.
+
+    A re-executed body must leave SrdC/SrdD advanced by its OWN whole coord1
+    span, wrap included: the step from the body's last row to the first row of
+    the next iteration. Every other advance in the body hangs off an element
+    that crosses a row; this one hangs off no element, so it needs its own
+    emit.
+
+    Who already carries it:
+      - row-pointer tensors (not optSrdIncForRow): the look-ahead in emit().
+      - SRD tensors on the delayed-primer chain: the last emitting elt's
+        AFTER-primer holds it (see _lookaheadRowInc) and the body's chain-seed
+        s_add consumes it one iteration later, around the back-edge.
+    Who does not, and is what this emits:
+      - SRD tensors whose per-element site opts OUT of that chain with
+        `selfContainedStride` because s[stmp] cannot survive between two of its
+        calls. That is the subtile store path: D on the 16bit paired store
+        (see _emitAdd's sba=0 deferred incrementToNextRow) and C on every
+        subtile beta load (KernelWriterAssembly.readInput). With no primer to
+        ride the back-edge, and a body that need not cross a row at all, those
+        SRDs would sit still and every iteration past the first would rewrite
+        the first iteration's rows.
+
+    Only the batch that closes the body needs this, and only when the body
+    actually repeats: elsewhere the next batch's own first element carries the
+    advance, so emitting here would double it.
+    """
+    module = Module("clsBodyRowWrap")
+    closesCLSBody = (self._computeBatchesPerCLSBody() - 1 == self.batchIdx)
+    if not (self.ss.optSrdIncForRow and self.kernel["BufferStore"]
+            and closesCLSBody and self._computeCLSIterCount() > 1):
+      return module
+    addrCalc = self.ss.elementAddr[0]
+    wrapC = self.beta and self.kernel.get("UseSubtileImpl")
+    if not (self.is16bitSubtile or wrapC):
+      return module
+    module.addComment0("CLS body wrap: advance the self-contained store SRDs to the next iteration's first row")
+    if wrapC:
+      # tmpS01+1 mirrors readInput's C scratch, so the two C sites agree.
+      module.add(addrCalc.incrementToNextRow(self.kernel, "C", self.ss, self.tmpS01 + 1,
+                                             selfContainedStride=True, overrideRows=rowInc))
+    if self.is16bitSubtile:
+      module.add(addrCalc.incrementToNextRow(self.kernel, "D", self.ss, self.tmpS01,
+                                             selfContainedStride=True, overrideRows=rowInc))
+    return module
 
   def _epilogScratchSgpr(self, n: int = 1):
     """Scratch sgpr for epilogue address math.
@@ -1606,21 +1694,8 @@ class GlobalWriteBatchWriter:
         module.add(VMovB32(vgpr(self.cvtVgprStruct.vgprBf16Mask), "0xffff0000", comment="mask for pack two bfloat16 element to 32bit" ))
         module.add(VMovB32(vgpr(self.cvtVgprStruct.vgprFp32Nan), "0x7fff0000", comment="fp32 Nan" ))
         module.add(VMovB32(vgpr(self.cvtVgprStruct.vgprBf16Inc), "0x7fff", comment="rounding bias for bfloat16" ))
-    # is16bitSubtile: controls partner-lane address setup for dwordx4 paired-subtile stores.
-    # Must match is16bitSubtilePaired (per-element store dispatch) exactly.
-    # Excluded for "MultipleBufferSingleKernel" and "MultipleBuffer" (StreamK partial-tile
-    # workspace path) — both write float32 to workspace, not 16bit to D output.
-    isSubtileNonEdge = (
-      self.kernel.get("UseSubtileImpl") and not self.edge
-      and self.kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
-    )
-    is16bitSubtile = (
-      isSubtileNonEdge
-      and (self.kernel["ProblemType"]["DestDataType"].isBFloat16() or
-           self.kernel["ProblemType"]["DestDataType"].isHalf())
-      and self.kernel["ProblemType"]["HighPrecisionAccumulate"]
-      and self.kernel["WavefrontSize"] != 32  # wave32: skip permute-based packed store (uses wave64-only ops)
-    )
+    isSubtileNonEdge = self.isSubtileNonEdge
+    is16bitSubtile = self.is16bitSubtile
     if is16bitSubtile:
       assert self.kernel["BufferStore"], \
         "UseSubtileImpl 16bit optimized store requires BufferStore=1"
