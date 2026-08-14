@@ -1,0 +1,77 @@
+# serializer version: 1
+# name: test_r3_subtile_bf16_pipeline_gfx950_golden
+  list([
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT12JS43OoBiuOuubVvXwruRYrt0XFCTs5rQ-8Q1-gOQ6s=',
+      'commits': 192,
+      'drained': 144,
+      'overlapped': 48,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT1QSJX4COx1IJ1nLj1Ua9KQmYC_BEbbauvrh3h6zK-QIo=',
+      'commits': 192,
+      'drained': 144,
+      'overlapped': 48,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT1hc4h9r476hxyq77gjFhARuxhcCwjpvtit_pc6wFkay8=',
+      'commits': 192,
+      'drained': 144,
+      'overlapped': 48,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT1wkOxBr86iLW2wZHLVSeyKIhHcommCxCj_PfRTW-NEsU=',
+      'commits': 192,
+      'drained': 144,
+      'overlapped': 48,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT207VWC7Xt9BIncKmMfr7QJpNcu0FFyoPPFYmWeYjM5eM=',
+      'commits': 768,
+      'drained': 480,
+      'overlapped': 288,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT25yyWomTDJEuntA_PrsiQH_OI-1soXaJiDuTz3TbN9lk=',
+      'commits': 768,
+      'drained': 480,
+      'overlapped': 288,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT2PhI2e-hf3KrHNoAc7Az_s58w_eoqX0VN-aDpJJejrUI=',
+      'commits': 768,
+      'drained': 480,
+      'overlapped': 288,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT2dKM2oJVyO1YJquz8e3L0a6DOb-IUcz0gxT4VaDObLkY=',
+      'commits': 768,
+      'drained': 480,
+      'overlapped': 288,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT39CvOVblxOowI4FokeV5rctIe7r2D2qv2RfY6FrfMog4=',
+      'commits': 48,
+      'drained': 48,
+      'overlapped': 0,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT3AcMIiayt1s-ECCwL_2ics2raEMHG3fa5JBvGIzrhvEA=',
+      'commits': 48,
+      'drained': 48,
+      'overlapped': 0,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT3GDhyDXMzuWjPw-Cm6vBkqs81ozwikeqZIOzwBvXxd4A=',
+      'commits': 48,
+      'drained': 48,
+      'overlapped': 0,
+    }),
+    dict({
+      'basename': 'Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT3sUmS70mw5Tk1fk2aLd6gZOxaRfZ5tBcCKQPpPFa6Hlk=',
+      'commits': 48,
+      'drained': 48,
+      'overlapped': 0,
+    }),
+  ])
+# ---
