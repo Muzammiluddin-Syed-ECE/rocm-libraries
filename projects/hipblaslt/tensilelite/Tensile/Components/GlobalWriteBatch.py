@@ -3002,6 +3002,9 @@ class GlobalWriteBatchWriter:
     Only called when guards are set (problem not tile-aligned) — otherwise the baseline
     body is already guard-free and no peel is emitted.
     """
+    if self._storeSpreadInterleave:
+      return self._buildSubtileInteriorStoresDepth3()
+
     mod = Module("subtileInteriorStores")
     prefixOffset = self.parentWriter.states.c.startVgprValu
     optInc = self.ss.optSrdIncForRow
@@ -3099,6 +3102,104 @@ class GlobalWriteBatchWriter:
 
     self.parentWriter.vgprPool.checkIn(pipePack1)
     self.parentWriter.vgprPool.checkIn(pipeAddr1)
+    return mod
+
+  def _buildSubtileInteriorStoresDepth3(self) -> Module:
+    """EpilogueStoreSpread=16 variant of _buildSubtileInteriorStores.
+
+    Same element walk, same deferred-SrdD contract, same guard-free body — but the
+    transpose pipeline rotates over THREE buffers and each unit is emitted as
+
+        [wait + permlane x2 for group k-2] [ISSUE group k] [store group k-2]
+
+    instead of the depth-2 `[ISSUE k][wait + permlane x2 + store k-1]`.  The whole of
+    group k's pack + ds_bpermute + address compute (9 instructions) therefore sits
+    between the LDS drain point and the store, without adding a single instruction to
+    the stream.  The pipeline still drains fully at every N-group transition, because
+    a deferred store reads the pre-increment SrdD.
+    """
+    mod = Module("subtileInteriorStoresDepth3")
+    prefixOffset = self.parentWriter.states.c.startVgprValu
+    optInc = self.ss.optSrdIncForRow
+    nGuardSet = self.parentWriter.states.subtileN16ValidBlocksSgpr is not None
+    pendingInc = None
+    prevN = -1
+
+    pipePack1 = self.parentWriter.vgprPool.checkOutAligned(4, 2, tag="subtilePipePack1")
+    pipeAddr1 = self.parentWriter.vgprPool.checkOut(1, tag="subtilePipeAddr1")
+    pipePack2 = self.parentWriter.vgprPool.checkOutAligned(4, 2, tag="subtilePipePack2")
+    pipeAddr2 = self.parentWriter.vgprPool.checkOut(1, tag="subtilePipeAddr2")
+    packBuf = [self.cvtVgprStruct.vgprBf16Temp, pipePack1, pipePack2]
+    addrBuf = [self.cvtVgprStruct.vgprAddrScratch, pipeAddr1, pipeAddr2]
+    pipeK = 0
+    inflight = []  # oldest-first (packVgpr, addrVgpr, globalOffset, tt0)
+
+    def drainAll():
+      while inflight:
+        old = inflight.pop(0)
+        mod.add(self._emitPairedStoreCommitHead(old[0], old[3], dscnt=4 * len(inflight)))
+        mod.add(self._emitPairedStoreCommitTail(old[0], old[1], old[2], old[3]))
+
+    def issuePaired(pairAddrCalc, sumIdx0, sumIdx1, tt0):
+      nonlocal pipeK
+      buf = pipeK % 3
+      old = inflight.pop(0) if len(inflight) >= 2 else None
+      if old is not None:
+        mod.add(self._emitPairedStoreCommitHead(old[0], old[3], dscnt=4 * len(inflight)))
+      issueMod, globalOffset = self._emitPairedStoreIssue(packBuf[buf], addrBuf[buf],
+                                                          pairAddrCalc, sumIdx0, sumIdx1, prefixOffset, tt0)
+      mod.add(issueMod)
+      if old is not None:
+        mod.add(self._emitPairedStoreCommitTail(old[0], old[1], old[2], old[3]))
+      inflight.append((packBuf[buf], addrBuf[buf], globalOffset, tt0))
+      pipeK += 1
+
+    def flushAtTransition(blockIdxN):
+      nonlocal pendingInc, prevN
+      if nGuardSet and blockIdxN != prevN:
+        drainAll()
+        if pendingInc is not None:
+          mod.add(pendingInc)
+          pendingInc = None
+        prevN = blockIdxN
+
+    for elementIdx, element in enumerate(self.batchElements):
+      tt0 = element[1]
+      blockIdxN = element[0]
+      addrCalc = self.ss.elementAddr[elementIdx]
+      if tt0 % 2 == 1:
+        partnerElementIdx = elementIdx - 1
+        partnerExists = (partnerElementIdx >= 0 and
+                         self.batchElements[partnerElementIdx][1] == tt0 - 1)
+        if partnerExists:
+          flushAtTransition(blockIdxN)
+          partnerAddrCalc = self.ss.elementAddr[partnerElementIdx]
+          issuePaired(partnerAddrCalc, self.ss.elementSumIdx[partnerElementIdx],
+                      self.ss.elementSumIdx[elementIdx], tt0 - 1)
+        else:
+          flushAtTransition(blockIdxN)
+          drainAll()  # the scalar store reuses buffer 0
+          mod.add(self._emit16bitSubtileScalarStore(addrCalc, self.ss.elementSumIdx[elementIdx],
+                    prefixOffset, tt0, blockIdxM=tt0, blockIdxN=blockIdxN, interior=True))
+      else:
+        if optInc and addrCalc.rowInc:
+          pendingInc = addrCalc.incrementToNextRow(self.kernel, "D", self.ss, self.tmpS01)
+        partnerElementIdx = elementIdx + 1
+        partnerExists = (partnerElementIdx < len(self.batchElements) and
+                         self.batchElements[partnerElementIdx][1] == tt0 + 1)
+        if not partnerExists:
+          flushAtTransition(blockIdxN)
+          drainAll()
+          mod.add(self._emit16bitSubtileScalarStore(addrCalc, self.ss.elementSumIdx[elementIdx],
+                    prefixOffset, tt0, blockIdxM=tt0, blockIdxN=blockIdxN, interior=True))
+    drainAll()
+    if pendingInc is not None:
+      mod.add(pendingInc)
+
+    self.parentWriter.vgprPool.checkIn(pipePack1)
+    self.parentWriter.vgprPool.checkIn(pipeAddr1)
+    self.parentWriter.vgprPool.checkIn(pipePack2)
+    self.parentWriter.vgprPool.checkIn(pipeAddr2)
     return mod
 
   def _emit16bitSubtilePairedStore(self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, interior: bool = False) -> Module:
@@ -3367,6 +3468,46 @@ class GlobalWriteBatchWriter:
                          comment="adjusted D addr = addrDVgpr + lane_group*8"))
     return module, globalOffset
 
+  @property
+  def _storeSpread(self) -> int:
+    """EpilogueStoreSpread — see Common/ValidParameters.py for the encoding."""
+    try:
+      return self.kernel["EpilogueStoreSpread"]
+    except KeyError:
+      return 0
+
+  @property
+  def _storeSpreadInterleave(self) -> bool:
+    return self._storeSpread in (16, 18)
+
+  @property
+  def _storeSpreadTailOnly(self) -> bool:
+    return self._storeSpread == 17
+
+  @property
+  def _storeSpreadNops(self) -> int:
+    """Number of `s_nop 15` to place immediately before each interior store."""
+    s = self._storeSpread
+    if s == 18:
+      # Enough to put the depth-3 arm's store spacing back above the depth-2
+      # baseline's, so a surviving depth-3 win cannot be attributed to clustering.
+      return 2
+    return s if 1 <= s <= 15 else 0
+
+  def _emitStoreSpreadDelay(self, module: Module, tt0: int, isDrain: bool = False):
+    n = self._storeSpreadNops
+    if self._storeSpreadTailOnly:
+      # Tail-only mode: pay the delay at the ONE store per batch that the depth-2
+      # pipeline cannot separate (the drain), and nowhere else. Paired with the
+      # uniform-delay arms this separates "the burst hurts" from "the rate hurts":
+      # it buys the same peak spacing for ~1/4 of the cycles.
+      n = 2 if isDrain else 0
+    if not n:
+      return
+    module.addComment1(f"[spread] {n} x s_nop 15 = {16 * n} wait states before the store (tt0={tt0})")
+    for _ in range(n):
+      module.add(SNop(waitState=15, comment="[spread] 16 wait states"))
+
   def _emitPairedStoreCommit(self, vPack: int, vAddrScratch: int, globalOffset: int, tt0: int, dscnt: int):
     """COMMIT half of the pipelined paired store: wait for this group's ds_bpermute
     (leaving `dscnt` younger ds ops in flight), do the 2 permlane swaps, and emit the
@@ -3381,6 +3522,9 @@ class GlobalWriteBatchWriter:
     module.addComment1("v_permlane32_swap_b32: swap across lane-32 boundary")
     module.add(VPermlane32SwapB32(dst=vgpr(vPack+0), src=vgpr(vPack+2), comment="swap dwords 0<->2"))
     module.add(VPermlane32SwapB32(dst=vgpr(vPack+1), src=vgpr(vPack+3), comment="swap dwords 1<->3"))
+    # dscnt==0 marks the pipeline drain — the one store per batch with no ISSUE
+    # block in front of it, and so the one tight store pair in the profile.
+    self._emitStoreSpreadDelay(module, tt0, isDrain=(dscnt == 0))
     module.addComment1("buffer_store_dwordx4: write 8 16bit values (4 dwords, 2-aligned src)")
     module.add(BufferStoreB128(
       src=vgpr(vPack, 4),
@@ -3391,6 +3535,39 @@ class GlobalWriteBatchWriter:
       comment=f"[pipeline] 16bit paired dwordx4 store tt0={tt0},{tt0+1}"
     ))
     # WAR: the store reads vPack; the next same-buffer pack (2 groups later) overwrites it.
+    module.add(SNop(waitState=0, comment="1 wait state: WAR store src -> next same-buffer pack dst"))
+    return module
+
+  def _emitPairedStoreCommitHead(self, vPack: int, tt0: int, dscnt: int):
+    """EpilogueStoreSpread=16: the drain+transpose half of COMMIT, split off from the
+    store so the next group's ISSUE can be emitted between them.  Leaves the payload
+    assembled in vPack+0..+3; the caller must emit the matching tail before anything
+    else writes that buffer."""
+    module = Module("pairedStoreCommitHead")
+    module.add(SWaitCnt(dscnt=dscnt, comment=f"[spread] wait this group's ds_bpermute; {dscnt} younger ds in flight (tt0={tt0})"))
+    module.addComment1("v_permlane32_swap_b32: swap across lane-32 boundary")
+    module.add(VPermlane32SwapB32(dst=vgpr(vPack+0), src=vgpr(vPack+2), comment="swap dwords 0<->2"))
+    module.add(VPermlane32SwapB32(dst=vgpr(vPack+1), src=vgpr(vPack+3), comment="swap dwords 1<->3"))
+    return module
+
+  def _emitPairedStoreCommitTail(self, vPack: int, vAddrScratch: int, globalOffset: int, tt0: int):
+    """EpilogueStoreSpread=16: the store half of COMMIT — see _emitPairedStoreCommitHead."""
+    module = Module("pairedStoreCommitTail")
+    ntd = self.kernel["NonTemporalD"]
+    # Mode 18 = mode 16 with the store spacing put back. Depth-3 changes two things
+    # at once (it hides more ds_bpermute latency AND packs the stores closer); the
+    # delay here restores the depth-2 spacing so the two can be told apart.
+    self._emitStoreSpreadDelay(module, tt0)
+    module.addComment1("[spread] buffer_store_dwordx4 emitted last in the unit")
+    module.add(BufferStoreB128(
+      src=vgpr(vPack, 4),
+      vaddr=vgpr(vAddrScratch),
+      saddr=sgpr("SrdD", 4),
+      soffset=0,
+      mubuf=MUBUFModifiers(offen=True, offset12=globalOffset, glc=bool(ntd & 0x1),
+                           slc=bool(ntd & 0x2), nt=bool(ntd & 0x4)),
+      comment=f"[spread] 16bit paired dwordx4 store tt0={tt0},{tt0+1}"
+    ))
     module.add(SNop(waitState=0, comment="1 wait state: WAR store src -> next same-buffer pack dst"))
     return module
 

@@ -1152,6 +1152,30 @@ validParameters = { # we need to make sure this matches develop
     # accumulator pairs are stored while the final-K-step MFMAs for later pairs run.
     # Scoped to fp4-input (MXFP4) + UseSubtileImpl on gfx950; auto-disabled otherwise.
     "PostLoopStoreInNll": [False, True],
+    # Separate the D buffer_store instructions of the bf16/fp16 subtile interior
+    # store body from one another, to test whether the vector-memory write path is
+    # burst-limited.  Only affects the guard-free interior peel body emitted by
+    # GlobalWriteBatch._buildSubtileInteriorStores; every other store path is
+    # untouched.  Encoding:
+    #     0      off -- byte-identical codegen to the unmodified branch
+    #     1..15  delay mode: N x `s_nop 15` (16N wait states) immediately before
+    #            each interior paired store, holding everything else fixed
+    #     16     depth-3 rotating transpose pipeline with the store emitted LAST in
+    #            each unit.  Adds no instructions, but the interior N-groups are only
+    #            4-5 pairs long, so the deeper pipeline spends most of each group in
+    #            prologue/drain and ends up CLUSTERING the stores -- kept as the
+    #            negative (anti-spread) control.
+    #     17     tail-only mode: 2 x `s_nop 15` before the ONE store per batch that
+    #            the depth-2 pipeline cannot separate (the drain, which follows its
+    #            predecessor after 5 instructions rather than 14), and nowhere else.
+    #            Buys the same minimum spacing as mode 2 for about a quarter of the
+    #            cycles, so mode 2 vs mode 17 separates "the burst hurts" from "the
+    #            store rate hurts".
+    #     18     mode 16 with 2 x `s_nop 15` before each store, putting the spacing
+    #            depth-3 removed back above the depth-2 baseline's.  Mode 16 changes
+    #            two things at once (more ds_bpermute latency hidden AND tighter
+    #            stores); 16 vs 18 says which of the two any win came from.
+    "EpilogueStoreSpread": list(range(0, 19)),
     # PLSIN store-epilogue mode (only meaningful when PostLoopStoreInNll is True and
     # the tile is <= 256x256; larger tiles are forced to Lend regardless):
     #   "Weave" - terminal MFMAs interleaved with the fused store, input-tile VGPRs

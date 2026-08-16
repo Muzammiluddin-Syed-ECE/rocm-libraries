@@ -604,6 +604,7 @@ defaultBenchmarkCommonParameters = [
     {"TailloopInNll": [False]},
     {"PostLoopStoreInNll": [True]},
     {"PLSINStoreMode": ["Weave"]},
+    {"EpilogueStoreSpread": [0]},
     {"SwapGlobalReadOrder": [0]},
     {"ScheduleGROverBarrier": [-1]},
     {"DtlPlusLdsBuf": [-1]},
