@@ -3002,6 +3002,8 @@ class GlobalWriteBatchWriter:
     Only called when guards are set (problem not tile-aligned) — otherwise the baseline
     body is already guard-free and no peel is emitted.
     """
+    if self._storePipe:
+      return self._buildSubtileInteriorStoresPipe()
     if self._storeCluster:
       return self._buildSubtileInteriorStoresLinePair()
     if self._storeSpreadInterleave:
@@ -3203,6 +3205,195 @@ class GlobalWriteBatchWriter:
     self.parentWriter.vgprPool.checkIn(pipePack2)
     self.parentWriter.vgprPool.checkIn(pipeAddr2)
     return mod
+
+  def _buildSubtileInteriorStoresPipe(self) -> Module:
+    """EpilogueStorePipe — line-pair store clustering INSIDE the depth-3 frame.
+
+    `EpilogueStoreCluster` reaches its merging win by replacing the depth-3 rotating
+    transpose pipeline with an issue-all frame, which bundles two changes: the frame
+    and the store order.  Its own control arm shows the reordering wins everywhere and
+    the frame is what varies by shape.  This body keeps the depth-3 frame and applies
+    only the reordering, by splitting the pipeline into two independently sized stages:
+
+      lookahead L -- how many pairs' ds_bpermute may be in flight before the oldest is
+                     drained.  L=2 reproduces EpilogueStoreSpread=16 exactly: the
+                     drain+transpose of pair k-2 is emitted, then the whole ISSUE of
+                     pair k, then pair k-2's store.
+      burst     U -- transposed pairs are queued and their stores emitted back to back
+                     in groups of U, so both 64B halves of a 128B L2 line are issued in
+                     consecutive slots.  U=1 is the incumbent's one-store-per-step.
+
+    The instruction MULTISET is identical for every (L=2, U) -- same waits, same
+    permlanes, same stores, same WAR nops -- so U>1 versus U=1 is a pure reordering
+    with no instruction-count or wait-structure confound, which is a tighter control
+    than the cluster lever had.  No `s_waitcnt` lands between the stores of a burst:
+    every LDS wait sits in the ISSUE window ahead of it.
+
+    Pack buffers are sized by walking the schedule rather than by a formula, so (2,5)
+    draws exactly the five the cluster lever already proved fit in the store-phase dead
+    pool and not the seven L+U would suggest.
+    """
+    L, U = self._storePipeLookahead, self._storePipeBurst
+
+    # Two passes over the same walk.  The first allocates nothing and only measures how
+    # many pack buffers the schedule actually holds live at once; the second emits.
+    # An analytic bound is not good enough here: L+U over-estimates whenever the walk
+    # drains at an N-group transition (it always does when the N guard SGPR is set), and
+    # over-allocating draws registers out of the store-phase dead pool that the epilogue
+    # still needs.  These tiles sit exactly at the 320-accvgpr ceiling, so "ask for more
+    # than you use" is not free.
+    nBuf = self._pipeWalk(L, U, None, None, None)
+    if nBuf > 8:
+      return self._buildSubtileInteriorStoresDepth3()
+
+    mod = Module("subtileInteriorStoresPipe")
+    packBuf = [self.cvtVgprStruct.vgprBf16Temp]
+    addrBuf = [self.cvtVgprStruct.vgprAddrScratch]
+    extra = []
+    for b in range(1, nBuf):
+      p = self.parentWriter.vgprPool.checkOutAligned(4, 2, tag=f"subtilePipeBufPack{b}")
+      a = self.parentWriter.vgprPool.checkOut(1, tag=f"subtilePipeBufAddr{b}")
+      packBuf.append(p)
+      addrBuf.append(a)
+      extra += [p, a]
+
+    self._pipeWalk(L, U, mod, packBuf, addrBuf)
+
+    for v in extra:
+      self.parentWriter.vgprPool.checkIn(v)
+    return mod
+
+  def _pipeWalk(self, L, U, mod, packBuf, addrBuf):
+    """One traversal of the batch under the (lookahead L, burst U) schedule.
+
+    `mod is None` is the SIZING pass: it runs the identical control flow but emits
+    nothing and allocates no registers, and returns the peak number of pack buffers held
+    live.  Running the same function both ways is deliberate -- a separate hand-written
+    bound is exactly the kind of thing that drifts from the emitter and mis-sizes the
+    pool without any build-time signal.
+    """
+    dry = mod is None
+    prefixOffset = self.parentWriter.states.c.startVgprValu
+    optInc = self.ss.optSrdIncForRow
+    nGuardSet = self.parentWriter.states.subtileN16ValidBlocksSgpr is not None
+    pendingInc = None
+    prevN = -1
+
+    free = []                  # buffer slots not currently holding a live pair
+    nSlots = 0                 # slots ever handed out == peak live, by construction
+    issued = []                # slots whose ds_bpermute is in flight, oldest first
+    ready = []                 # slots transposed and awaiting their store, oldest first
+
+    def emitHead():
+      """Drain the oldest in-flight pair: wait for its ds_bpermute and transpose it.
+      Everything younger stays in flight, so the wait never falls to 0 mid-group."""
+      slot = issued.pop(0)
+      ready.append(slot)
+      if dry:
+        return
+      # Only this body's ds_bpermute are in flight here (the walk drains before any
+      # other lgkm producer), and DS returns in order, so allowing 4 per younger pair
+      # is exactly "this pair's four have retired".  Clamped to the 4-bit immediate;
+      # a smaller wait is stricter, never wrong.
+      younger = 4 * len(issued)
+      mod.add(SWaitCnt(dscnt=min(younger, 15),
+                       comment=f"[pipe] pair tt0={slot[3]} bpermute retired; "
+                               f"{younger} younger ds may stay in flight"))
+      mod.addComment1(f"v_permlane32_swap_b32: swap across lane-32 boundary (tt0={slot[3]})")
+      mod.add(VPermlane32SwapB32(dst=vgpr(slot[0]+0), src=vgpr(slot[0]+2), comment="swap dwords 0<->2"))
+      mod.add(VPermlane32SwapB32(dst=vgpr(slot[0]+1), src=vgpr(slot[0]+3), comment="swap dwords 1<->3"))
+
+    def emitBurst(n):
+      """Commit n transposed pairs as n back-to-back stores.  Consecutive pairs are
+      64 B apart in D, so an even-length burst covers whole 128 B L2 lines whichever
+      of the two runtime line parities this wave landed on."""
+      burst = [ready.pop(0) for _ in range(n)]
+      if not dry:
+        if n > 1:
+          mod.addComment1(f"[pipe] {n} adjacent stores -> {n} x 64B, "
+                          f"{n // 2} whole 128B L2 lines per parity")
+        for slot in burst:
+          mod.add(self._emitLinePairStore(slot[0], slot[1], slot[2], slot[3]))
+        # WAR nops are placed behind the burst rather than dropped, so every U shares
+        # the instruction multiset of U=1.
+        for _ in burst:
+          mod.add(SNop(waitState=0, comment="WAR store src -> next same-buffer pack dst"))
+      for slot in burst:
+        free.append(slot[-1])
+
+    def issuePaired(pairAddrCalc, sumIdx0, sumIdx1, tt0):
+      nonlocal nSlots
+      while len(issued) >= L:
+        emitHead()
+      if free:
+        b = free.pop(0)
+      else:
+        b, nSlots = nSlots, nSlots + 1
+      if dry:
+        issued.append((None, None, None, tt0, b))
+      else:
+        issueMod, globalOffset = self._emitPairedStoreIssue(packBuf[b], addrBuf[b],
+                                                            pairAddrCalc, sumIdx0, sumIdx1,
+                                                            prefixOffset, tt0)
+        mod.add(issueMod)
+        issued.append((packBuf[b], addrBuf[b], globalOffset, tt0, b))
+      while len(ready) >= U:
+        emitBurst(U)
+
+    def drainAll():
+      while issued:
+        emitHead()
+        if len(ready) >= U:
+          emitBurst(U)
+      if ready:
+        emitBurst(len(ready))
+
+    def flushAtTransition(blockIdxN):
+      nonlocal pendingInc, prevN
+      if nGuardSet and blockIdxN != prevN:
+        drainAll()
+        if pendingInc is not None:
+          mod.add(pendingInc)
+          pendingInc = None
+        prevN = blockIdxN
+
+    def scalarStore(addrCalc, elementIdx, tt0, blockIdxN):
+      drainAll()  # the scalar store reuses buffer 0
+      if not dry:
+        mod.add(self._emit16bitSubtileScalarStore(addrCalc, self.ss.elementSumIdx[elementIdx],
+                  prefixOffset, tt0, blockIdxM=tt0, blockIdxN=blockIdxN, interior=True))
+
+    for elementIdx, element in enumerate(self.batchElements):
+      tt0 = element[1]
+      blockIdxN = element[0]
+      addrCalc = self.ss.elementAddr[elementIdx]
+      if tt0 % 2 == 1:
+        partnerElementIdx = elementIdx - 1
+        partnerExists = (partnerElementIdx >= 0 and
+                         self.batchElements[partnerElementIdx][1] == tt0 - 1)
+        if partnerExists:
+          flushAtTransition(blockIdxN)
+          issuePaired(self.ss.elementAddr[partnerElementIdx],
+                      self.ss.elementSumIdx[partnerElementIdx],
+                      self.ss.elementSumIdx[elementIdx], tt0 - 1)
+        else:
+          flushAtTransition(blockIdxN)
+          scalarStore(addrCalc, elementIdx, tt0, blockIdxN)
+      else:
+        if optInc and addrCalc.rowInc and not dry:
+          pendingInc = addrCalc.incrementToNextRow(self.kernel, "D", self.ss, self.tmpS01)
+        partnerElementIdx = elementIdx + 1
+        partnerExists = (partnerElementIdx < len(self.batchElements) and
+                         self.batchElements[partnerElementIdx][1] == tt0 + 1)
+        if not partnerExists:
+          flushAtTransition(blockIdxN)
+          scalarStore(addrCalc, elementIdx, tt0, blockIdxN)
+    drainAll()
+    if dry:
+      return max(nSlots, 1)
+    if pendingInc is not None:
+      mod.add(pendingInc)
+    return nSlots
 
   @staticmethod
   def _lineClusterChunks(nPairs: int, size: int, phase: int):
@@ -3685,6 +3876,25 @@ class GlobalWriteBatchWriter:
       return self.kernel["EpilogueStoreCluster"]
     except KeyError:
       return 0
+
+  @property
+  def _storePipe(self) -> int:
+    """EpilogueStorePipe — see Common/ValidParameters.py for the encoding."""
+    try:
+      return self.kernel["EpilogueStorePipe"]
+    except KeyError:
+      return 0
+
+  @property
+  def _storePipeLookahead(self) -> int:
+    """Pairs allowed in flight before the oldest is drained; 2 == the depth-3 frame."""
+    return max(1, self._storePipe // 10)
+
+  @property
+  def _storePipeBurst(self) -> int:
+    """Stores committed back to back.  Values above the pairs per N-group clamp
+    naturally to `whole group`, which is what makes 25 and 26 the same kernel."""
+    return max(1, self._storePipe % 10)
 
   @property
   def _storeSpreadInterleave(self) -> bool:

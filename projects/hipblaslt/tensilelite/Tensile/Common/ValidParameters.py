@@ -1197,6 +1197,26 @@ validParameters = { # we need to make sure this matches develop
     #            M-waves have opposite line-internal pair boundaries; 2-vs-12-vs-5
     #            tests that directly.
     "EpilogueStoreCluster": [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, 17, 18],
+    # Cluster the interior peel's D stores INSIDE the rotating transpose pipeline
+    # instead of in place of it.  EpilogueStoreCluster wins its merging by replacing
+    # the depth-3 frame with an issue-all frame; its control arm shows the store
+    # reordering wins in every tile/shape combination while the frame is what varies
+    # by shape, so this parameter separates the two stages of the pipeline and sizes
+    # them independently.  Encoded as L*10 + U, both 1-based:
+    #     0     off
+    #     L     LOOKAHEAD: pairs whose ds_bpermute may be in flight before the oldest
+    #           is drained.  L=2 is exactly EpilogueStoreSpread=16's depth-3 frame --
+    #           drain+transpose pair k-2, ISSUE pair k, then store pair k-2.
+    #     U     BURST: stores committed back to back.  U=1 is the incumbent.  U above
+    #           the pairs per N-group clamps to "the whole group", so 25 and 26 emit
+    #           the same kernel on both anchor tiles (5 and 4 pairs) and their measured
+    #           gap is the harness floor.
+    # Every (L=2, U) shares one instruction multiset with (2,1)=EpilogueStoreSpread=16,
+    # so U is a pure reordering axis.  Takes precedence over EpilogueStoreCluster and
+    # EpilogueStoreSpread.  Peak live pack buffers is min(pairs, L+U); above 8 the
+    # body falls back to the depth-3 pipeline rather than risking a spill at the
+    # 320-accvgpr ceiling.
+    "EpilogueStorePipe": [0] + [L * 10 + U for L in range(1, 6) for U in range(1, 9)],
     # PLSIN store-epilogue mode (only meaningful when PostLoopStoreInNll is True and
     # the tile is <= 256x256; larger tiles are forced to Lend regardless):
     #   "Weave" - terminal MFMAs interleaved with the fused store, input-tile VGPRs

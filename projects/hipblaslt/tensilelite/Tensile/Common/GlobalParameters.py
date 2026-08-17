@@ -606,6 +606,7 @@ defaultBenchmarkCommonParameters = [
     {"PLSINStoreMode": ["Weave"]},
     {"EpilogueStoreSpread": [0]},
     {"EpilogueStoreCluster": [0]},
+    {"EpilogueStorePipe": [0]},
     {"SwapGlobalReadOrder": [0]},
     {"ScheduleGROverBarrier": [-1]},
     {"DtlPlusLdsBuf": [-1]},
