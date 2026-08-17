@@ -1176,6 +1176,27 @@ validParameters = { # we need to make sure this matches develop
     #            two things at once (more ds_bpermute latency hidden AND tighter
     #            stores); 16 vs 18 says which of the two any win came from.
     "EpilogueStoreSpread": list(range(0, 19)),
+    # Cluster the interior peel's D buffer_store instructions so that both 64B halves
+    # of a 128B L2 line are ISSUED IN CONSECUTIVE SLOTS.  Consecutive pairs of the
+    # interior walk already carry globalOffset 0, 64, 128, ... (one store = 64B of D
+    # along M for each of 16 N columns), so the halves are already adjacent in the
+    # WALK; what this changes is that nothing is emitted between them.  Every mode
+    # shares one ISSUE frame -- all of an N-group's pack/ds_bpermute/address work is
+    # emitted before any of its stores -- so ds_bpermute latency exposure is constant
+    # across the arms and only store adjacency varies.  Takes precedence over
+    # EpilogueStoreSpread.  Encoding:
+    #     0      off -- byte-identical codegen to EpilogueStoreSpread's behaviour
+    #     1      CONTROL: same frame, same single wait, but each store is emitted
+    #            straight after its own permlanes.  Byte-identical instruction
+    #            multiset to mode 5, differing only in the order of the stores, so
+    #            5-vs-1 isolates clustering from latency hiding.
+    #     2..8   store bursts of N, partitioned from pair 0
+    #     12..18 store bursts of (N-10), partitioned from pair 1.  The phase matters
+    #            because a wave's D window is 128B-line-aligned only for even M-waves
+    #            on MT320x256 (160 D elements = 320 bytes per wave), so the two
+    #            M-waves have opposite line-internal pair boundaries; 2-vs-12-vs-5
+    #            tests that directly.
+    "EpilogueStoreCluster": [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, 17, 18],
     # PLSIN store-epilogue mode (only meaningful when PostLoopStoreInNll is True and
     # the tile is <= 256x256; larger tiles are forced to Lend regardless):
     #   "Weave" - terminal MFMAs interleaved with the fused store, input-tile VGPRs

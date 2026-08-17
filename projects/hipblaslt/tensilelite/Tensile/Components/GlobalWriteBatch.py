@@ -3002,6 +3002,8 @@ class GlobalWriteBatchWriter:
     Only called when guards are set (problem not tile-aligned) — otherwise the baseline
     body is already guard-free and no peel is emitted.
     """
+    if self._storeCluster:
+      return self._buildSubtileInteriorStoresLinePair()
     if self._storeSpreadInterleave:
       return self._buildSubtileInteriorStoresDepth3()
 
@@ -3201,6 +3203,206 @@ class GlobalWriteBatchWriter:
     self.parentWriter.vgprPool.checkIn(pipePack2)
     self.parentWriter.vgprPool.checkIn(pipeAddr2)
     return mod
+
+  @staticmethod
+  def _lineClusterChunks(nPairs: int, size: int, phase: int):
+    """Partition the pair indices of one N-group into store bursts.
+
+    `phase` shifts the partition by one pair.  Both phases matter because the
+    128B-line parity of a wave's D window is a RUNTIME property: an M-tall
+    wave-group covers MIWaveTile0*MI_M/2 = 160 D elements = 320 bytes per wave, so
+    the second M-wave starts 64 bytes (half a line) into a line and its
+    line-internal pair boundaries are the complement of the first M-wave's.
+    """
+    chunks = []
+    i = 0
+    if phase and nPairs > 1:
+      chunks.append([0])
+      i = 1
+    while i < nPairs:
+      chunks.append(list(range(i, min(i + size, nPairs))))
+      i += size
+    return chunks
+
+  def _buildSubtileInteriorStoresLinePair(self) -> Module:
+    """EpilogueStoreCluster — emit the interior peel's D stores in line-pairing bursts.
+
+    Geometry this exploits (measured from the shipped codegen, see the stage report):
+    one `buffer_store_dwordx4` covers 64 BYTES of D along M for each of the 16 N
+    columns a wave's lane-groups map to, and consecutive pairs of the interior walk
+    carry `globalOffset` 0, 64, 128, ... — i.e. consecutive stores already cover
+    consecutive 64B halves of the same 128B L2 lines.  What they do not do is ARRIVE
+    together: the depth-2 pipeline leaves 14 instructions between them and 8+ other
+    waves per CU interleave their own store traffic into that window, so with
+    NonTemporalD=4 (nt=1) the first half is usually written back before its partner
+    lands.  This body removes the window instead of the residency: all of an
+    N-group's transposes are completed first, then the stores are emitted BACK TO
+    BACK so that both halves of a line are issued in consecutive cycles.
+
+    Structure per N-group (all modes share the ISSUE frame, so the ds_bpermute
+    latency exposure is identical across every arm and cannot confound the
+    comparison):
+
+        ISSUE  p for every pair p in the group      (pack + ds_bpermute + address)
+        for each chunk C of the group:
+            s_waitcnt lgkmcnt(4 * #pairs issued after C)
+            v_permlane32_swap x2   for every p in C
+            buffer_store_dwordx4   for every p in C   <-- adjacent, no filler
+            s_nop 0                x |C|
+
+    Mode 1 keeps the same frame and the same single wait but emits each store
+    immediately after its own permlanes, so it has the byte-identical instruction
+    multiset of mode 5 and differs from it ONLY in store adjacency.  That is the
+    arm that separates "clustering the stores" from "hiding more LDS latency" —
+    the confound that ESS16-vs-ESS18 exposed in the previous campaign.
+    """
+    mode = self._storeCluster
+    ctrl = (mode == 1)
+    phase = 1 if mode >= 10 else 0
+    size = 64 if ctrl else (mode - 10 if phase else mode)
+
+    mod = Module("subtileInteriorStoresLinePair")
+    prefixOffset = self.parentWriter.states.c.startVgprValu
+    optInc = self.ss.optSrdIncForRow
+    nGuardSet = self.parentWriter.states.subtileN16ValidBlocksSgpr is not None
+    pendingInc = None
+    prevN = -1
+    pending = []  # pairs of the current N-group, issued-but-not-stored
+
+    # Size the buffer pool from the LONGEST N-group in this batch: the ISSUE frame
+    # holds every pair of a group live at once.  MIWaveTile0/2 pairs per group (5 on
+    # MT320x256, 4 on MT256x320) so this is small, but it is bounded defensively --
+    # these tiles sit exactly at the accvgpr ceiling and a spill would dominate any
+    # win this body could produce.
+    maxSeg, seg = 1, 0
+    lastN = None
+    for elementIdx, element in enumerate(self.batchElements):
+      if element[0] != lastN:
+        maxSeg, seg, lastN = max(maxSeg, seg), 0, element[0]
+      if element[1] % 2 == 1:
+        seg += 1
+    maxSeg = max(maxSeg, seg)
+    if maxSeg > 8:
+      return self._buildSubtileInteriorStoresDepth3()
+
+    packBuf = [self.cvtVgprStruct.vgprBf16Temp]
+    addrBuf = [self.cvtVgprStruct.vgprAddrScratch]
+    extra = []
+    for b in range(1, maxSeg):
+      p = self.parentWriter.vgprPool.checkOutAligned(4, 2, tag=f"subtileLinePack{b}")
+      a = self.parentWriter.vgprPool.checkOut(1, tag=f"subtileLineAddr{b}")
+      packBuf.append(p)
+      addrBuf.append(a)
+      extra += [p, a]
+
+    def emitGroup():
+      nonlocal pending
+      if not pending:
+        return
+      n = len(pending)
+      mod.addComment1(f"[linepair] N-group of {n} paired stores: issue all, then "
+                      f"{'store each after its own transpose (control)' if ctrl else f'burst {size} (phase {phase})'}")
+      live = []
+      for i, (pairAddrCalc, sumIdx0, sumIdx1, tt0) in enumerate(pending):
+        issueMod, globalOffset = self._emitPairedStoreIssue(
+            packBuf[i], addrBuf[i], pairAddrCalc, sumIdx0, sumIdx1, prefixOffset, tt0)
+        mod.add(issueMod)
+        live.append((packBuf[i], addrBuf[i], globalOffset, tt0))
+      for chunk in self._lineClusterChunks(n, size, phase):
+        # A pair is complete once every ds_bpermute issued for it has retired; the
+        # 4*(#pairs issued later) younger ones may stay in flight.  Clamped to the
+        # 4-bit lgkmcnt immediate -- a SMALLER wait is stricter, never wrong.
+        younger = 4 * (n - 1 - chunk[-1])
+        mod.add(SWaitCnt(dscnt=min(younger, 15),
+                         comment=f"[linepair] pairs {chunk[0]}..{chunk[-1]} transposed; "
+                                 f"{younger} younger ds_bpermute may stay in flight"))
+        if ctrl:
+          for i in chunk:
+            mod.add(self._emitLinePairPermlanes(live[i][0], live[i][3]))
+            mod.add(self._emitLinePairStore(live[i][0], live[i][1], live[i][2], live[i][3]))
+            mod.add(SNop(waitState=0, comment="WAR store src -> next same-buffer pack dst"))
+        else:
+          for i in chunk:
+            mod.add(self._emitLinePairPermlanes(live[i][0], live[i][3]))
+          mod.addComment1(f"[linepair] {len(chunk)} adjacent stores -> "
+                          f"{len(chunk)} x 64B covering {len(chunk) // 2} whole 128B L2 lines")
+          for i in chunk:
+            mod.add(self._emitLinePairStore(live[i][0], live[i][1], live[i][2], live[i][3]))
+          # The WAR nops are moved behind the burst rather than dropped, so every
+          # cluster arm carries the SAME instruction multiset as the mode-1 control.
+          for _ in chunk:
+            mod.add(SNop(waitState=0, comment="WAR store src -> next same-buffer pack dst"))
+      pending = []
+
+    def flushAtTransition(blockIdxN):
+      nonlocal pendingInc, prevN
+      if nGuardSet and blockIdxN != prevN:
+        emitGroup()
+        if pendingInc is not None:
+          mod.add(pendingInc)
+          pendingInc = None
+        prevN = blockIdxN
+
+    for elementIdx, element in enumerate(self.batchElements):
+      tt0 = element[1]
+      blockIdxN = element[0]
+      addrCalc = self.ss.elementAddr[elementIdx]
+      if tt0 % 2 == 1:
+        partnerElementIdx = elementIdx - 1
+        partnerExists = (partnerElementIdx >= 0 and
+                         self.batchElements[partnerElementIdx][1] == tt0 - 1)
+        if partnerExists:
+          flushAtTransition(blockIdxN)
+          pending.append((self.ss.elementAddr[partnerElementIdx],
+                          self.ss.elementSumIdx[partnerElementIdx],
+                          self.ss.elementSumIdx[elementIdx], tt0 - 1))
+        else:
+          flushAtTransition(blockIdxN)
+          emitGroup()  # the scalar store reuses buffer 0
+          mod.add(self._emit16bitSubtileScalarStore(addrCalc, self.ss.elementSumIdx[elementIdx],
+                    prefixOffset, tt0, blockIdxM=tt0, blockIdxN=blockIdxN, interior=True))
+      else:
+        if optInc and addrCalc.rowInc:
+          pendingInc = addrCalc.incrementToNextRow(self.kernel, "D", self.ss, self.tmpS01)
+        partnerElementIdx = elementIdx + 1
+        partnerExists = (partnerElementIdx < len(self.batchElements) and
+                         self.batchElements[partnerElementIdx][1] == tt0 + 1)
+        if not partnerExists:
+          flushAtTransition(blockIdxN)
+          emitGroup()
+          mod.add(self._emit16bitSubtileScalarStore(addrCalc, self.ss.elementSumIdx[elementIdx],
+                    prefixOffset, tt0, blockIdxM=tt0, blockIdxN=blockIdxN, interior=True))
+    emitGroup()
+    if pendingInc is not None:
+      mod.add(pendingInc)
+
+    for v in extra:
+      self.parentWriter.vgprPool.checkIn(v)
+    return mod
+
+  def _emitLinePairPermlanes(self, vPack: int, tt0: int):
+    """The lane-32 half of the store transpose, with no wait and no store attached."""
+    module = Module("linePairPermlanes")
+    module.addComment1(f"v_permlane32_swap_b32: swap across lane-32 boundary (tt0={tt0})")
+    module.add(VPermlane32SwapB32(dst=vgpr(vPack+0), src=vgpr(vPack+2), comment="swap dwords 0<->2"))
+    module.add(VPermlane32SwapB32(dst=vgpr(vPack+1), src=vgpr(vPack+3), comment="swap dwords 1<->3"))
+    return module
+
+  def _emitLinePairStore(self, vPack: int, vAddrScratch: int, globalOffset: int, tt0: int):
+    """One interior paired store, with nothing else in the module — so a caller can
+    place several of them in consecutive instruction slots."""
+    module = Module("linePairStore")
+    ntd = self.kernel["NonTemporalD"]
+    module.add(BufferStoreB128(
+      src=vgpr(vPack, 4),
+      vaddr=vgpr(vAddrScratch),
+      saddr=sgpr("SrdD", 4),
+      soffset=0,
+      mubuf=MUBUFModifiers(offen=True, offset12=globalOffset, glc=bool(ntd & 0x1),
+                           slc=bool(ntd & 0x2), nt=bool(ntd & 0x4)),
+      comment=f"[linepair] 16bit paired dwordx4 store tt0={tt0},{tt0+1} (D+{globalOffset}B)"
+    ))
+    return module
 
   def _emit16bitSubtilePairedStore(self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, interior: bool = False) -> Module:
     """Emit a paired 16bit store combining sba=0 and sba=1 subtile data.
@@ -3473,6 +3675,14 @@ class GlobalWriteBatchWriter:
     """EpilogueStoreSpread — see Common/ValidParameters.py for the encoding."""
     try:
       return self.kernel["EpilogueStoreSpread"]
+    except KeyError:
+      return 0
+
+  @property
+  def _storeCluster(self) -> int:
+    """EpilogueStoreCluster — see Common/ValidParameters.py for the encoding."""
+    try:
+      return self.kernel["EpilogueStoreCluster"]
     except KeyError:
       return 0
 

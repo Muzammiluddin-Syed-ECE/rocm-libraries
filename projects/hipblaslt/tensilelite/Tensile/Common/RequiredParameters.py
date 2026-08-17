@@ -54,6 +54,7 @@ def getRequiredParametersMin() -> set:
         'DirectToLdsMetadata',
         'DirectToVgprMXSA',
         'DirectToVgprMXSB',
+        'EpilogueStoreCluster',
         'EpilogueStoreSpread',
         'ExpandPointerSwap',
         'ExtraLatencyForLR',
