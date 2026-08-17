@@ -55,6 +55,13 @@ from ..KernelWriterModules import hasSequentialValuC
 from math import ceil, log2
 
 
+# SubtilePreStoreBarrier encoding; see ValidParameters.py for the full rationale.
+# A solution parameter rather than a build-time switch so that all three variants can
+# coexist in one library under distinct kernel names, which is what lets an A/B
+# interleave them inside a single client process.
+_PSB_NONE, _PSB_ONCE, _PSB_PER_BATCH = 0, 1, 2
+
+
 def _scmpGtU32(writer, src, imm, comment=""):
     """ISA-aware scalar compare: s_cmpk_gt_u32 when available, else s_cmp_gt_u32 via temp SGPR."""
     if writer.states.asmCaps["HasSCMPK"]:
@@ -374,15 +381,27 @@ class GlobalWriteBatchWriter:
     ahead of the paired subtile stores. It is needed only in multi-DU, where the
     store loop re-stages that LDS vector across sub-iterations, so one wave's next
     staging (an LDS write) can race another wave's in-flight reads of it. Single-DU
-    stages the vector once and never writes LDS again in the store region, so the
-    ordering is redundant there and the barrier is elided (see emit()). Returns
-    True iff the barrier was emitted.
+    needs no *per-batch* ordering, but still needs the reads ordered against the
+    NEXT tile's LDS fill; that is emitted once, on the last batch, in emit().
+    Returns True iff the barrier was emitted.
     """
     if isMultiDU and needsDrain:
       module.add(SWaitCnt(dscnt=0, comment="drain bias/SAV LDS reads"))
       module.add(SBarrier(comment="sync waves before subtile paired stores"))
       return True
     return False
+
+  def _isLastStoreBatch(self) -> bool:
+    """True on the batch after which no further bias/SAV LDS read is issued.
+
+    Normally that is simply the last batch of the store loop. Under
+    CompactLoopStore the tail of the batch list is re-executed as a hardware loop,
+    so the last *emitted* batch is not the last *executed* one; the end of the CLS
+    loop body is, and it is also the point the CLS countdown tail already uses.
+    """
+    if self.kernel["CompactLoopStore"]:
+      return self._computeBatchesPerCLSBody() - 1 == self.batchIdx
+    return self.batchIdx == self.numBatches - 1
 
   def emit(self) -> Module:
     assert self._checkAtomicPreconditions()
@@ -393,31 +412,55 @@ class GlobalWriteBatchWriter:
     # A subtile bias/scaleAlphaVec epilogue stages a per-column vector into LDS once,
     # then every wave reads that shared LDS vector while computing the paired stores.
     # The stores themselves route through the ds_permute/ds_bpermute crossbar, which is
-    # a register-lane shuffle and writes no LDS memory -- so the store region issues no
-    # LDS writes. The drain+barrier only matters when a later LDS *write* could race
-    # those in-flight LDS reads:
-    #   * multi-DU: the store loop re-stages the LDS vector across sub-iterations, so one
-    #     wave's next staging (an LDS write) can overtake another wave's reads -> the
-    #     drain+barrier is required, and it pairs with the multi-DU epilogue-vector
-    #     barrier in KernelWriterAssembly.
-    #   * single-DU: the vector is staged exactly once and the store region is
-    #     LDS-write-free, so nothing can write the LDS the reads depend on -> the ordering
-    #     is redundant and the barrier is elided. The assert below fails loud if a future
-    #     change reintroduces an LDS write into the single-DU store region.
+    # a register-lane shuffle and writes no LDS memory, so the store region issues no
+    # LDS writes of its own.
+    #
+    # That is NOT sufficient to drop the ordering, and an earlier version of this code
+    # dropped it on exactly that argument. The barrier this replaces sat AFTER the store
+    # region, so what it ordered was this region's LDS *reads* against whatever writes
+    # LDS *next* -- a cross-wave WAR edge, not an intra-region one. Checking that the
+    # region contains no LDS write therefore checks the wrong interval.
+    #
+    # The next LDS write does exist. The staged vector is written at LDS offset 0 and
+    # the A/B tile double buffers span the whole LDS segment, so it aliases them; and
+    # with StreamK the workgroup is persistent -- the epilogue closes with a long branch
+    # (label_SK_CloseLoop, an s_getpc/s_sub/s_setpc pair rather than an s_cbranch) back
+    # to the tile setup, whose first act is the next tile's DirectToLds fill. Measured on
+    # the emitted code: after that loop-back target the first LDS write precedes the
+    # first s_barrier, so the loop-back path supplies no ordering of its own. A wave
+    # still reading the vector can therefore have it overwritten by a wave that has
+    # already gone round.
+    #
+    # What is genuinely redundant is doing this once per *batch*. A barrier is a
+    # rendezvous: one drain+barrier placed after the last batch orders every batch's
+    # reads, in every wave, ahead of every later LDS write. So:
+    #   * multi-DU: still per batch. The store loop re-stages the vector across
+    #     sub-iterations, so the hazard recurs within the loop, and this pairs with the
+    #     multi-DU epilogue-vector barrier in KernelWriterAssembly.
+    #   * single-DU: once, after the last batch's stores.
     isMultiDU = isSubtileMultiDU(self.kernel)
     needsDrain = self._needsBiasSavDrain(self.kernel, self.parentWriter.states.useBias)
-    if isMultiDU:
-      self._emitBiasSavDrainBarrier(module, isMultiDU, needsDrain)
+    psb = self.kernel.get("SubtilePreStoreBarrier", _PSB_ONCE)
+    if isMultiDU or psb == _PSB_PER_BATCH:
+      self._emitBiasSavDrainBarrier(module, True, needsDrain)
       self._emitAdd(module)
     else:
       storeStart = len(module.flatitems())
       self._emitAdd(module)
+      # The store region being LDS-write-free is still worth asserting -- it is what
+      # lets one trailing barrier stand in for one per batch -- but it is an input to
+      # the argument, not the argument. Note it cannot see a DirectToLds
+      # `buffer_load ... lds`, which writes LDS without a DSStoreInstruction.
       if needsDrain:
         assert not any(self._isLdsMemoryWrite(i) for i in module.flatitems()[storeStart:]), \
-          ("single-DU subtile store region must be LDS-write-free to elide the pre-store "
-           "bias/SAV drain barrier: an LDS memory write (ds_write/ds_store) here would race "
-           "the in-flight bias/SAV LDS column-vector reads. Re-emit the drain+barrier (or "
-           "move the LDS write out of the store region) before removing this invariant.")
+          ("single-DU subtile store region must be LDS-write-free for one trailing "
+           "drain+barrier to order every batch's bias/SAV LDS reads: an LDS memory write "
+           "(ds_write/ds_store) inside the region would need per-batch ordering instead. "
+           "Re-emit the per-batch drain+barrier, or move the LDS write out of the region.")
+      if needsDrain and psb != _PSB_NONE and self._isLastStoreBatch():
+        module.add(SWaitCnt(dscnt=0, comment="drain bias/SAV LDS reads"))
+        module.add(SBarrier(
+          comment="order epilogue bias/SAV LDS reads before the next tile's LDS fill"))
     self._epilog(module)
     # CompactLoopStore CLS countdown tail: emit countdown + branch + s_endpgm at
     # END of the CLS-loop body (= last batch of batchesPerCLSBody). Gated by

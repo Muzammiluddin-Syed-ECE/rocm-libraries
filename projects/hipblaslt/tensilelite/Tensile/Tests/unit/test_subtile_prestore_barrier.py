@@ -7,14 +7,23 @@
 #
 # The subtile bias/scaleAlphaVec epilogue stages a per-column vector into LDS and
 # every wave reads it while computing the paired stores. A drain (s_waitcnt
-# lgkmcnt(0)) + workgroup s_barrier orders those LDS reads ahead of the stores.
-# It is required only for multi-DU (the store loop re-stages the LDS vector, so an
-# LDS write can race in-flight reads); single-DU stages the vector once and the
-# store region is LDS-write-free, so the barrier is elided. These tests pin that
-# emit fork so a future refactor cannot silently add/drop the barrier, and pin the
-# derivation of the two predicates (isSubtileMultiDU, needs-bias/SAV-drain) that
-# drive it -- including PGR-invariance and both the useBias and UseScaleAlphaVec
-# triggers. No GPU required: the emitted rocisa module is the contract.
+# lgkmcnt(0)) + workgroup s_barrier orders those LDS reads against the next LDS
+# write, which is a cross-wave WAR edge.
+#
+# Multi-DU needs that ordering once per batch, because the store loop re-stages the
+# LDS vector across sub-iterations and so the hazard recurs inside the loop.
+# Single-DU does NOT need it per batch -- the store region is LDS-write-free, the
+# crossbar notwithstanding -- but it still needs it ONCE. The staged vector aliases
+# the A/B tile buffers, and under StreamK the workgroup is persistent, so the next
+# tile's LDS fill is the racing write. Dropping the ordering outright (rather than
+# reducing it to one trailing barrier) is a real WAR race, not just a weak argument.
+#
+# These tests pin the emit fork so a future refactor cannot silently add or drop the
+# barrier, pin the derivation of the two predicates (isSubtileMultiDU,
+# needs-bias/SAV-drain) that drive it -- including PGR-invariance and both the
+# useBias and UseScaleAlphaVec triggers -- and pin the last-batch placement that
+# makes one barrier stand in for one per batch. No GPU required: the emitted rocisa
+# module is the contract.
 #
 # Usage:
 #   pytest test_subtile_prestore_barrier.py -v
@@ -87,14 +96,15 @@ class TestBarrierEmitFork:
         assert nbar == 1, "multi-DU bias/SAV epilogue must emit exactly one s_barrier"
         assert ndrain == 1, "multi-DU must emit the s_waitcnt lgkmcnt(0) LDS-read drain"
 
-    def test_singledu_with_drain_elides_barrier(self):
-        # The whole point of the change: single-DU must NOT emit the barrier.
+    def test_singledu_with_drain_elides_per_batch_barrier(self):
+        # Single-DU must not emit the barrier *per batch*. It still gets one trailing
+        # drain+barrier on the last batch; that is emit()'s job, not this helper's.
         _init_rocisa_gfx950()
         mod, emitted = _emit_barrier(is_multi_du=False, needs_drain=True)
         nbar, ndrain = _barrier_counts(mod)
         assert emitted is False
-        assert nbar == 0, "single-DU epilogue must elide the pre-store s_barrier"
-        assert ndrain == 0, "single-DU epilogue must elide the s_waitcnt lgkmcnt(0) drain"
+        assert nbar == 0, "single-DU epilogue must elide the PER-BATCH s_barrier"
+        assert ndrain == 0, "single-DU epilogue must elide the PER-BATCH lgkmcnt(0) drain"
 
     def test_no_drain_never_emits_barrier(self):
         # No bias/SAV staging -> no ordering needed, in either DU mode.
@@ -205,6 +215,45 @@ class TestIsLdsMemoryWrite:
         from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
         _init_rocisa_gfx950()
         assert GlobalWriteBatchWriter._isLdsMemoryWrite(SBarrier(comment="x")) is False
+
+
+# ---------------------------------------------------------------------------
+# _isLastStoreBatch: where the single trailing drain+barrier lands. Getting this
+# wrong is the difference between ordering every batch's LDS reads and ordering
+# none of them, so it is pinned on its own.
+# ---------------------------------------------------------------------------
+class _BatchStub:
+    """Just the attributes _isLastStoreBatch reads."""
+
+    def __init__(self, batch_idx, num_batches, cls=False, cls_body=None):
+        self.kernel = {"CompactLoopStore": cls}
+        self.batchIdx = batch_idx
+        self.numBatches = num_batches
+        self._cls_body = cls_body
+
+    def _computeBatchesPerCLSBody(self):
+        return self._cls_body
+
+
+class TestIsLastStoreBatch:
+    def test_last_batch_only(self):
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        f = GlobalWriteBatchWriter._isLastStoreBatch
+        assert f(_BatchStub(3, 4)) is True
+        for i in (0, 1, 2):
+            assert f(_BatchStub(i, 4)) is False
+
+    def test_single_batch_epilogue_is_last(self):
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        assert GlobalWriteBatchWriter._isLastStoreBatch(_BatchStub(0, 1)) is True
+
+    def test_compact_loop_store_uses_end_of_loop_body(self):
+        # Under CLS the batch tail is re-executed as a loop, so the last *emitted*
+        # batch is not the last *executed* one; the end of the loop body is.
+        from Tensile.Components.GlobalWriteBatch import GlobalWriteBatchWriter
+        f = GlobalWriteBatchWriter._isLastStoreBatch
+        assert f(_BatchStub(1, 8, cls=True, cls_body=2)) is True
+        assert f(_BatchStub(7, 8, cls=True, cls_body=2)) is False
 
 
 if __name__ == "__main__":

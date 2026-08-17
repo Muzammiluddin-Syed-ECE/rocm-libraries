@@ -607,6 +607,7 @@ defaultBenchmarkCommonParameters = [
     {"EpilogueStoreSpread": [0]},
     {"EpilogueStoreCluster": [0]},
     {"EpilogueStorePipe": [0]},
+    {"SubtilePreStoreBarrier": [1]},
     {"SwapGlobalReadOrder": [0]},
     {"ScheduleGROverBarrier": [-1]},
     {"DtlPlusLdsBuf": [-1]},

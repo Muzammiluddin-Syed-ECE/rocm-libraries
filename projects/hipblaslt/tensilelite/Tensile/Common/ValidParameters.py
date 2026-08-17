@@ -1217,6 +1217,20 @@ validParameters = { # we need to make sure this matches develop
     # body falls back to the depth-3 pipeline rather than risking a spill at the
     # 320-accvgpr ceiling.
     "EpilogueStorePipe": [0] + [L * 10 + U for L in range(1, 6) for U in range(1, 9)],
+    # Placement of the subtile epilogue's bias/scaleAlphaVec LDS-read drain + workgroup
+    # barrier in SINGLE-DU mode.  (Multi-DU is always per batch and ignores this: its
+    # store loop re-stages the LDS vector, so the hazard recurs inside the loop.)
+    #
+    # The barrier orders the epilogue's LDS reads of the staged column vector against the
+    # NEXT LDS write.  That write exists: the vector aliases the A/B tile buffers, and
+    # under StreamK the workgroup is persistent, so the next tile's DirectToLds fill is
+    # the racing write.  Only the FREQUENCY is negotiable, because a barrier is a
+    # rendezvous -- one after the last batch orders every batch's reads in every wave.
+    #     0   NONE.  UNSOUND, retained only so the defect can be A/B'd against the fix;
+    #         leaves a cross-wave WAR race on the staged vector.  Do not ship.
+    #     1   ONCE, after the last store batch.  Default, and the correct condition.
+    #     2   PER BATCH -- the pre-elision emission.  Sound but redundant.
+    "SubtilePreStoreBarrier": [0, 1, 2],
     # PLSIN store-epilogue mode (only meaningful when PostLoopStoreInNll is True and
     # the tile is <= 256x256; larger tiles are forced to Lend regardless):
     #   "Weave" - terminal MFMAs interleaved with the fused store, input-tile VGPRs

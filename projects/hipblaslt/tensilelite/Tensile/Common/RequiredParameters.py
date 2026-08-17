@@ -57,6 +57,7 @@ def getRequiredParametersMin() -> set:
         'EpilogueStoreCluster',
         'EpilogueStorePipe',
         'EpilogueStoreSpread',
+        'SubtilePreStoreBarrier',
         'ExpandPointerSwap',
         'ExtraLatencyForLR',
         'ExtraMiLatencyLeft',
