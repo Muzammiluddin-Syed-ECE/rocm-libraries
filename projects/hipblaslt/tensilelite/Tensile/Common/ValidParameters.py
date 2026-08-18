@@ -1229,7 +1229,15 @@ validParameters = { # we need to make sure this matches develop
     #     0   NONE.  UNSOUND, retained only so the defect can be A/B'd against the fix;
     #         leaves a cross-wave WAR race on the staged vector.  Do not ship.
     #     1   ONCE, after the last store batch.  Default, and the correct condition.
-    #     2   PER BATCH -- the pre-elision emission.  Sound but redundant.
+    #     2   PER BATCH, emitted BEFORE the store region (the multi-DU placement).
+    #         Sound but redundant.  This is NOT the pre-elision emission, as this
+    #         comment previously claimed: the pre-elision single-DU code emitted the
+    #         pair AFTER the store region, so mode 2 orders a batch's LDS reads against
+    #         its OWN stores while the pre-elision pair ordered them against the NEXT
+    #         batch's reads.  The two agree on every count -- 235681 instructions, 417
+    #         s_barrier, 2233 s_waitcnt on MT320x256 -- and are different machine code
+    #         (encoding md5 c20243e5b4392b81 against 0a8585800c97f170), so a census
+    #         cannot tell them apart.
     "SubtilePreStoreBarrier": [0, 1, 2],
     # PLSIN store-epilogue mode (only meaningful when PostLoopStoreInNll is True and
     # the tile is <= 256x256; larger tiles are forced to Lend regardless):
