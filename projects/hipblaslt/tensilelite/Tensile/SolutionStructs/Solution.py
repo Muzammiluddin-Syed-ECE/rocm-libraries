@@ -992,9 +992,22 @@ class Solution(collections.abc.Mapping):
         reject(state, printRejectionReason, "gfx950 MX requires UseSubtileImpl")
 
     if state["UseSubtileImpl"]:
-      state["VectorWidthA"] = 1
-      state["VectorWidthB"] = 1
-      state["SourceSwap"] = False
+      # SourceSwap requires: FP4/FP16 A dtype, BF16/FP16 2-byte dest, MIWaveTile[0]==8,
+      # VWA divisible by 8, VWB divisible by MIWaveTile[1]. Anything else downgrades to SS0.
+      miwt = state.get("MIWaveTile", [])
+      inputOK = (state["ProblemType"]["DataTypeA"].numBytes() == 2
+                 or state["ProblemType"]["DataTypeA"].isFloat4())
+      vwAOK = state["VectorWidthA"] in (-1, 8)
+      vwBOK = (state["VectorWidthB"] == -1
+               or (state["VectorWidthB"] > 0 and len(miwt) == 2
+                   and miwt[1] % state["VectorWidthB"] == 0))
+      ssSupported = (inputOK
+                     and state["ProblemType"]["DestDataType"].numBytes() == 2
+                     and len(miwt) == 2 and miwt[0] == 8 and vwAOK and vwBOK)
+      if not (state["SourceSwap"] and ssSupported):
+        state["VectorWidthA"] = 1
+        state["VectorWidthB"] = 1
+        state["SourceSwap"] = False
       # Force BufferStore=True: UseSubtileImpl optimized storeD path is only implemented
       # for buffer stores for now.
       state["BufferStore"] = True
@@ -1739,6 +1752,13 @@ class Solution(collections.abc.Mapping):
                     or (not streamKFixupSafe))
       if structuralFail or registerFail or (profitFail and not forcePlsinFp4F16):
         state["PostLoopStoreInNll"] = False
+
+    # SourceSwap transposes the accumulator layout; the PLSIN paired-store tile
+    # mapping has not been validated under SourceSwap and produces a 40% larger
+    # binary (doubled Fused/Plain epilog copies + a third DoPostLoopStore path)
+    # that causes L1 icache thrashing. Disable until explicitly co-validated.
+    if state["PostLoopStoreInNll"] and state.get("SourceSwap", False):
+      state["PostLoopStoreInNll"] = False
 
     # PLSIN fuses the D store into the No-Load Loop, so it needs a structural NLL
     # (PGR >= 1). Defensive re-check.
