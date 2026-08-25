@@ -3319,6 +3319,36 @@ class LogicalScheduler:
         return InlineModuleOp(build=_build_initC, label="initC_overlap")
 
     @staticmethod
+    def _make_single_gr_op(placement: 'GRPlacement',
+                           tileId: int, k: int) -> InlineModuleOp:
+        """Return an InlineModuleOp that emits exactly one buffer_load for an
+        A/B GRPlacement at (tileId, k), or the full scale load for SA/SB.
+
+        Used to explode a GRPlacement into its individual loads so that
+        initC slices can be interleaved between every single buffer_load
+        rather than between whole GRPlacement groups.
+        """
+        tensor  = placement.tensor
+        uid_k   = placement.unrollId  # captured at schedule-build time
+
+        def _build_single(emitter, _tensor=tensor, _tileId=tileId, _k=k, _uid_k=uid_k):
+            from rocisa.code import Module
+            if _tensor in ('A', 'B'):
+                from Tensile.Components.Subtile.SubtileGREmit import emitSingleBufferLoad
+                ti      = emitter.tileInfoMap[_tensor]
+                grGran  = emitter.config.grA if _tensor == 'A' else emitter.config.grB
+                subtileK = (_k - _uid_k * grGran.k) // emitter.subtileShapeK
+                return emitSingleBufferLoad(ti, emitter.kernel, _tileId, subtileK)
+            else:
+                from Tensile.Components.Subtile.SubtileScaleEmit import (
+                    globalReadDoScaleSubtile)
+                tc = 'MXSA' if _tensor == 'SA' else 'MXSB'
+                return globalReadDoScaleSubtile(tc, emitter.writer, emitter.kernel)
+
+        return InlineModuleOp(build=_build_single,
+                              label=f"single_gr_{tensor}_t{tileId}_k{k}")
+
+    @staticmethod
     def _make_initC_slice(slice_idx: int, n_slices: int) -> InlineModuleOp:
         """Return one of n_slices equal slices of the initC module.
 
@@ -3516,18 +3546,50 @@ class LogicalScheduler:
             # 32768×6144×4096 MXFP4 shape vs the back-to-back baseline).
             # The NLL partial-tile path receives the full initC block intact (it
             # never enters the interleaved MT1 section).
-            n_mt1 = len(mt1_ops)
+            # Explode mt1_ops into individual (tensor, tileId, k) load slots so
+            # that initC slices are interleaved between every single buffer_load,
+            # not between whole GRPlacement groups.  For the production MXFP4
+            # kernel this means one initC slice per load (K=1 at buffer_load
+            # granularity) rather than K≈10 at GRPlacement granularity.
+            # SA/SB placements are treated as single-load atoms.
+            single_gr_ops: list = []
+            for gr_op in mt1_ops:
+                if not isinstance(gr_op, GRPlacement):
+                    # GRIncOp or other dep-op — keep as-is (no interleave)
+                    single_gr_ops.append(('dep', gr_op))
+                    continue
+                tensor = gr_op.tensor
+                if tensor in ('SA', 'SB'):
+                    single_gr_ops.append(('load', gr_op, None, None))
+                else:
+                    grGran = cfg.grA if tensor == 'A' else cfg.grB
+                    for tileId in range(gr_op.tiles.tileId_start,
+                                        gr_op.tiles.tileId_end,
+                                        grGran.mn):
+                        for k in range(gr_op.tiles.subIterK_start,
+                                       gr_op.tiles.subIterK_end,
+                                       grGran.k):
+                            single_gr_ops.append(('load', gr_op, tileId, k))
+
+            # Count only 'load' atoms for initC slice distribution
+            n_loads = sum(1 for x in single_gr_ops if x[0] == 'load')
+            load_idx = 0
             interleaved_mt1: list = []
-            if n_mt1 > 0:
-                for i, gr_op in enumerate(mt1_ops):
-                    interleaved_mt1.append(gr_op)
-                    # One initC slice follows each GR atom (including the last),
-                    # so all initC work completes before the vmcnt wait.
+            for item in single_gr_ops:
+                if item[0] == 'dep':
+                    interleaved_mt1.append(item[1])
+                else:
+                    _, gr_op, tileId, k = item
+                    if tileId is None:
+                        # SA/SB: emit as the original GRPlacement (single load)
+                        interleaved_mt1.append(gr_op)
+                    else:
+                        interleaved_mt1.append(
+                            self._make_single_gr_op(gr_op, tileId, k))
+                    # One initC slice per load (K=1 at buffer_load level)
                     interleaved_mt1.append(
-                        self._make_initC_slice(i, n_mt1)
-                    )
-            else:
-                interleaved_mt1 = list(mt1_ops)
+                        self._make_initC_slice(load_idx, n_loads))
+                    load_idx += 1
 
             emitted = self._to_emitted([
                 *preloop_ops,
