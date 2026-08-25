@@ -3573,6 +3573,14 @@ class LogicalScheduler:
 
             # Count only 'load' atoms for initC slice distribution
             n_loads = sum(1 for x in single_gr_ops if x[0] == 'load')
+            # Cluster size: one initC slice is inserted after every CLUSTER_K
+            # consecutive buffer_loads (K=10 at buffer_load granularity).
+            # Empirically: K=10 gives the best balance on both S6 (+22.7%) and
+            # S3 (+2.1%) from ClusteredGlobalReads Experiment 2.  With 20 MT1
+            # loads this produces 2 clusters of 10 loads each, 1 inter-cluster
+            # gap, and 2 initC slices (~528 cycles each).
+            CLUSTER_K = 10
+            n_slices = -(-n_loads // CLUSTER_K)   # ceil(n_loads / CLUSTER_K)
             load_idx = 0
             interleaved_mt1: list = []
             for item in single_gr_ops:
@@ -3586,10 +3594,14 @@ class LogicalScheduler:
                     else:
                         interleaved_mt1.append(
                             self._make_single_gr_op(gr_op, tileId, k))
-                    # One initC slice per load (K=1 at buffer_load level)
-                    interleaved_mt1.append(
-                        self._make_initC_slice(load_idx, n_loads))
                     load_idx += 1
+                    # Insert one initC slice after every CLUSTER_K loads and
+                    # after the final load so all initC work completes before
+                    # the vmcnt wait.
+                    if load_idx % CLUSTER_K == 0 or load_idx == n_loads:
+                        slice_idx = (load_idx - 1) // CLUSTER_K
+                        interleaved_mt1.append(
+                            self._make_initC_slice(slice_idx, n_slices))
 
             emitted = self._to_emitted([
                 *preloop_ops,
