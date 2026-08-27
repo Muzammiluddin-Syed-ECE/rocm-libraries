@@ -4178,7 +4178,7 @@ class LogicalScheduler:
         if plsin and writer._plsinCanBypassEndSummation(kernel):
             plsinFusedExitLabel = Label("SkipPostLoopStore", "")
 
-        skipGRLabel = Label("SkipPreloop", "")
+        skipGRLabel = Label("SkipPreloopGR", "")
         preloopEndLabel = Label("PreloopEnd", "")
         skipGRForTail = (not kernel["NoTailLoop"]) and self.config.pgr >= 1
         if skipGRForTail:
@@ -4315,10 +4315,12 @@ class LogicalScheduler:
 
                 # Copy already-populated instructions from the fast-path initC.
                 # populate() ran before deepcopy, so em_list[init_idx].instructions
-                # already contains the built assembly — duplicate it for the slow path.
+                # already contains the built assembly — deep-copy it so the slow-path
+                # module owns independent instruction objects; a shallow list() copy
+                # would share rocisa instances and silently corrupt both on mutation.
                 em_list.insert(sp_base + 1, EmittedModule(
                     moduleId=next_id,
-                    instructions=list(em_list[init_idx].instructions)))
+                    instructions=copy.deepcopy(em_list[init_idx].instructions)))
                 next_id += 1
 
                 em_list.insert(sp_base + 2, EmittedModule(
@@ -4339,9 +4341,10 @@ class LogicalScheduler:
                         tailJump,
                     ]))
 
-        # NoTailLoop fallback: no split exists, so inject lraDeferred before wait_gr
-        # in the flat preloop (the only path). skipGRForTail=False implies NoTailLoop=True
-        # for any kernel where _lraDeferred is set (PGR=0 kernels never defer LRA).
+        # NoTailLoop fallback: no split path exists, so inject lraDeferred before
+        # wait_gr in the flat preloop (the only path). _lraDeferred is only set when
+        # PGR>=1 (enforced by _deferLra in KernelWriter), so not skipGRForTail here
+        # always means NoTailLoop=True.
         if _lraDeferred and not skipGRForTail:
             fl = preloop_emitted[0][0]
             drain_idx = next((i for i, em in enumerate(fl)

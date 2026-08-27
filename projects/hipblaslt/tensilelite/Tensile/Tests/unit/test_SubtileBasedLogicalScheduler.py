@@ -2969,12 +2969,12 @@ class TestIntegration:
             #                      SkipPreloop -> slow initC -> tail-jump -> PreloopEnd.
             fast_zero_idx  = asm.index("vgprTiles to zero")
             branch_end_idx = asm.index("PreloopEnd", fast_zero_idx)
-            skip_idx       = asm.index("SkipPreloop:", branch_end_idx)
+            skip_idx       = asm.index("SkipPreloopGR:", branch_end_idx)
             slow_zero_idx  = asm.index("vgprTiles to zero", skip_idx)
             tail_idx       = asm.index("K < DepthU: jump to tail loop", slow_zero_idx)
             preloop_end_idx = asm.index("PreloopEnd:", tail_idx)
             assert fast_zero_idx < branch_end_idx < skip_idx < slow_zero_idx < tail_idx < preloop_end_idx, \
-                "expected: fast initC -> SBranch PreloopEnd -> SkipPreloop -> slow initC -> tail-jump -> PreloopEnd:"
+                "expected: fast initC -> SBranch PreloopEnd -> SkipPreloopGR -> slow initC -> tail-jump -> PreloopEnd:"
         finally:
             sched.deallocVgprTiles(writer)
 
@@ -3002,10 +3002,10 @@ class TestIntegration:
             # initC duplicated: fast path (after GRs) + slow path (after SkipPreloop).
             assert asm.count("vgprTiles to zero") == 2, "initC must appear on both paths"
 
-            # Guard branches to SkipPreloop (not old SkipPreloopGR).
-            assert asm.count("label_SkipPreloop:") == 1, "SkipPreloop label present"
-            skip_gr = re.findall(r"s_cbranch_scc1\s+label_SkipPreloop\b", asm)
-            assert len(skip_gr) == 1, "K<DepthU guard must branch to SkipPreloop"
+            # Guard branches to SkipPreloopGR label.
+            assert asm.count("label_SkipPreloopGR:") == 1, "SkipPreloopGR label present"
+            skip_gr = re.findall(r"s_cbranch_scc1\s+label_SkipPreloopGR\b", asm)
+            assert len(skip_gr) == 1, "K<DepthU guard must branch to SkipPreloopGR"
 
             # Fast path has unconditional branch to PreloopEnd after fast-path initC.
             assert asm.count("label_PreloopEnd:") == 1, "PreloopEnd label present"
@@ -3016,6 +3016,114 @@ class TestIntegration:
             assert asm.count("label_SkipToEnd:") == 1, "SkipToEnd label must be present"
             tail_jump = re.findall(r"s_cbranch_scc1\s+label_SkipToEnd", asm)
             assert len(tail_jump) == 1, "K<DepthU slow path must jump to tail loop after initC"
+        finally:
+            sched.deallocVgprTiles(writer)
+
+    def test_lra_deferred_lands_before_waitgr_in_notailloop_preloop(self):
+        """NoTailLoop + _deferredPreloopLraModules: LRA injected before wait_gr.
+
+        When NoTailLoop=True the preloop has no slow/fast split.
+        The NoTailLoop fallback must inject _lraDeferred before the wait_gr
+        EmittedModule so LRA VALU runs while buffer_loads are in flight.
+        """
+        from rocisa.code import Module as RocModule
+        from rocisa.instruction import SMovB32
+
+        kernel = create_kernel(256, 256, fp4=True)
+        kernel["NoTailLoop"] = True
+        assert kernel["NoTailLoop"]
+        assert kernel["PrefetchGlobalRead"] >= 1
+
+        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=True)
+
+        # Inject a sentinel LRA module so we can locate it in the output.
+        sentinel = RocModule("LRA_SENTINEL")
+        sentinel.addComment0("LRA_SENTINEL_MARKER")
+        writer._deferredPreloopLraModules = [sentinel]
+
+        cfg = make_cfg_256x256_fp4()
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.allocVgprTiles(writer, tiA, tiB,
+                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+        try:
+            sched.populate_instructions(
+                writer, kernel,
+                tileInfoA=tiA, tileInfoB=tiB,
+                dtileInfo=dTileInfo,
+                scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+            )
+
+            asm = str(sched.emitMainAndExitLoops(writer, kernel))
+
+            assert "LRA_SENTINEL_MARKER" in asm, \
+                "LRA sentinel must appear in preloop output (NoTailLoop fallback)"
+
+            # LRA must appear BEFORE the wait_gr comment — it should run while
+            # buffer_loads are in flight, not after the drain.
+            lra_idx  = asm.index("LRA_SENTINEL_MARKER")
+            wait_idx = asm.index("Wait GR")
+            assert lra_idx < wait_idx, \
+                "LRA must land before wait_gr in NoTailLoop flat preloop"
+
+            # No slow/fast split: neither SkipPreloopGR nor PreloopEnd label emitted.
+            assert "SkipPreloopGR:" not in asm, \
+                "NoTailLoop preloop must not emit SkipPreloopGR label"
+        finally:
+            sched.deallocVgprTiles(writer)
+
+    def test_lra_deferred_on_fast_path_for_non_plsin_kernel(self):
+        """Widened _deferLra: non-PLSIN UseSubtileImpl PGR>=1 kernel gets LRA on fast path.
+
+        After gate widening, _deferredPreloopLraModules is populated for any
+        UseSubtileImpl + PGR>=1 + !hasTDM kernel, not just PLSIN. The LRA
+        instructions must appear on the fast path (between initC and SBranch
+        PreloopEnd) and NOT on the slow path.
+        """
+        from rocisa.code import Module as RocModule
+
+        kernel = create_kernel(256, 256, fp4=True)
+        assert not kernel["NoTailLoop"]
+        # Explicitly not PLSIN
+        kernel["PostLoopStoreInNll"] = 0
+        assert kernel["PrefetchGlobalRead"] >= 1
+
+        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=True)
+
+        sentinel = RocModule("LRA_SENTINEL")
+        sentinel.addComment0("LRA_SENTINEL_MARKER")
+        writer._deferredPreloopLraModules = [sentinel]
+
+        cfg = make_cfg_256x256_fp4()
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.allocVgprTiles(writer, tiA, tiB,
+                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+        try:
+            sched.populate_instructions(
+                writer, kernel,
+                tileInfoA=tiA, tileInfoB=tiB,
+                dtileInfo=dTileInfo,
+                scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+            )
+
+            asm = str(sched.emitMainAndExitLoops(writer, kernel))
+
+            assert "LRA_SENTINEL_MARKER" in asm, \
+                "LRA sentinel must appear in preloop output (non-PLSIN kernel)"
+
+            # Fast path: sentinel must appear after fast initC but before SBranch PreloopEnd.
+            fast_zero_idx = asm.index("vgprTiles to zero")
+            lra_idx       = asm.index("LRA_SENTINEL_MARKER")
+            branch_idx    = asm.index("PreloopEnd", lra_idx)
+            assert fast_zero_idx < lra_idx < branch_idx, \
+                "LRA must land on fast path: after initC, before SBranch PreloopEnd"
+
+            # Slow path (after SkipPreloopGR:) must NOT contain the sentinel.
+            skip_idx = asm.index("SkipPreloopGR:")
+            asm_after_skip = asm[skip_idx:]
+            assert "LRA_SENTINEL_MARKER" not in asm_after_skip, \
+                "LRA must NOT appear on the slow path (tail loop is addressing-independent)"
         finally:
             sched.deallocVgprTiles(writer)
 

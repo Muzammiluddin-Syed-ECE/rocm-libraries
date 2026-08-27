@@ -5184,6 +5184,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # (no split) it lands before wait_gr. The slow path (K<DepthU) omits lraDeferred
     # entirely — the tail loop uses an independent flat-tile layout. TDM / PGR==0
     # kernels emit inline as before.
+    # gfx1250 note: gfx1250 subtile kernels always set enableTDMA=enableTDMB=True,
+    # so hasTDM=True and the `not hasTDM` guard already excludes them. No separate
+    # arch check is needed.
     _deferLra = (kernel.get("UseSubtileImpl")
                  and kernel["PrefetchGlobalRead"] >= 1
                  and not hasTDM)
