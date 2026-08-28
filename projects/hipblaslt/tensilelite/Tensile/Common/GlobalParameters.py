@@ -608,6 +608,10 @@ defaultBenchmarkCommonParameters = [
     {"ScheduleGROverBarrier": [-1]},
     {"DtlPlusLdsBuf": [-1]},
     {"MinGRIncPerMfma": [-1]},
+    # PreloopGRClusterSize: cluster size for fused preloop GR interleaving.
+    # -1 (default) = off. N > 0 = groups of N loads separated by initC MFMA filler.
+    # Only active when UseSubtileImpl=True and PGR=2 (single-DU path).
+    {"PreloopGRClusterSize": [-1]},
     {"UsePLRPack": [0]},
     {"TDMInst": [0]},
     {"TDMSplit": [False]},
