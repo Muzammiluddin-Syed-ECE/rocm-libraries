@@ -164,6 +164,7 @@ def getRequiredParametersMin() -> set:
         'WorkGroupMappingXCC',
         'DtlPlusLdsBuf',
         'MinGRIncPerMfma',
+        'PreloopGRClusterSize',
         'UsePLRPack',
         'UseSubtileImpl',
         'ClusterDim',
