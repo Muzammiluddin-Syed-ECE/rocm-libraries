@@ -3379,30 +3379,20 @@ class LogicalScheduler:
                             and getattr(x.dst, 'regType', None) == 'm')
         _is_load = lambda x: isinstance(x, GlobalReadInstruction)
 
-        # ── Locate MT0/MT1 gr modules, gr_inc modules, initC, WaitGROp ──
-        mt0_idx, mt1_idx, grinc_idx, initc_i, waitgr_i = [], [], [], None, None
+        # ── Locate the clustered region: MT0 gr modules, gr_inc modules, initC ──
+        mt0_idx, grinc_idx, initc_i = [], [], None
         for i, em in enumerate(em_list):
             lbl = getattr(em.source, 'label', None)
-            if em.opType == 'gr':
-                mt = getattr(em.source, 'mtIteration', None)
-                if mt == 0:
-                    mt0_idx.append(i)
-                elif mt == 1:
-                    mt1_idx.append(i)
+            if em.opType == 'gr' and getattr(em.source, 'mtIteration', None) == 0:
+                mt0_idx.append(i)
             elif em.opType == 'gr_inc':
                 grinc_idx.append(i)
             elif lbl == 'initC_overlap' and initc_i is None:
                 initc_i = i
-            elif em.opType == 'wait_gr' and initc_i is not None and waitgr_i is None:
-                waitgr_i = i
         if not mt0_idx or initc_i is None:
             return False
         region_start = mt0_idx[0]
-        # Extend region through MT1 GRs when clustering MT1 (stop before WaitGROp)
-        if mt1_idx and waitgr_i is not None:
-            region_end = waitgr_i - 1
-        else:
-            region_end = initc_i
+        region_end = initc_i  # inclusive; MT1 grs follow at initc_i+1
 
         # ── Extract MT0 atoms (split each module at m0-update boundaries) ──
         def _atomize(instrs):
@@ -3416,30 +3406,14 @@ class LogicalScheduler:
                 atoms.append(cur)
             return atoms
 
-        # MT0 atoms — skip phantom atoms (pre-load scalars with no buffer_load)
-        atoms = []
+        atoms = []  # list of (tensor, [instrs])
         for i in mt0_idx:
             t = getattr(em_list[i].source, 'tensor', '')
             for a in _atomize(list(em_list[i].instructions)):
-                if any(_is_load(inst) for inst in a):  # skip scalar-only phantoms
-                    atoms.append((t, a))
-        n_atoms    = len(atoms)
+                atoms.append((t, a))
+        n_atoms = len(atoms)
         n_clusters = (n_atoms + cluster_size - 1) // cluster_size
-        # One gap after EVERY MT0 cluster (including the last) — the gap after the
-        # last MT0 cluster acts as the trailing filler before MT1 starts.
-        n_gaps = n_clusters
-
-        # MT1 atoms — same cluster_size, same phantom filter
-        mt1_atoms = []
-        for i in mt1_idx:
-            t = getattr(em_list[i].source, 'tensor', '')
-            for a in _atomize(list(em_list[i].instructions)):
-                if any(_is_load(inst) for inst in a):
-                    mt1_atoms.append((t, a))
-        n_mt1_clusters = (len(mt1_atoms) + cluster_size - 1) // cluster_size if mt1_atoms else 0
-        # One gap after every MT1 cluster (last gap before WaitGR)
-        n_mt1_gaps   = n_mt1_clusters
-        n_total_gaps = n_gaps + n_mt1_gaps
+        n_gaps = max(0, n_clusters - 1)
 
         # ── SRD depop pool, per tensor ──
         srd_by_tensor = {}
@@ -3481,84 +3455,64 @@ class LogicalScheduler:
         # all clusters, still before MT1), which srd_leftover handles.
         window_open = {t: last_mt0_atom[t] // cluster_size for t in last_mt0_atom}
 
-        # ── Fill: SRDs into MT0 gaps, then equalize free pools across ALL gaps ──
-        gap_fill = [[] for _ in range(n_total_gaps)]  # MT0 gaps then MT1 gaps
-
-        # SRD depops into MT0 gaps per tensor window
+        # ── Greedy fill ──
+        gap_fill = [[] for _ in range(n_gaps)]
+        # SRD: place each tensor's whole group in the earliest legal gap of its window.
+        # Tensors whose window opens at/after n_gaps (last MT0 load in the final
+        # cluster, e.g. the scale tensors) are left in srd_by_tensor and emitted in
+        # the trailing block — placing them in any earlier gap would advance Srd{tc}
+        # before that tensor's own MT0 load reads it (wrong-address load).
         for t in self.tensors:
             grp = srd_by_tensor.get(t)
-            wo  = window_open.get(t, 0)
+            wo = window_open.get(t, 0)
             if grp and n_gaps > 0 and wo < n_gaps:
                 gap_fill[wo].extend(grp)
                 srd_by_tensor[t] = []
-
-        # Cycle-equalise free pools (LRA=1 cycle, MFMA=8 cycles) across all gaps.
-        # Gap 0 receives pinned (non-negotiable); its free-pool budget is reduced by
-        # the pinned cycle cost so every gap ends up at roughly the same total cycles.
-        pinned_cyc  = len(pinned)
-        free_cyc    = len(lra) + 8 * len(free_mfma)
-        if n_total_gaps > 0:
-            target_cyc  = (pinned_cyc + free_cyc + n_total_gaps - 1) // n_total_gaps
-            budgets     = [max(0, target_cyc - (pinned_cyc if g == 0 else 0))
-                           for g in range(n_total_gaps)]
-        else:
-            budgets = []
-
-        lra_pool  = list(lra);       lra[:]       = []
-        mfma_pool = list(free_mfma); free_mfma[:] = []
-        for g, budget in enumerate(budgets):
+        # Cycle budget for the free pools (LRA=1, MFMA=8, seed_out=1).
+        total_cycles = len(lra) + len(free_seed_out) + 8 * len(free_mfma)
+        if n_gaps > 0:
+            base, rem = divmod(total_cycles, n_gaps)
+        for g in range(n_gaps):
+            budget = base + (1 if g < rem else 0)
             if g == 0:
-                gap_fill[g] = pinned + gap_fill[g]
+                gap_fill[g] = pinned + gap_fill[g]  # pinned lead precedes all MFMA
                 pinned = []
-            # Fill gap: LRA first (1 cycle each), then MFMAs (8 cycles each)
-            while lra_pool and budget > 0:
-                gap_fill[g].append(lra_pool.pop(0)); budget -= 1
-            while mfma_pool and budget >= 8:
-                gap_fill[g].append(mfma_pool.pop(0)); budget -= 8
+            while lra and budget > 0:
+                gap_fill[g].append(lra.pop(0)); budget -= 1
+            while free_mfma and budget >= 8:
+                gap_fill[g].append(free_mfma.pop(0)); budget -= 8
+            while free_seed_out and budget > 0:
+                gap_fill[g].append(free_seed_out.pop(0)); budget -= 1
 
-        # Leftovers (unplaced SRDs for scale tensors, n_total_gaps==0 case)
+        # Leftovers (incl. the single-cluster n_gaps==0 case) → one trailing module
+        # emitted before the (now empty) initC, still ahead of MT1 grs so any
+        # unplaced SRD stays inside its window (window closes at first MT1 load).
         srd_leftover = [inst for t in self.tensors
                         for inst in (srd_by_tensor.get(t) or [])]
-        trailing = pinned + srd_leftover + mfma_pool + lra_pool + list(free_seed_out)
+        trailing = pinned + srd_leftover + list(free_mfma) + list(lra) + list(free_seed_out)
 
         # ── Rebuild the region in place ──
-        # Region spans: MT0 GRs + SRDs + initC + MT1 GRs (up to WaitGROp).
-        next_id  = max((em.moduleId for em in em_list), default=-1) + 1
+        next_id = max((em.moduleId for em in em_list), default=-1) + 1
         new_region = []
-
-        # MT0 clusters — one gap emitted after EVERY cluster (gap index = c)
         for c in range(n_clusters):
             chunk = atoms[c * cluster_size:(c + 1) * cluster_size]
+            cluster_instrs = [inst for (_t, a) in chunk for inst in a]
             new_region.append(EmittedModule(moduleId=next_id,
-                instructions=[inst for (_t, a) in chunk for inst in a], source=None))
+                                            instructions=cluster_instrs, source=None))
             next_id += 1
-            if gap_fill[c]:  # gap after every MT0 cluster, incl. the last
+            if c < n_gaps and gap_fill[c]:
                 new_region.append(EmittedModule(moduleId=next_id,
-                    instructions=gap_fill[c], source=None))
+                                                instructions=gap_fill[c], source=None))
                 next_id += 1
-
-        # SRD trailing (scale tensors whose window opens in the final MT0 cluster)
         if trailing:
             new_region.append(EmittedModule(moduleId=next_id,
-                instructions=trailing, source=None))
+                                            instructions=trailing, source=None))
             next_id += 1
-
-        # Emptied initC_overlap (split path asserts it exists)
+        # Keep the canonical initC_overlap module present (split asserts on it) but
+        # emptied on the fast path; its full content lives in _canonicalInitCInstrs.
         initc_mod = em_list[initc_i]
         initc_mod.instructions = []
         new_region.append(initc_mod)
-
-        # MT1 clusters — one gap emitted after EVERY cluster (gap index = n_gaps + c)
-        for c in range(n_mt1_clusters):
-            chunk = mt1_atoms[c * cluster_size:(c + 1) * cluster_size]
-            new_region.append(EmittedModule(moduleId=next_id,
-                instructions=[inst for (_t, a) in chunk for inst in a], source=None))
-            next_id += 1
-            mt1_gap = n_gaps + c
-            if mt1_gap < n_total_gaps and gap_fill[mt1_gap]:
-                new_region.append(EmittedModule(moduleId=next_id,
-                    instructions=gap_fill[mt1_gap], source=None))
-                next_id += 1
 
         em_list[region_start:region_end + 1] = new_region
         return True
