@@ -153,6 +153,7 @@ namespace TensileLite
 
                 iot::mapOptional(io, "activationFused", s.activationFused);
 
+                iot::mapOptional(io, "wgmBitSwizzle", s.wgmBitSwizzle);
                 iot::mapRequired(io, "workGroupMappingXCC", s.workGroupMappingXCC);
                 iot::mapRequired(io, "workGroupMappingXCCGroup", s.workGroupMappingXCCGroup);
 
