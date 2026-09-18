@@ -16946,87 +16946,6 @@ class KernelWriterAssembly(KernelWriter):
       module.add(VMulLOU32(dst=vgpr(vPermAddr), src0=vgpr(vPermAddr), src1=12*bpeDest,
                            comment="(lane_group&1)*12 rows = permlane16 row-byte delta"))
       self.states.subtileHoistedPermAddr = True
-    module.add(self.emitSubtileScalarStoreAddr(kernel, cvtVgprStruct))
-    return module
-
-  def emitSubtileScalarStoreAddr(self, kernel, cvtVgprStruct):
-    """Materialize the unpaired dwordx2 store's per-lane vaddr once per store.
-
-    Every term of that address -- the N-column offset, lane_group*8, the M
-    workgroup base and both wave offsets -- is a function of Serial and of SGPRs
-    that do not move across the store. The element only contributes the 12-bit
-    ``offset12`` immediate and the SrdD row increments, so one copy here serves
-    every store in the phase instead of ~18 ops (five of them v_mul_lo_u32) per
-    store. Only the fused arm routes elements through the unpaired store, so this
-    is emitted only there; the plain arm's orphan stores keep computing their own.
-    """
-    module = Module("SubtileScalarStoreAddr")
-    self.states.subtileHoistedScalarAddr = False
-    if not self.states.subtileFusedWeave:
-      return module
-    vAddr = getattr(cvtVgprStruct, "vgprScalarAddr", -1)
-    vLGDelta = getattr(cvtVgprStruct, "vgprLaneGroupDelta", -1)
-    if vAddr < 0 or vLGDelta < 0 or not self.states.subtileHoistedLaneGroupDelta:
-      return module
-    from .Components.GlobalWriteBatch import plsinScalarStoreActive
-    if not plsinScalarStoreActive(kernel):
-      return module
-
-    bpe       = self.states.bpeCexternalGSU1
-    packedC1  = kernel["PackedC1IndicesX"]
-    strideD1J = "StrideD%s" % self.states.indexChars[packedC1[0]]
-    ws        = kernel["WavefrontSize"]
-    miwg0     = kernel["MIWaveGroup"][0]
-    miwg1     = kernel["MIWaveGroup"][1]
-    if (miwg0 & (miwg0 - 1)) != 0:
-      return module
-    wsLog2 = int(log2(ws))
-    tmpV = cvtVgprStruct.vgprAddrScratch   # free until the first paired store, which this replaces
-    tmpS = self.sgprPool.checkOut(1, "plsinScalarStoreAddr")
-
-    module.addComment1("hoisted unpaired dwordx2 store vaddr (wave-invariant, once per store)")
-    module.add(VAndB32(dst=vgpr(vAddr), src0=15, src1=vgpr("Serial"),
-                       comment="col_in_wave = lane_id & 15  (N-column index)"))
-    module.add(VMulLOU32(dst=vgpr(tmpV), src0=vgpr(vAddr), src1=sgpr(strideD1J),
-                         comment="col_in_wave * StrideD1J"))
-    if bpe == 2:
-      module.add(VLShiftLeftB32(dst=vgpr(vAddr), shiftHex=1, src=vgpr(tmpV),
-                                comment="N_col_off = col_in_wave * StrideD1J * 2"))
-    else:
-      module.add(VMulLOU32(dst=vgpr(vAddr), src0=vgpr(tmpV), src1=bpe,
-                           comment="N_col_off = col_in_wave * StrideD1J * bpe"))
-    module.add(VAddU32(dst=vgpr(vAddr), src0=vgpr(vAddr), src1=vgpr(vLGDelta),
-                       comment="vaddr += LG_M_off (= vgprLaneGroupDelta)"))
-    module.add(SMulI32(dst=sgpr(tmpS), src0=sgpr("WorkGroup0"), src1=kernel["MacroTile0"]*bpe,
-                       comment="wg0_M_off = WorkGroup0 * MT0 * bpe"))
-    module.add(VAddU32(dst=vgpr(vAddr), src0=vgpr(vAddr), src1=sgpr(tmpS),
-                       comment="vaddr += wg0_M_off"))
-    if miwg0 > 1:
-      module.add(VLShiftRightB32(dst=vgpr(tmpV), shiftHex=wsLog2, src=vgpr("Serial"),
-                                 comment=f"waveId = Serial >> {wsLog2}"))
-      module.add(VAndB32(dst=vgpr(tmpV), src0=miwg0-1, src1=vgpr(tmpV),
-                         comment=f"waveId0 = waveId & {miwg0-1}"))
-      module.add(SMovB32(dst=sgpr(tmpS), src=kernel["MIWaveTile"][0]*kernel["MatrixInstM"]*bpe,
-                         comment="waveM_stride_bpe"))
-      module.add(VMulLOU32(dst=vgpr(tmpV), src0=vgpr(tmpV), src1=sgpr(tmpS),
-                           comment="wave_M_off = waveId0 * waveM_stride_bpe"))
-      module.add(VAddU32(dst=vgpr(vAddr), src0=vgpr(vAddr), src1=vgpr(tmpV),
-                         comment="vaddr += wave_M_off"))
-    if miwg1 > 1:
-      module.add(VLShiftRightB32(dst=vgpr(tmpV), shiftHex=wsLog2, src=vgpr("Serial"),
-                                 comment=f"waveId = Serial >> {wsLog2}"))
-      module.add(VLShiftRightB32(dst=vgpr(tmpV), shiftHex=int(log2(miwg0)), src=vgpr(tmpV),
-                                 comment=f"waveId1 = waveId / {miwg0}"))
-      module.add(SMovB32(dst=sgpr(tmpS), src=kernel["MIWaveTile"][1]*kernel["MatrixInstN"]*bpe,
-                         comment="waveN_stride_bpe"))
-      module.add(VMulLOU32(dst=vgpr(tmpV), src0=vgpr(tmpV), src1=sgpr(tmpS),
-                           comment="waveId1 * waveN_stride_bpe"))
-      module.add(VMulLOU32(dst=vgpr(tmpV), src0=vgpr(tmpV), src1=sgpr(strideD1J),
-                           comment="wave_N_off = waveId1 * waveN_stride_bpe * StrideD1J"))
-      module.add(VAddU32(dst=vgpr(vAddr), src0=vgpr(vAddr), src1=vgpr(tmpV),
-                         comment="vaddr += wave_N_off"))
-    self.sgprPool.checkIn(tmpS)
-    self.states.subtileHoistedScalarAddr = True
     return module
 
   def _plsinFusedSkipBias(self, kernel):
@@ -18506,7 +18425,6 @@ class KernelWriterAssembly(KernelWriter):
 
       cvtVgprStruct  = None
       cvtVgpr        = None
-      pairRing       = -1
       # No hoisted lane math until emitSubtileStoreLaneMath below says otherwise; a
       # stale True would make batches skip a computation that never ran.
       self.states.subtileHoistedLaneGroupDelta = False
@@ -18581,16 +18499,7 @@ class KernelWriterAssembly(KernelWriter):
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
                                                vgprLaneGroupDelta=(cvtVgpr+5) if kernel.get("UseSubtileImpl") else -1, \
-                                               vgprAddrScratch=(cvtVgpr+6) if kernel.get("UseSubtileImpl") else -1, \
-                                               vgprScalarAddr=(cvtVgpr+7) if scalarStore else -1, \
-                                               vgprScalarPackRing=(cvtVgpr+8) if scalarStore else -1, \
-                                               numScalarPackPairs=packPairs, \
-                                               vgprPairPackRing=pairRing, \
-                                               numPairPackQuads=pairQuads, \
-                                               vgprColPackB=(cvtVgpr+col128Base) if col128Base >= 0 else -1, \
-                                               vgprColMergeTmp=(cvtVgpr+col128Base+4) if col128Base >= 0 else -1, \
-                                               vgprColAddrQ=(cvtVgpr+col128Base+5) if col128Base >= 0 else -1, \
-                                               vgprColAddrR=(cvtVgpr+col128Base+6) if col128Base >= 0 else -1)
+                                               vgprAddrScratch=(cvtVgpr+6) if kernel.get("UseSubtileImpl") else -1)
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
@@ -18836,8 +18745,6 @@ class KernelWriterAssembly(KernelWriter):
       self.vgprPool.checkIn(tmpVgpr.idx)
       if cvtVgpr is not None:
         self.vgprPool.checkIn(cvtVgpr)
-        if pairRing >= 0:
-          self.vgprPool.checkIn(pairRing)
       # The hoisted values die with the cvtVgpr block.
       self.states.subtileHoistedLaneGroupDelta = False
       self.states.subtileHoistedPermAddr = False

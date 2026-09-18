@@ -3067,59 +3067,6 @@ class GlobalWriteBatchWriter:
 
     return module
 
-  # DPP row_ror:8 rotates within each 16-lane row, so it exchanges lanes m and
-  # m^8. bank_mask gates which banks of 4 lanes are written; the rest of the
-  # destination keeps its old value, which is what makes the merge in-place.
-  _COL128_ROR8     = 8
-  _COL128_ROW_ALL  = 0xf
-  _COL128_BANK_HI8 = 0xc   # banks 2,3 -> lanes 8-15 of each row
-  _COL128_BANK_LO8 = 0x3   # banks 0,1 -> lanes 0-7  of each row
-
-  def _emitSubtileColumnMerge(self, vPackA: int, vPackB: int, vTmp: int) -> Module:
-    """Re-split two M-adjacent paired-store payloads into 128B column runs.
-
-    On entry vPackA holds the store at MUBUF offset 0 and vPackB the one at
-    offset 64, so between them they hold 16 columns x 128B but each covers only
-    64B of any single column. On exit vPackA holds columns 0-7 and vPackB holds
-    columns 8-15, each with the full 128B run, so one store fills an L2 line
-    instead of half of one.
-
-    Writing P0 for the entry vPackA and P1 for the entry vPackB, the split is
-
-      vPackA[m] = P0[m]        if (m&15) < 8, else P1[m^8]     (columns 0-7)
-      vPackB[m] = P0[m^8]      if (m&15) < 8, else P1[m]       (columns 8-15)
-
-    Both halves are the same lane-XOR-8 exchange, and 8 == 16/2 makes that a
-    ``row_ror:8`` inside the DPP row. The two bank masks are complementary, so
-    each destination takes the rotated operand in exactly the lanes the other
-    one keeps. vTmp holds P0 across the first write, which overwrites it.
-
-    Verified against the emitted lane mapping and on gfx950 hardware; see
-    ~/data/0922/store-coalescing/{verify_merge.py,dpp_merge_test.cpp}.
-
-    Args:
-      vPackA: Base VGPR of the offset-0 quad (2-aligned); becomes columns 0-7.
-      vPackB: Base VGPR of the offset-64 quad (2-aligned); becomes columns 8-15.
-      vTmp:   One scratch VGPR, dead on return.
-
-    Returns:
-      Module of 12 VALU (3 per dword), no LDS traffic and no waitcnt.
-    """
-    module = Module("SubtileColumnMerge")
-    module.addComment1("column merge: 2 x (16 cols x 64B) -> 2 x (8 cols x 128B)")
-    hi8 = DPPModifiers(row_ror=self._COL128_ROR8, row_mask=self._COL128_ROW_ALL,
-                       bank_mask=self._COL128_BANK_HI8)
-    lo8 = DPPModifiers(row_ror=self._COL128_ROR8, row_mask=self._COL128_ROW_ALL,
-                       bank_mask=self._COL128_BANK_LO8)
-    for k in range(4):
-      module.add(VMovB32(dst=vgpr(vTmp), src=vgpr(vPackA+k),
-                         comment=f"save P0 dword {k} (vPackA is about to be overwritten)"))
-      module.add(VMovB32(dst=vgpr(vPackA+k), src=vgpr(vPackB+k), dpp=hi8,
-                         comment=f"cols 0-7 dword {k}: lanes 8-15 <- P1[m^8]"))
-      module.add(VMovB32(dst=vgpr(vPackB+k), src=vgpr(vTmp), dpp=lo8,
-                         comment=f"cols 8-15 dword {k}: lanes 0-7 <- P0[m^8]"))
-    return module
-
   def _pairedStoreClobbersBf16Consts(self):
     """True when the paired dwordx4 store overwrites the bf16 software-rounding
     constants before anything can read them, so emitting them is pure waste.
