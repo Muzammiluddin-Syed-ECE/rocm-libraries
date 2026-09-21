@@ -124,6 +124,7 @@ def getRequiredParametersMin() -> set:
         'SourceSwap',
         'UseDualFMAC',
         'WGMBitSwizzle',
+        'DPPStoreFold',
         'SpaceFillingAlgo',
         'StorePriorityOpt',
         'StoreRemapVectorWidth',

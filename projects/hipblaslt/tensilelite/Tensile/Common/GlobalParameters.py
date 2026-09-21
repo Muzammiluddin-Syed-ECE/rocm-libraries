@@ -616,6 +616,7 @@ defaultBenchmarkCommonParameters = [
     {"ReuseAcrossPersistent": [0]},
     {"UseCustomMainLoopSchedule": [-1]},
     {"WGMBitSwizzle": [False]},
+    {"DPPStoreFold": [False]},
     {"SpaceFillingAlgo": [[]]},
     {"SFCWGM": [[[1,1],[1,1]]]},
     {"AdaptiveGemm": [0]},
