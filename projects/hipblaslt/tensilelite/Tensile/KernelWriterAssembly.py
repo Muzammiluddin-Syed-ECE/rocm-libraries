@@ -17763,18 +17763,10 @@ class KernelWriterAssembly(KernelWriter):
     vgprPermAddr: int = -1        # per-lane ds_bpermute byte address (partner_lane*4); constant for the whole batch
     vgprLaneGroupDelta: int = -1  # per-lane lane_group*8: M-row byte offset added to addrDVgpr for the dwordx4 store
     vgprAddrScratch: int = -1     # per-store scratch: holds (addrDVgpr scaled + lane_group*8) without modifying addrDVgpr
-    vgprScalarAddr: int = -1      # hoisted per-lane vaddr for the unpaired dwordx2 store; wave-invariant, one copy per store
-    vgprScalarPackRing: int = -1  # base of the unpaired-store pack ring (numScalarPackPairs 2-vgpr pairs)
-    numScalarPackPairs: int = 1   # pairs in that ring; 1 serialises every store on one pair
-    vgprPairPackRing: int = -1    # base of the paired-store pack ring (numPairPackQuads 4-vgpr quads)
-    numPairPackQuads: int = 1     # quads in that ring; 1 puts every paired store on vgprBf16Temp
-    # 128B-column merge (plsinStoreCol128Active): the offset-0 pair packs into the
-    # +0..+3 quad as usual and the offset-64 pair into this second quad, so both are
-    # live when _emitSubtileColumnMerge re-splits them by column.
-    vgprColPackB: int = -1        # 2-aligned second pack quad (+0..+3) for the offset-64 paired store
-    vgprColMergeTmp: int = -1     # holds P0 across the merge's first (overwriting) write
-    vgprColAddrQ: int = -1        # vaddr for the columns 0-7 store
-    vgprColAddrR: int = -1        # vaddr for the columns 8-15 store, one N-column past Q
+    vgprBf16Temp2: int = -1       # second 4-VGPR scratch window (+8..+11, 2-aligned) for DPP store-repack: batchB packed dwords
+    vgprStoreData: int = -1       # 4-VGPR store-src (+12..+15, 2-aligned) for DPP store-repack: blended per-store data
+    vgprVoff: int = -1            # 1-VGPR (+16) for DPP store-repack: per-store voffset (cndmask result)
+    vgprBlendTmp: int = -1        # 1-VGPR (+17) shared scratch: odd-batchB data temp AND store-2 even-addr temp (disjoint use)
 
   class FP8CVTVgprStruct(NamedTuple):
     vgprFp8NanInf: int = -1
@@ -18446,60 +18438,68 @@ class KernelWriterAssembly(KernelWriter):
         #   +4: vgprPermAddr       — ds_permute partner-lane byte address
         #   +5: vgprLaneGroupDelta — lane_group*8, pre-computed once per batch
         #   +6: vgprAddrScratch    — per-store adjusted D address; avoids modifying addrDVgpr
-        #   +7: vgprScalarAddr     — hoisted vaddr for the unpaired dwordx2 store
-        #        (only allocated when that store is in use, so the paired path's
-        #         register footprint is unchanged)
-        #   +8..: vgprScalarPackRing — additional dwordx2 pack pairs. With a single
-        #        pair every store waits for the previous store to read it before its
-        #        pack may run, so the stores cannot overlap each other; rotating a
-        #        ring of pairs lets several be in flight (the reference FlyDSL kernel
-        #        rotates 8). TENSILE_PLSIN_DEBUG="TENSILE_PLSIN_STORE_PAIRS=n".
-        #   +col..+col+3: vgprColPackB — second pack quad for the 128B-column merge,
-        #        2-aligned for its own buffer_store_dwordx4. +col+4 is the merge temp
-        #        and +col+5 the columns-8-15 vaddr. Costs 6 vgprs over the 64B-run
-        #        store, which is why it is gated rather than unconditional.
-        from .Components.GlobalWriteBatch import plsinScalarStoreActive, plsinStoreCol128Active, \
-                                                 plsinStorePermlane16Active
-        scalarStore = plsinScalarStoreActive(kernel)
-        packPairs   = max(1, int(plsinDebugEnv("TENSILE_PLSIN_STORE_PAIRS", "4"))) if scalarStore else 1
-        numCvtVgprs = (8 + 2 * packPairs if scalarStore else 7) \
-                      if kernel.get("UseSubtileImpl") else 4
-        col128Base  = -1
-        if kernel.get("UseSubtileImpl") and \
-           plsinStoreCol128Active(kernel, True if self.states.subtileFusedFullTileStore else None):
-          col128Base  = (numCvtVgprs + 1) & ~1   # 2-align the second pack quad
-          numCvtVgprs = col128Base + 7
-        # Paired-store pack ring. On one quad every paired store's v_cvt_pk must wait
-        # for the previous store to latch that same quad, so no two paired stores can
-        # be in flight and none can be hoisted away from its own buffer_store -- all 32
-        # stores of an MT256x256 epilogue name vPack in the trace. Rotating quads
-        # removes that dependence. The merge path packs an M-adjacent pair into two
-        # named quads at once, so it keeps the single buffer.
-        # Held in its own allocation rather than appended to the cvt block: growing
-        # that block moves the slots after it and shifts the store batching, which
-        # dropped the paired dwordx4 store for the unpaired pair and miscompared.
-        pairQuads = 1
-        # plsinBlockSchedTile, not UseSubtileImpl alone: the ring is the only part
-        # of this store that spends registers, and permlane16 reaches every gfx950
-        # MI16 subtile kernel, including bf16-input ones whose accumulators already
-        # fill the VGPR file. Four more registers there push ValuC past the 256 cap
-        # and the kernel fails to assemble.
-        if kernel.get("UseSubtileImpl") and col128Base < 0 and plsinBlockSchedTile(kernel) and \
-           plsinStorePermlane16Active(kernel, True if self.states.subtileFusedFullTileStore else None):
-          pairQuads = max(1, int(plsinDebugEnv("TENSILE_PLSIN_STORE_QUADS", "2")))
+        # DPP store-repack (SubtileStoreCachelineFill) needs 11 extra scratch VGPRs
+        # (+7 pad, +8..+11 batchB pack, +12..+15 blended store src, +16 voffset, +17 blend
+        # temp).  The backward fold needs >=2 M-subtile paired stores to fold a pair, i.e.
+        # MIWaveTile[0] >= 4 (MIWaveTile[0]/2 pairs; odd counts leave one pair unfolded).
+        # The per-lane store layout is fixed by the MI16 + permlane16 shuffle and is
+        # independent of MIWaveTile, so the same quad_perm blend is correct for every
+        # config (roc_kernel_tracer-verified on MIWaveTile[0]==8, byte-exact).
+        #
+        # VGPR envelope: these subtile kernels run at the occupancy-1 256-VGPR cap, so the
+        # +11 has almost no headroom.  MIWaveTile[0]==8 is the proven case -- the whole
+        # F4BS library builds with it -- so it is always allowed.  For other MIWaveTile[0]
+        # the +11 can push the store epilogue past 256 (assemble-time "register index out
+        # of range"), so take it only when the live VGPR pool at the store still has room
+        # for the full 18-wide block plus a small margin for the windows allocated after it.
+        # Kernels without headroom keep the baseline 7-VGPR allocation and skip the fold.
+        # VGPR headroom: the fold's true cost is NOT just the +11 cvt scratch -- it also
+        # holds BOTH the batchA and batchB packed data (and their accvgpr-read windows) live
+        # at once to blend them, which the un-folded store never does.  So reusing a freed
+        # scratch hole is not enough: near-cap tiles still overflow on the ValuC read window
+        # (observed: v[vgprValuC+252..255] / buffer_store v[256:259] on a MIWaveTile[0]=4
+        # SwizzleB tile).  Gate conservatively on the live high-water plus a margin for that
+        # extra window; MIWaveTile[0]==8 is the proven case and always allowed.  Kernels
+        # without headroom keep the baseline 7-VGPR allocation and skip the fold.
+        # Stage 4: the fold reuses batchA's now-dead ValuC accumulator slots for the batchB
+        # pack (vPack2) and the blended store src (vSD) -- see _emit16bitSubtilePairedStoreRepack.
+        # For subtile kernels the whole ValuC block is pool-RESERVED (the "add ValuC back as
+        # available" below at defineAndResources is skipped for UseSubtileImpl), so those slots
+        # are conservatively held, not live; reusing the batchA pair's slots after they are
+        # packed costs no fresh high-water.  That leaves only 9 cvt VGPRs to allocate:
+        #   +0..3 vPack (batchA packed; also the baseline bf16 cvt temp)
+        #   +4    vPermAddr (loop-invariant row-delta / bpermute addr)
+        #   +5    vLGDelta  (loop-invariant row-delta)
+        #   +6    vAddrScratch (per-store base addr)
+        #   +7    vVoff  (per-store voffset)
+        #   +8    vBlend (per-store temp)
+        # 9 vs the old 17 (which allocated vPack2/vSD on top): the 8-VGPR drop is what lets
+        # the self-tuning gate admit the near-cap tiles that used to overflow.
+        # With ValuC-slot reuse the fold's only fresh allocation is the 9-VGPR cvt block
+        # (vPack2/vSD live in reserved ValuC, not on top), so the peak grows by just 9 -- no
+        # margin for post-cvt store windows is needed.
+        miwt = kernel.get("MIWaveTile", [0, 0])
+        maxVgpr = self.states.regCaps["MaxVgpr"]
+        foldFits = (self.vgprPool.size() + 9) <= maxVgpr
+        isSubtileFold = (kernel.get("UseSubtileImpl")
+                         and len(miwt) >= 2 and miwt[0] >= 4
+                         and (miwt[0] == 8 or foldFits))
+        numCvtVgprs = 9 if isSubtileFold else (7 if kernel.get("UseSubtileImpl") else 4)
         cvtAlign    = 2 if kernel.get("UseSubtileImpl") else 1
         cvtVgpr = self.vgprPool.checkOutAligned(numCvtVgprs, cvtAlign, tag="globalWriteElements_cvtVgpr")
-        # Slot 0 of the ring is the cvt block's own quad, which the paired store
-        # already uses, so only the extra slots are checked out. Every register
-        # taken here comes off numElementsPerBatch, and that has a hard floor at
-        # MIWaveTile[0] -- see the note in _pairPackQuad.
-        pairRing = self.vgprPool.checkOutAligned(4 * (pairQuads - 1), 2, tag="subtilePairPackRing") \
-                   if pairQuads > 1 else -1
+        # vgprBf16Temp2/vgprStoreData (the batchB pack + store src) are NOT cvt-allocated under
+        # the fold -- the repack places them in batchA's dead ValuC slots.  vgprStoreData is
+        # set to cvtVgpr (>=0) purely so the caller's `vgprStoreData >= 0` fold-enable check
+        # holds; the repack does not read it.
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
                                                vgprLaneGroupDelta=(cvtVgpr+5) if kernel.get("UseSubtileImpl") else -1, \
-                                               vgprAddrScratch=(cvtVgpr+6) if kernel.get("UseSubtileImpl") else -1)
+                                               vgprAddrScratch=(cvtVgpr+6) if kernel.get("UseSubtileImpl") else -1, \
+                                               vgprBf16Temp2=-1, \
+                                               vgprStoreData=(cvtVgpr) if isSubtileFold else -1, \
+                                               vgprVoff=(cvtVgpr+7)      if isSubtileFold else -1, \
+                                               vgprBlendTmp=(cvtVgpr+8)  if isSubtileFold else -1)
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
