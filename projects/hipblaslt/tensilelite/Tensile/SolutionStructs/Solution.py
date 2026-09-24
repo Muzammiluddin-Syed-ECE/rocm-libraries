@@ -150,7 +150,8 @@ def _deriveAndValidateMXScaleLayoutAndTransport(state, asmCaps, archCaps, printR
       state["MXScaleFormat"] = "NoSwizzle"
 
   # Cap guard: any swizzled format requires HasMXScaleSwizzle.
-  if state["MXScaleFormat"] in ("InMemorySwizzle", "HostPreSwizzle") and not hasMxSwizCap:
+  if state["MXScaleFormat"] in ("InMemorySwizzle", "HostPreSwizzle",
+                                "LaneContiguousGFX950") and not hasMxSwizCap:
     reject(state, printRejectionReason,
            "MXScaleFormat=%s requires archCaps.HasMXScaleSwizzle" % state["MXScaleFormat"])
     return False
@@ -171,6 +172,15 @@ def _deriveAndValidateMXScaleLayoutAndTransport(state, asmCaps, archCaps, printR
       reject(state, printRejectionReason,
              "MXScaleFormat=HostPreSwizzle is only implemented on the gfx950 host pipeline")
       return False
+    if state["MXScaleFormat"] == "LaneContiguousGFX950":
+      if state["MXLoadInst"] != "BufferLoad":
+        reject(state, printRejectionReason,
+               "MXScaleFormat=LaneContiguousGFX950 requires MXLoadInst=BufferLoad")
+        return False
+      if not isGfx950:
+        reject(state, printRejectionReason,
+               "MXScaleFormat=LaneContiguousGFX950 is only implemented on gfx950")
+        return False
     if state["MXLoadInst"] == "TDM" and state["MXScaleFormat"] != "InMemorySwizzle":
       reject(state, printRejectionReason,
              "MXLoadInst=TDM currently always produces MXScaleFormat=InMemorySwizzle "
@@ -241,6 +251,58 @@ def _validateSubtileGRKPartition(state, printRejectionReason):
              % (tc, loadRatioGR, localSubtileGrid, localSubtileGrid[0]))
       return False
   return True
+
+
+def _validateSubtileUnifiedKSchedule(state, printRejectionReason):
+  if not state.get("SubtileUnifiedKSchedule", 0):
+    return True
+  dtypeA = state["ProblemType"]["DataTypeA"]
+  numSubIterK = 1 if dtypeA.is8bitFloat() else 2
+  requirements = (
+      tuple(state["ISA"]) == (9, 5, 0)
+      and state.get("UseSubtileImpl", False)
+      and state.get("SourceSwap", False)
+      and state.get("PrefetchGlobalRead") == 2
+      and numSubIterK == 2
+      and list(state.get("MIWaveTile", [])) == [8, 8]
+  )
+  if requirements:
+    return True
+  reject(
+      state, printRejectionReason,
+      "SubtileUnifiedKSchedule requires gfx950, UseSubtileImpl=1, "
+      "SourceSwap=1, numPartitions=1, numSubIterK=2, PGR2, and "
+      "MIWaveTile 8x8")
+  return False
+
+
+def _validateSubtileNativeWholeLoopScheduler(state, printRejectionReason):
+  if not state.get("SubtileNativeWholeLoopScheduler", 0):
+    return True
+  dtypeA = state["ProblemType"]["DataTypeA"]
+  numSubIterK = 1 if dtypeA.is8bitFloat() else 2
+  requirements = (
+      tuple(state["ISA"]) == (9, 5, 0)
+      and state.get("UseSubtileImpl", False)
+      and state.get("SourceSwap", False)
+      and state.get("PrefetchGlobalRead") == 2
+      and numSubIterK == 2
+      and list(state.get("MIWaveTile", [])) == [8, 8]
+      and state.get("StreamK", 0) == 0
+      and not state.get("PrefetchAcrossPersistent", False)
+      and not state.get("SubtileUnifiedKSchedule", 0)
+      and state.get("SubtileRollingPeel", 0)
+      and state.get("SubtileStoreInNLL", 0)
+  )
+  if requirements:
+    return True
+  reject(
+      state, printRejectionReason,
+      "SubtileNativeWholeLoopScheduler requires gfx950, UseSubtileImpl=1, "
+      "SourceSwap=1, numPartitions=1, numSubIterK=2, PGR2, MIWaveTile 8x8, "
+      "StreamK=0, PAP=0, SubtileUnifiedKSchedule=0, SubtileRollingPeel=1, "
+      "and SubtileStoreInNLL=1")
+  return False
 
 
 def _validateStreamKForceDPOnly(state, printRejectionReason):
@@ -1140,6 +1202,8 @@ class Solution(collections.abc.Mapping):
     storeInNLLReason = subtileStoreInNLLRejectionReason(state)
     if storeInNLLReason is not None:
       reject(state, printRejectionReason, storeInNLLReason)
+    _validateSubtileUnifiedKSchedule(state, printRejectionReason)
+    _validateSubtileNativeWholeLoopScheduler(state, printRejectionReason)
 
     state["Multicast"] = False
     state["ClusterBarrier"] = False
@@ -2630,6 +2694,68 @@ class Solution(collections.abc.Mapping):
       state["VectorWidthMXSB"] = state["VectorWidthB"]
       state["MIWaveTileMXSB"] = state["MIWaveTileB"]
       state["UnrollMajorLDSMXSB"] = state["UnrollMajorLDSB"]
+
+    if state.get("SubtileDirectToVgprScale", 0):
+      pt = state["ProblemType"]
+      laneContiguous = state.get("MXScaleFormat") == "LaneContiguousGFX950"
+      supported = (
+        tuple(state["ISA"]) == (9, 5, 0)
+        and state["UseSubtileImpl"]
+        and state["SourceSwap"]
+        and pt["MXBlockA"] == 32 and pt["MXBlockB"] == 32
+        and pt["DataTypeA"].isFloat4() and pt["DataTypeB"].isFloat4()
+        and state["VectorWidthA"] == 8 and state["VectorWidthB"] == 8
+        and state["PrefetchGlobalRead"] == 2
+        and state["MIWaveTile"] == [8, 8]
+      )
+      if laneContiguous:
+        supported = (
+          supported
+          and int(state["SubtileDirectToVgprScale"]) == 3
+          and state["MXLoadInst"] == "BufferLoad"
+          and state["SourceSwap"]
+          and state["MacroTile0"] == 256 and state["MacroTile1"] == 256
+          and state["MIWaveGroup"] == [2, 2]
+          and state["DepthU"] == 256
+          and state["MatrixInstM"] == 16 and state["MatrixInstN"] == 16
+          and state["MatrixInstK"] == 128
+          and state["GlobalSplitU"] == 1
+          and state["StreamK"] == 0
+          and not pt["TLUA"] and not pt["TLUB"]
+        )
+      if not supported:
+        reject(state, printRejectionReason,
+               "SubtileDirectToVgprScale is restricted to the gfx950 "
+               "UseSubtileImpl SourceSwap FP4 MX32 VW8 PGR2 MIWaveTile 8x8 kernel")
+        return
+      if not laneContiguous:
+        reject(state, printRejectionReason,
+               "SubtileDirectToVgprScale requires "
+               "MXScaleFormat=LaneContiguousGFX950")
+        return
+      # The ordinary MX derivation above copies these flags from A/B. Override
+      # only selected tensors after the copy; unselected tensors retain the
+      # ordinary DTL/LDS fallback metadata.
+      directScaleMask = int(state["SubtileDirectToVgprScale"])
+      for bit, tc in ((1, "MXSA"), (2, "MXSB")):
+        if directScaleMask & bit:
+          state["DirectToVgpr%s" % tc] = True
+          state["DirectToLds%s" % tc] = False
+          state["LocalWriteUseSgpr%s" % tc] = False
+
+    if state.get("MXScaleFormat") == "LaneContiguousGFX950" \
+       and int(state.get("SubtileDirectToVgprScale", 0)) != 3:
+      reject(state, printRejectionReason,
+             "MXScaleFormat=LaneContiguousGFX950 requires "
+             "SubtileDirectToVgprScale=3")
+      return
+
+    if state.get("SubtileDirectScaleDeferredWait", 0) \
+       and not (int(state.get("SubtileDirectToVgprScale", 0)) & 2):
+      reject(state, printRejectionReason,
+             "SubtileDirectScaleDeferredWait requires MXSB direct scale "
+             "(SubtileDirectToVgprScale bit 2)")
+      return
 
     if state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"]:
       if state["ProblemType"]["MXBlockA"]:

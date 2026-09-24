@@ -5,9 +5,10 @@
 
 enum class MXScaleLayout
 {
-    None    = 0,
-    GFX950  = 1,
-    GFX1250 = 2,
+    None                 = 0,
+    GFX950               = 1,
+    GFX1250              = 2,
+    LaneContiguousGFX950 = 3,
 };
 
 #include "hipblaslt_scaling_format.hpp"
@@ -56,6 +57,17 @@ void restrideMXScaleBufferKFast(uint8_t* buffer,
                                 size_t   compactKBlocks,
                                 size_t   paddedKBlocks,
                                 size_t   elemBytes);
+
+// Pack canonical row-major [freeDim][kBlocks] UE8M0 scales into the
+// lane-contiguous records consumed by the focused gfx950 SS1 kernel.
+// Each 128-row x 8-K-block tile becomes 64 lanes x four dwords.
+size_t packedMXScaleLaneContiguousGFX950Size(size_t freeDim, size_t kBlocks);
+
+std::vector<uint8_t>
+    packMXScaleLaneContiguousGFX950(std::vector<uint8_t> const& canonical,
+                                    size_t                      freeDim,
+                                    size_t                      kBlocks,
+                                    bool                        isMatrixA);
 
 void applyMXScaleLayoutInPlace(uint8_t*      scale,
                                size_t        scaleElemCount,

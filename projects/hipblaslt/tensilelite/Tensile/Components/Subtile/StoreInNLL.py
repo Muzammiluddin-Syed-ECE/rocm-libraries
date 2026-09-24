@@ -9,23 +9,96 @@ import re
 from typing import Any, Iterable, List, Optional
 
 from rocisa.code import Label, Module
-from rocisa.container import MUBUFModifiers, VOP3PModifiers, accvgpr, sgpr, vgpr
+from rocisa.container import MUBUFModifiers, VCC, VOP3PModifiers, accvgpr, sgpr, vgpr
 from rocisa.instruction import (
     BufferStoreB128,
+    BufferStoreB64,
     SBranch,
     SCBranchSCC0,
     SCmpEQU32,
     VAccvgprReadB32,
+    VAndB32,
+    VCmpEQU32,
+    VCndMaskB32,
     VCvtPkF32toBF16,
     VAddU32,
     VAddLShiftLeftU32,
     VLShiftLeftB32,
+    VLShiftRightB32,
     VMovB32,
+    VMadU32U24,
     VMulPKF32,
     VMulLOU32,
+    VPermlane16SwapB32,
+    VSubU32,
 )
 
 _MFMA_TILE_RE = re.compile(r"MFMA C\[(\d+),(\d+)\]")
+
+
+def subtileFlyStorePacketGeometryRejectionReason(state: dict) -> Optional[str]:
+    """Return why the focused Fly store geometry is inadmissible."""
+    if not state.get("SubtileFlyStorePacketGeometry", 0):
+        return None
+    checks = (
+        (tuple(state.get("ISA", ())) == (9, 5, 0),
+         "SubtileFlyStorePacketGeometry requires gfx950"),
+        (state.get("UseSubtileImpl", False),
+         "SubtileFlyStorePacketGeometry requires UseSubtileImpl=1"),
+        (state.get("SourceSwap", False),
+         "SubtileFlyStorePacketGeometry requires SourceSwap=1"),
+        (state.get("SubtileStoreInNLL", 0),
+         "SubtileFlyStorePacketGeometry requires SubtileStoreInNLL=1"),
+        (state.get("SubtileRollingPeel", 0),
+         "SubtileFlyStorePacketGeometry requires SubtileRollingPeel=1"),
+        (state.get("SubtileFlyNMajor", 0),
+         "SubtileFlyStorePacketGeometry requires SubtileFlyNMajor=1"),
+        (state.get("MacroTile0") == 256 and state.get("MacroTile1") == 256,
+         "SubtileFlyStorePacketGeometry requires MacroTile=256x256"),
+        (state.get("DepthU", state.get("_DepthUA")) == 256,
+         "SubtileFlyStorePacketGeometry requires DepthU=256"),
+        (state.get("MatrixInstM") == 16 and state.get("MatrixInstK") == 128,
+         "SubtileFlyStorePacketGeometry requires MI16x16x128"),
+        (state.get("MIWaveGroup") == [2, 2],
+         "SubtileFlyStorePacketGeometry requires MIWaveGroup=[2,2]"),
+        (state.get("MIWaveTile") == [8, 8],
+         "SubtileFlyStorePacketGeometry requires MIWaveTile=[8,8]"),
+    )
+    for accepted, reason in checks:
+        if not accepted:
+            return reason
+    return None
+
+
+def flyStorePacketGeometryEnabled(kernel: dict) -> bool:
+    """Validate and return the target-only Fly store packet gate."""
+    reason = subtileFlyStorePacketGeometryRejectionReason(kernel)
+    if reason is not None:
+        raise ValueError(reason)
+    return bool(kernel.get("SubtileFlyStorePacketGeometry", 0))
+
+
+def flyStorePacketCoordinates(
+        wave_id: int, lane: int, tile_n: int, sl: int,
+        component: int) -> list:
+    """Return the four C coordinates carried by one Fly dwordx2 store.
+
+    The two M waves own alternating 64-row quarters.  ``sl`` selects the
+    128-row second half, while the lane's low four bits select a four-row
+    packet.  The N wave owns one 128-column half; ``tile_n`` and the lane
+    group select its 16- and four-column subdivisions.
+    """
+    values = (wave_id, lane, tile_n, sl, component)
+    limits = (4, 64, 8, 2, 4)
+    assert all(0 <= int(value) < limit
+               for value, limit in zip(values, limits))
+    lane16 = lane & 15
+    lane_group = lane >> 4
+    wave_m = wave_id & 1
+    wave_n = wave_id >> 1
+    m_base = wave_m * 64 + sl * 128 + lane16 * 4
+    n = wave_n * 128 + tile_n * 16 + lane_group * 4 + component
+    return [(m_base + ji, n) for ji in range(4)]
 
 
 def subtileStoreInNLLRejectionReason(state: dict) -> Optional[str]:
@@ -67,6 +140,9 @@ def subtileStoreInNLLRejectionReason(state: dict) -> Optional[str]:
     for accepted, reason in checks:
         if not accepted:
             return reason
+    fly_reason = subtileFlyStorePacketGeometryRejectionReason(state)
+    if fly_reason is not None:
+        return fly_reason
     return None
 
 
@@ -130,34 +206,137 @@ def emitSubtileStoreInNLLAddressInit(writer, kernel) -> Module:
     module = Module("SubtileStoreInNLLAddressInit")
     if hasattr(writer.states, "subtileStoreInNLLVaddr"):
         return module
+    fly_packets = bool(kernel.get("SubtileFlyStorePacketGeometry", 0))
+    if fly_packets:
+        flyStorePacketGeometryEnabled(kernel)
 
-    vaddr = writer.vgprPool.checkOut(1, "subtileStoreInNLLVaddr")
-    data = writer.vgprPool.checkOutAligned(16, 4, "subtileStoreInNLLData")
-    stride = writer.vgprPool.checkOut(1, "subtileStoreInNLLStride")
+    # Keep the lane base plus two alternating four-address banks.  Eight
+    # packed dwordx2 packets likewise alternate across two four-packet banks.
+    vaddr = writer.vgprPool.checkOut(9, "subtileStoreInNLLVaddr")
+    data = writer.vgprPool.checkOutAligned(18, 2, "subtileStoreInNLLData")
+    stride = writer.vgprPool.checkOut(4, "subtileStoreInNLLStride")
     alpha = writer.vgprPool.checkOutAligned(2, 2, "subtileStoreInNLLAlpha")
     writer.states.subtileStoreInNLLVaddr = vaddr
     writer.states.subtileStoreInNLLData = data
     writer.states.subtileStoreInNLLStride = stride
+    writer.states.subtileStoreInNLLStride8 = stride + 1
+    writer.states.subtileStoreInNLLStride32 = stride + 2
+    writer.states.subtileStoreInNLLLaneGroupOdd = stride + 3
     writer.states.subtileStoreInNLLAlpha = alpha
+    if fly_packets:
+        writer.states.subtileStoreInNLLSecondHalfOffset = 256
+        module.addComment0(
+            "Fly store packets: second accumulator half is +256 bytes")
     strideD1 = "StrideD%s" % writer.states.indexChars[kernel["PackedC1IndicesX"][0]]
-    module.add(VMulLOU32(
-        dst=vgpr(vaddr),
-        src0=vgpr(writer.vgprs.coord1),
-        src1=sgpr(strideD1),
-        comment="folded-store global D column offset",
-    ))
-    module.add(VAddLShiftLeftU32(
-        dst=vgpr(vaddr),
-        src0=vgpr(vaddr),
-        src1=vgpr(writer.vgprs.coord0),
-        shiftHex=1,
-        comment="folded-store D address = (column*strideD + row) * sizeof(bf16)",
-    ))
+    if kernel.get("SubtileFlyNMajor", 0):
+        # Form Fly coordinates directly.  Legacy SourceSwap coord0/coord1 shift
+        # their wave terms by VW=8, so they cannot be algebraically rescaled.
+        lane_group = stride + 3
+        mbase = data
+        nbase = data + 1
+        wave = data + 2
+        tmp = data + 3
+        module.add(VAndB32(
+            dst=vgpr(mbase), src0=15, src1=vgpr("Serial"),
+            comment="Fly lane16"))
+        module.add(VLShiftLeftB32(
+            dst=vgpr(mbase), shiftHex=hex(2), src=vgpr(mbase),
+            comment="Fly lane16 four-row M base"))
+        module.add(VLShiftRightB32(
+            dst=vgpr(wave), shiftHex=hex(6), src=vgpr("Serial"),
+            comment="Fly wave id"))
+        module.add(VAndB32(
+            dst=vgpr(tmp), src0=1, src1=vgpr(wave),
+            comment="Fly M-wave id"))
+        if fly_packets:
+            module.add(VLShiftLeftB32(
+                dst=vgpr(tmp), shiftHex=hex(6), src=vgpr(tmp),
+                comment="Fly M-wave 64-row quarter offset"))
+        else:
+            module.add(VLShiftLeftB32(
+                dst=vgpr(tmp), shiftHex=hex(7), src=vgpr(tmp),
+                comment="Fly M-wave 128-row offset"))
+        module.add(VAddU32(
+            dst=vgpr(mbase), src0=vgpr(mbase), src1=vgpr(tmp)))
+        module.add(VMovB32(
+            dst=vgpr(tmp), src=sgpr("WorkGroup0"),
+            comment="copy workgroup M coordinate"))
+        module.add(VLShiftLeftB32(
+            dst=vgpr(tmp), shiftHex=hex(8), src=vgpr(tmp),
+            comment="Fly workgroup M base"))
+        module.add(VAddU32(
+            dst=vgpr(mbase), src0=vgpr(mbase), src1=vgpr(tmp)))
+        module.add(VLShiftRightB32(
+            dst=vgpr(lane_group), shiftHex=hex(4), src=vgpr("Serial"),
+            comment="Fly lane-group index"))
+        module.add(VAndB32(
+            dst=vgpr(lane_group), src0=3, src1=vgpr(lane_group)))
+        module.add(VLShiftLeftB32(
+            dst=vgpr(nbase), shiftHex=hex(2), src=vgpr(lane_group),
+            comment="Fly lane-group four-column N base"))
+        module.add(VLShiftRightB32(
+            dst=vgpr(wave), shiftHex=hex(1), src=vgpr(wave),
+            comment="Fly N-wave id"))
+        module.add(VLShiftLeftB32(
+            dst=vgpr(wave), shiftHex=hex(7), src=vgpr(wave),
+            comment="Fly N-wave 128-column offset"))
+        module.add(VAddU32(
+            dst=vgpr(nbase), src0=vgpr(nbase), src1=vgpr(wave)))
+        module.add(VMovB32(
+            dst=vgpr(tmp), src=sgpr("WorkGroup1"),
+            comment="copy workgroup N coordinate"))
+        module.add(VLShiftLeftB32(
+            dst=vgpr(tmp), shiftHex=hex(8), src=vgpr(tmp),
+            comment="Fly workgroup N base"))
+        module.add(VAddU32(
+            dst=vgpr(nbase), src0=vgpr(nbase), src1=vgpr(tmp)))
+        module.add(VMulLOU32(
+            dst=vgpr(vaddr), src0=vgpr(nbase), src1=sgpr(strideD1),
+            comment="Fly N-major global D column offset"))
+        module.add(VAddLShiftLeftU32(
+            dst=vgpr(vaddr), src0=vgpr(vaddr), src1=vgpr(mbase),
+            shiftHex=1,
+            comment="Fly N-major D address = (N*strideD + M) * sizeof(bf16)"))
+    else:
+        module.add(VMulLOU32(
+            dst=vgpr(vaddr),
+            src0=vgpr(writer.vgprs.coord1),
+            src1=sgpr(strideD1),
+            comment="folded-store global D column offset",
+        ))
+        module.add(VAddLShiftLeftU32(
+            dst=vgpr(vaddr),
+            src0=vgpr(vaddr),
+            src1=vgpr(writer.vgprs.coord0),
+            shiftHex=1,
+            comment="folded-store D address = (column*strideD + row) * sizeof(bf16)",
+        ))
     module.add(VLShiftLeftB32(
         dst=vgpr(stride),
         shiftHex=hex(1),
         src=sgpr(strideD1),
         comment="folded-store BF16 D column stride in bytes"))
+    module.add(VLShiftLeftB32(
+        dst=vgpr(stride + 1),
+        shiftHex=hex(3),
+        src=vgpr(stride),
+        comment="peeled packet-group eight-column byte stride"))
+    module.add(VLShiftLeftB32(
+        dst=vgpr(stride + 2),
+        shiftHex=hex(5),
+        src=vgpr(stride),
+        comment="peeled packet-group 32-column byte stride"))
+    if not kernel.get("SubtileFlyNMajor", 0):
+        module.add(VLShiftRightB32(
+            dst=vgpr(stride + 3),
+            shiftHex=hex(4),
+            src=vgpr("Serial"),
+            comment="folded-store lane-group index"))
+        module.add(VAndB32(
+            dst=vgpr(stride + 3),
+            src0=1,
+            src1=vgpr(stride + 3),
+            comment="folded-store odd lane-group flag"))
     module.add(VMovB32(
         dst=vgpr(alpha), src=sgpr("Alpha"),
         comment="duplicate folded-store alpha for packed multiply"))
@@ -178,9 +357,14 @@ def cleanupSubtileStoreInNLL(writer) -> None:
     if hasattr(writer.states, "subtileStoreInNLLStride"):
         writer.vgprPool.checkIn(writer.states.subtileStoreInNLLStride)
         del writer.states.subtileStoreInNLLStride
+        del writer.states.subtileStoreInNLLStride8
+        del writer.states.subtileStoreInNLLStride32
+        del writer.states.subtileStoreInNLLLaneGroupOdd
     if hasattr(writer.states, "subtileStoreInNLLAlpha"):
         writer.vgprPool.checkIn(writer.states.subtileStoreInNLLAlpha)
         del writer.states.subtileStoreInNLLAlpha
+    if hasattr(writer.states, "subtileStoreInNLLSecondHalfOffset"):
+        del writer.states.subtileStoreInNLLSecondHalfOffset
 
 
 def _column_accumulators(writer, dtileInfo, column: int) -> list:
@@ -241,6 +425,403 @@ def _store_unit(writer, kernel, dtileInfo, column: int) -> list:
             dst=vgpr(vaddr), src0=vgpr(vaddr),
             src1=vgpr(writer.states.subtileStoreInNLLStride),
             comment="advance folded-store address by one BF16 D column"))
+    return insts
+
+
+def _store_packet(writer, kernel, dtileInfo, column: int,
+                  row_block: int) -> list:
+    """Return one absolute-address alpha-one four-row dwordx2 packet."""
+    regs = _column_accumulators(writer, dtileInfo, column)
+    row_start = row_block * 4
+    regs = regs[row_start:row_start + 4]
+    flags = nonTemporalDFlags(kernel["NonTemporalD"])
+    mubuf = MUBUFModifiers(
+        offen=True, offset12=row_start * 2, glc=flags["glc"],
+        slc=flags["slc"], nt=flags["nt"])
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    vaddr = base_vaddr + 1
+    data = writer.states.subtileStoreInNLLData
+    insts = [VMadU32U24(
+        dst=vgpr(vaddr),
+        src0=column,
+        src1=vgpr(writer.states.subtileStoreInNLLStride),
+        src2=vgpr(base_vaddr),
+        comment="peeled packet absolute D address")]
+    for row, reg in enumerate(regs):
+        insts.append(VAccvgprReadB32(
+            dst=vgpr(data + row), src=accvgpr(reg),
+            comment=(f"peel C column {column} rows "
+                     f"{row_start + row}: acc -> vgpr")))
+    for pair in range(2):
+        insts.append(VCvtPkF32toBF16(
+            dst=vgpr(data + pair),
+            src0=vgpr(data + 2 * pair),
+            src1=vgpr(data + 2 * pair + 1),
+            comment="pack alpha-one peeled BF16 rows"))
+    insts.append(BufferStoreB64(
+        src=vgpr(data, 2),
+        vaddr=vgpr(vaddr),
+        saddr=sgpr("SrdD", 4),
+        soffset=0,
+        mubuf=mubuf,
+        comment=(f"peeled dwordx2 D store column {column} "
+                 f"rows {row_start}:{row_start + 4}")))
+    return insts
+
+
+def _store_packet_group(writer, kernel, dtileInfo, tile_n: int,
+                        row_block: int, bank: int) -> list:
+    """Stage four dwordx2 packets, then issue one four-store burst."""
+    columns = list(range(tile_n, 32, dtileInfo.localMMATileGrid[1]))
+    if len(columns) != 4:
+        raise RuntimeError("peeled store group requires four physical columns")
+
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    addresses = base_vaddr + 1 + bank * 4
+    data = writer.states.subtileStoreInNLLData + bank * 8
+    scratch = writer.states.subtileStoreInNLLData + 16
+    stride = writer.states.subtileStoreInNLLStride
+    stride8 = writer.states.subtileStoreInNLLStride8
+    row_start = row_block * 4
+    flags = nonTemporalDFlags(kernel["NonTemporalD"])
+    mubuf = MUBUFModifiers(
+        offen=True, offset12=row_start * 2, glc=flags["glc"],
+        slc=flags["slc"], nt=flags["nt"])
+
+    insts = [VMadU32U24(
+        dst=vgpr(addresses),
+        src0=tile_n,
+        src1=vgpr(stride),
+        src2=vgpr(base_vaddr),
+        comment="peeled packet-group first D address")]
+    for slot in range(1, 4):
+        insts.append(VAddU32(
+            dst=vgpr(addresses + slot),
+            src0=vgpr(addresses + slot - 1),
+            src1=vgpr(stride8),
+            comment="advance peeled address by eight D columns"))
+
+    for slot, column in enumerate(columns):
+        regs = _column_accumulators(writer, dtileInfo, column)
+        regs = regs[row_start:row_start + 4]
+        packed = data + slot * 2
+        insts.extend([
+            VAccvgprReadB32(
+                dst=vgpr(packed), src=accvgpr(regs[0]),
+                comment=f"stage peel column {column} row {row_start}"),
+            VAccvgprReadB32(
+                dst=vgpr(scratch), src=accvgpr(regs[1]),
+                comment=f"stage peel column {column} row {row_start + 1}"),
+            VCvtPkF32toBF16(
+                dst=vgpr(packed), src0=vgpr(packed), src1=vgpr(scratch),
+                comment="pack staged peeled BF16 pair"),
+            VAccvgprReadB32(
+                dst=vgpr(packed + 1), src=accvgpr(regs[2]),
+                comment=f"stage peel column {column} row {row_start + 2}"),
+            VAccvgprReadB32(
+                dst=vgpr(scratch + 1), src=accvgpr(regs[3]),
+                comment=f"stage peel column {column} row {row_start + 3}"),
+            VCvtPkF32toBF16(
+                dst=vgpr(packed + 1), src0=vgpr(packed + 1),
+                src1=vgpr(scratch + 1),
+                comment="pack staged peeled BF16 pair"),
+        ])
+
+    for slot, column in enumerate(columns):
+        insts.append(BufferStoreB64(
+            src=vgpr(data + slot * 2, 2),
+            vaddr=vgpr(addresses + slot),
+            saddr=sgpr("SrdD", 4),
+            soffset=0,
+            mubuf=mubuf,
+            comment=(f"staged peeled dwordx2 D store column {column} "
+                     f"rows {row_start}:{row_start + 4}")))
+    return insts
+
+
+def _store_recoalesced_packet_group(writer, kernel, dtileInfo,
+                                    tile_n: int) -> list:
+    """Transpose SourceSwap lane groups into contiguous four-row dwordx2 stores.
+
+    A SourceSwap lane owns eight adjacent M rows, so splitting its output into
+    two dwordx2 stores leaves an eight-byte hole between neighboring lanes.
+    Pair adjacent 16-lane groups instead: even groups carry the lower halves
+    and odd groups carry the upper halves of one 32-column band.  The second
+    store reverses that ownership for the adjacent band.  Both stores then
+    cover complete cache-line runs, matching FlyDSL's packet coalescing while
+    preserving SS1's accumulator mapping.
+    """
+    columns = list(range(tile_n, 32, dtileInfo.localMMATileGrid[1]))
+    if len(columns) != 4:
+        raise RuntimeError("recoalesced store group requires four physical columns")
+
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    addresses = base_vaddr + 1
+    data = writer.states.subtileStoreInNLLData
+    scratch = data + 16
+    stride = writer.states.subtileStoreInNLLStride
+    stride8 = writer.states.subtileStoreInNLLStride8
+    stride32 = writer.states.subtileStoreInNLLStride32
+    odd = writer.states.subtileStoreInNLLLaneGroupOdd
+    flags = nonTemporalDFlags(kernel["NonTemporalD"])
+    mubuf = MUBUFModifiers(
+        offen=True, offset12=0, glc=flags["glc"],
+        slc=flags["slc"], nt=flags["nt"])
+
+    # Start from this lane's normal SourceSwap address.  Address A merges lane
+    # groups 0/1 and 2/3 into the even 32-column bands; address B merges them
+    # into the odd bands.  Odd groups contribute rows +4 (eight bytes).
+    insts = [
+        VMadU32U24(
+            dst=vgpr(addresses),
+            src0=tile_n,
+            src1=vgpr(stride),
+            src2=vgpr(base_vaddr),
+            comment="recoalesced packet original D address"),
+        VSubU32(
+            dst=vgpr(scratch),
+            src0=vgpr(addresses),
+            src1=vgpr(stride32),
+            comment="odd-group even-band D address"),
+        VAddU32(
+            dst=vgpr(scratch),
+            src0=vgpr(scratch),
+            src1=8,
+            comment="odd-group upper four-row D address"),
+        VAddU32(
+            dst=vgpr(scratch + 1),
+            src0=vgpr(addresses),
+            src1=vgpr(stride32),
+            comment="even-group odd-band D address"),
+        VCmpEQU32(
+            dst=VCC(), src0=vgpr(odd), src1=1,
+            comment="select odd SourceSwap lane groups"),
+        VCndMaskB32(
+            dst=vgpr(addresses),
+            src0=vgpr(addresses),
+            src1=vgpr(scratch),
+            src2=VCC(),
+            comment="recoalesced even-band D address"),
+        VAddU32(
+            dst=vgpr(addresses + 1),
+            src0=vgpr(base_vaddr),
+            src1=8,
+            comment="odd-group odd-band upper-row candidate"),
+        VMadU32U24(
+            dst=vgpr(addresses + 1),
+            src0=tile_n,
+            src1=vgpr(stride),
+            src2=vgpr(addresses + 1),
+            comment="odd-group odd-band D address"),
+        VCndMaskB32(
+            dst=vgpr(addresses + 1),
+            src0=vgpr(scratch + 1),
+            src1=vgpr(addresses + 1),
+            src2=VCC(),
+            comment="recoalesced odd-band D address"),
+    ]
+    for slot in range(1, 4):
+        insts.extend([
+            VAddU32(
+                dst=vgpr(addresses + slot * 2),
+                src0=vgpr(addresses + (slot - 1) * 2),
+                src1=vgpr(stride8),
+                comment="advance recoalesced even-band address by eight columns"),
+            VAddU32(
+                dst=vgpr(addresses + slot * 2 + 1),
+                src0=vgpr(addresses + (slot - 1) * 2 + 1),
+                src1=vgpr(stride8),
+                comment="advance recoalesced odd-band address by eight columns"),
+        ])
+
+    for slot, column in enumerate(columns):
+        regs = _column_accumulators(writer, dtileInfo, column)
+        packed = data + slot * 4
+        for pair in range(4):
+            insts.extend([
+                VAccvgprReadB32(
+                    dst=vgpr(scratch), src=accvgpr(regs[pair * 2]),
+                    comment=f"stage recoalesced column {column} row {pair * 2}"),
+                VAccvgprReadB32(
+                    dst=vgpr(scratch + 1), src=accvgpr(regs[pair * 2 + 1]),
+                    comment=f"stage recoalesced column {column} row {pair * 2 + 1}"),
+                VCvtPkF32toBF16(
+                    dst=vgpr(packed + pair),
+                    src0=vgpr(scratch),
+                    src1=vgpr(scratch + 1),
+                    comment="pack recoalesced peeled BF16 pair"),
+            ])
+        for dword in range(2):
+            lower = packed + dword
+            upper = packed + 2 + dword
+            insts.append(VPermlane16SwapB32(
+                dst=vgpr(lower),
+                src=vgpr(upper),
+                comment="transpose lower/upper packets across lane groups"))
+        if slot & 1:
+            for store_slot in (slot - 1, slot):
+                store_column = columns[store_slot]
+                insts.extend([
+                    BufferStoreB64(
+                        src=vgpr(data + store_slot * 4, 2),
+                        vaddr=vgpr(addresses + store_slot * 2),
+                        saddr=sgpr("SrdD", 4),
+                        soffset=0,
+                        mubuf=mubuf,
+                        comment=(
+                            "recoalesced even-band dwordx2 "
+                            f"column {store_column}")),
+                    BufferStoreB64(
+                        src=vgpr(data + store_slot * 4 + 2, 2),
+                        vaddr=vgpr(addresses + store_slot * 2 + 1),
+                        saddr=sgpr("SrdD", 4),
+                        soffset=0,
+                        mubuf=mubuf,
+                        comment=(
+                            "recoalesced odd-band dwordx2 "
+                            f"column {store_column}")),
+                ])
+    return insts
+
+
+def _store_final_wide_group(writer, kernel, dtileInfo, tile_n: int) -> list:
+    """Drain the final SourceSwap N group as four coalesced dwordx4 stores."""
+    columns = list(range(tile_n, 32, dtileInfo.localMMATileGrid[1]))
+    if len(columns) != 4:
+        raise RuntimeError("final wide store group requires four physical columns")
+
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    addresses = base_vaddr + 1
+    data = writer.states.subtileStoreInNLLData
+    scratch = data + 16
+    stride = writer.states.subtileStoreInNLLStride
+    stride8 = writer.states.subtileStoreInNLLStride8
+    flags = nonTemporalDFlags(kernel["NonTemporalD"])
+    mubuf = MUBUFModifiers(
+        offen=True, offset12=0, glc=flags["glc"],
+        slc=flags["slc"], nt=flags["nt"])
+
+    insts = [VMadU32U24(
+        dst=vgpr(addresses),
+        src0=tile_n,
+        src1=vgpr(stride),
+        src2=vgpr(base_vaddr),
+        comment="final wide-group first D address")]
+    for slot in range(1, 4):
+        insts.append(VAddU32(
+            dst=vgpr(addresses + slot),
+            src0=vgpr(addresses + slot - 1),
+            src1=vgpr(stride8),
+            comment="advance final wide address by eight columns"))
+
+    for slot, column in enumerate(columns):
+        regs = _column_accumulators(writer, dtileInfo, column)
+        packed = data + slot * 4
+        for pair in range(4):
+            insts.extend([
+                VAccvgprReadB32(
+                    dst=vgpr(scratch), src=accvgpr(regs[pair * 2]),
+                    comment=f"stage final wide column {column} row {pair * 2}"),
+                VAccvgprReadB32(
+                    dst=vgpr(scratch + 1),
+                    src=accvgpr(regs[pair * 2 + 1]),
+                    comment=f"stage final wide column {column} row {pair * 2 + 1}"),
+                VCvtPkF32toBF16(
+                    dst=vgpr(packed + pair),
+                    src0=vgpr(scratch),
+                    src1=vgpr(scratch + 1),
+                    comment="pack final wide BF16 pair"),
+            ])
+
+    for slot, column in enumerate(columns):
+        insts.append(BufferStoreB128(
+            src=vgpr(data + slot * 4, 4),
+            vaddr=vgpr(addresses + slot),
+            saddr=sgpr("SrdD", 4),
+            soffset=0,
+            mubuf=mubuf,
+            comment=f"final wide dwordx4 column {column}"))
+    return insts
+
+
+def _store_fly_nmajor_group(writer, kernel, dtileInfo, tile_n: int) -> list:
+    """Emit FlyDSL's direct ji-adjacent stores for one original-N tile."""
+    if dtileInfo.localMMATileGrid != [8, 8]:
+        raise RuntimeError("Fly N-major stores require an 8x8 MFMA tile")
+
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    addresses = base_vaddr + 1
+    data = writer.states.subtileStoreInNLLData
+    scratch = data + 16
+    stride = writer.states.subtileStoreInNLLStride
+    stride8 = writer.states.subtileStoreInNLLStride8
+    flags = nonTemporalDFlags(kernel["NonTemporalD"])
+    insts = [VMulLOU32(
+        dst=vgpr(addresses),
+        src0=tile_n * 2,
+        src1=vgpr(stride8),
+        comment=f"Fly N-major tile {tile_n} column-byte offset"),
+        VAddU32(
+            dst=vgpr(addresses),
+            src0=vgpr(addresses),
+            src1=vgpr(base_vaddr),
+            comment=f"Fly N-major tile {tile_n} first D address")]
+    for component in range(1, 4):
+        insts.append(VAddU32(
+            dst=vgpr(addresses + component),
+            src0=vgpr(addresses + component - 1),
+            src1=vgpr(stride),
+            comment="advance Fly N-major address by one D column"))
+
+    for sl in range(2):
+        for component in range(4):
+            packed = data + component * 2
+            regs = []
+            for ji in range(4):
+                q = sl * 32 + tile_n * 4 + ji
+                tile = dtileInfo.vgprTiles[q]
+                if tile.regList.pool == writer.vgprPool:
+                    raise RuntimeError(
+                        "Fly N-major stores do not support accumulator spill to VGPR")
+                regs.append(tile.regList.indices[component])
+            insts.extend([
+                VAccvgprReadB32(
+                    dst=vgpr(packed), src=accvgpr(regs[0]),
+                    comment=f"Fly N-major sl={sl} e={component} ji=0"),
+                VAccvgprReadB32(
+                    dst=vgpr(scratch), src=accvgpr(regs[1]),
+                    comment=f"Fly N-major sl={sl} e={component} ji=1"),
+                VCvtPkF32toBF16(
+                    dst=vgpr(packed), src0=vgpr(packed), src1=vgpr(scratch),
+                    comment="pack Fly N-major ji 0:2"),
+                VAccvgprReadB32(
+                    dst=vgpr(packed + 1), src=accvgpr(regs[2]),
+                    comment=f"Fly N-major sl={sl} e={component} ji=2"),
+                VAccvgprReadB32(
+                    dst=vgpr(scratch + 1), src=accvgpr(regs[3]),
+                    comment=f"Fly N-major sl={sl} e={component} ji=3"),
+                VCvtPkF32toBF16(
+                    dst=vgpr(packed + 1), src0=vgpr(packed + 1),
+                    src1=vgpr(scratch + 1),
+                    comment="pack Fly N-major ji 2:4"),
+            ])
+        for component in range(4):
+            offset = (
+                sl * writer.states.subtileStoreInNLLSecondHalfOffset
+                if kernel.get("SubtileFlyStorePacketGeometry", 0)
+                else sl * 128)
+            mubuf = MUBUFModifiers(
+                offen=True, offset12=offset, glc=flags["glc"],
+                slc=flags["slc"], nt=flags["nt"])
+            insts.append(BufferStoreB64(
+                src=vgpr(data + component * 2, 2),
+                vaddr=vgpr(addresses + component),
+                saddr=sgpr("SrdD", 4),
+                soffset=0,
+                mubuf=mubuf,
+                comment=(
+                    f"Fly N-major dwordx2 tile={tile_n} "
+                    f"sl={sl} e={component}")))
     return insts
 
 
@@ -320,6 +901,7 @@ def interleaveSubtileStoreInNLL(
     dtileInfo,
     minMfmaGap: int = 4,
     issueRate: int = 8,
+    fourRowPackets: bool = False,
 ) -> Module:
     """Pace completed output-column stores through a scheduled NLL MFMA stream."""
     if not kernel.get("SubtileStoreInNLL", 0):
@@ -340,18 +922,47 @@ def interleaveSubtileStoreInNLL(
     last_seq = len(mfmas) - 1
 
     units = []
-    for column in range(32):
-        tile_n = column % dtileInfo.localMMATileGrid[1]
-        producer = max(last_producer[(tile_m, tile_n)]
-                       for tile_m in range(dtileInfo.localMMATileGrid[0]))
-        release = min(producer + minMfmaGap, last_seq)
-        units.append({
-            "release": release,
-            "column": column,
-            "instructions": deque(
-                _store_unit(writer, kernel, dtileInfo, column)),
-            "started": False,
-        })
+    groupedPackets = fourRowPackets or kernel.get("SubtileFlyNMajor", 0)
+    if groupedPackets:
+        for tile_n in range(dtileInfo.localMMATileGrid[1]):
+            producer = max(last_producer[(tile_m, tile_n)]
+                           for tile_m in range(
+                               dtileInfo.localMMATileGrid[0]))
+            release = min(producer + minMfmaGap, last_seq)
+            units.append({
+                "release": release,
+                "column": tile_n,
+                "row_block": 0,
+                "instructions": deque(
+                    _store_fly_nmajor_group(
+                        writer, kernel, dtileInfo, tile_n)
+                    if kernel.get("SubtileFlyNMajor", 0)
+                    else (
+                        _store_final_wide_group(
+                            writer, kernel, dtileInfo, tile_n)
+                        if tile_n == dtileInfo.localMMATileGrid[1] - 1
+                        else _store_recoalesced_packet_group(
+                            writer, kernel, dtileInfo, tile_n))),
+                "started": False,
+            })
+    else:
+        for column in range(32):
+            tile_n = column % dtileInfo.localMMATileGrid[1]
+            producer = max(last_producer[(tile_m, tile_n)]
+                           for tile_m in range(
+                               dtileInfo.localMMATileGrid[0]))
+            release = min(producer + minMfmaGap, last_seq)
+            units.append({
+                "release": release,
+                "column": column,
+                "row_block": 0,
+                "instructions": deque(
+                    _store_unit(writer, kernel, dtileInfo, column)),
+                "started": False,
+            })
+    if groupedPackets:
+        units.sort(key=lambda unit: (unit["release"], unit["row_block"],
+                                     unit["column"]))
 
     out = Module(module.name)
     pending = deque()
@@ -384,8 +995,14 @@ def interleaveSubtileStoreInNLL(
                 unit = pending.popleft()
                 while unit["instructions"]:
                     out.add(unit["instructions"].popleft())
-            out.add(_emit_deferred_store_paths(
-                writer, kernel, dtileInfo,
-                [unit["column"] for unit in pending]))
+            if groupedPackets:
+                while pending:
+                    unit = pending.popleft()
+                    while unit["instructions"]:
+                        out.add(unit["instructions"].popleft())
+            else:
+                out.add(_emit_deferred_store_paths(
+                    writer, kernel, dtileInfo,
+                    [unit["column"] for unit in pending]))
             pending.clear()
     return out

@@ -1060,6 +1060,33 @@ namespace TensileLite
                             size_t dimk = 128 / MX;
                             numAllocatedElements = getSwizzledMXTensorNumAllocatedElements(problem.tensors()[i], dimk, unrollMajor);
                         }
+                        if(m_mxScaleFormat == 3
+                           && (i == ContractionProblemGemm::TENSOR::MXSA
+                               || i == ContractionProblemGemm::TENSOR::MXSB))
+                        {
+                            bool const isA
+                                = i == ContractionProblemGemm::TENSOR::MXSA;
+                            auto const& dataDesc
+                                = problem.tensors()[isA
+                                                        ? ContractionProblemGemm::TENSOR::A
+                                                        : ContractionProblemGemm::TENSOR::B];
+                            auto const& scaleDesc = problem.tensors()[i];
+                            auto const  boundIdx
+                                = isA ? problem.boundIndices()[0].a
+                                      : problem.boundIndices()[0].b;
+                            auto const freeIdx
+                                = isA ? problem.freeIndicesA()[0].i
+                                      : problem.freeIndicesB()[0].i;
+                            size_t const batchCount
+                                = dataDesc.sizes().size() > 2 ? dataDesc.sizes()[2] : 1;
+                            size_t const packedElements
+                                = packedMXScaleLaneContiguousGFX950Size(
+                                      dataDesc.sizes()[freeIdx],
+                                      scaleDesc.sizes()[boundIdx])
+                                  * batchCount;
+                            numAllocatedElements
+                                = std::max(numAllocatedElements, packedElements);
+                        }
 
                         pristine.maxElements = std::max(pristine.maxElements, numAllocatedElements);
 
@@ -2095,9 +2122,13 @@ namespace TensileLite
 
             MXScaleLayout layoutA = MXScaleLayout::None;
             MXScaleLayout layoutB = MXScaleLayout::None;
+            bool const laneContiguousGFX950
+                = m_mxScaleFormat == 3 && m_currentSolution != nullptr
+                  && m_currentSolution->problemType.mxScaleFormat == 3;
 
             if(m_mxScaleFormat > 0 && m_mxScaleLayout == MXScaleLayout::GFX950
-               && m_currentSolution != nullptr)
+               && m_currentSolution != nullptr
+               && m_currentSolution->problemType.mxScaleFormat == 1)
             {
                 auto const&      mi            = m_currentSolution->sizeMapping.matrixInstruction;
                 size_t           MiK           = static_cast<size_t>(mi[2]);
@@ -2221,6 +2252,56 @@ namespace TensileLite
                       if(kFast)
                           restrideMXScaleBufferKFast(
                               scalePtr, compactFree, compactKBlocks, paddedKBlocks, scaleElemSize);
+                  }
+
+                  if(laneContiguousGFX950)
+                  {
+                      if(!kFast || scaleElemSize != 1 || paddedKBlocks % 8 != 0)
+                          throw std::runtime_error(
+                              "LaneContiguousGFX950 requires K-fast byte scales "
+                              "with K-block count divisible by 8");
+                      size_t const packedBytesPerBatch
+                          = packedMXScaleLaneContiguousGFX950Size(
+                              compactFree, paddedKBlocks);
+                      if(batchCount > 1
+                         && scaleBatchStrideBytes != packedBytesPerBatch)
+                          throw std::runtime_error(
+                              "LaneContiguousGFX950 batched scale stride must "
+                              "equal the packed batch size");
+                      size_t const packedBytes = packedBytesPerBatch * batchCount;
+                      if(!pristineScale.gpuInput.valid
+                         || packedBytes > pristineScale.maxElements * scaleElemSize)
+                          throw std::runtime_error(
+                              "LaneContiguousGFX950 scale allocation is too small");
+
+                      std::vector<uint8_t> packedAll(packedBytes, 0);
+                      size_t const canonicalBytes
+                          = compactFree * paddedKBlocks;
+                      for(size_t b = 0; b < batchCount; ++b)
+                      {
+                          auto const* scalePtr
+                              = static_cast<uint8_t const*>(
+                                    pristineScale.cpuInput.valid.get())
+                                + b * scaleBatchStrideBytes;
+                          std::vector<uint8_t> canonical(
+                              scalePtr, scalePtr + canonicalBytes);
+                          auto packed = packMXScaleLaneContiguousGFX950(
+                              canonical,
+                              compactFree,
+                              paddedKBlocks,
+                              isMatrixA);
+                          std::copy(packed.begin(),
+                                    packed.end(),
+                                    packedAll.begin()
+                                        + b * packedBytesPerBatch);
+                      }
+                      HIP_CHECK_EXC(hipMemcpy(
+                          pristineScale.gpuInput.valid.get(),
+                          packedAll.data(),
+                          packedBytes,
+                          hipMemcpyHostToDevice));
+                      *preswizzledFlag = true;
+                      return;
                   }
 
                   // When the kernel needs a swizzled scale, regenerate it with the

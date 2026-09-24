@@ -17,8 +17,14 @@ from Tensile.Components.Subtile.SubtileLREmit import (
     emitSingleDsRead, localReadLDSBufferSwap,
 )
 from Tensile.Components.Subtile.SubtileScaleEmit import (
-    emitScaleGroupLoad, globalReadDoScaleSubtile, globalReadScalePtrUpdates,
-    scaleRemapEnabled,
+    emitScaleGroupDirectGlobalRead, emitScaleGroupLoad, emitScaleGroupPack,
+    emitScaleLaneContiguousGlobalRead,
+    globalReadDoScaleSubtile, globalReadScalePtrUpdates,
+    scaleDirectCanonicalGatherEnabled, scaleDirectDeferredWaitEnabled,
+    scaleDirectToVgprEnabled, scaleLaneContiguousGFX950Enabled,
+    scaleGroupBlockedOffset,
+    scaleGroupInterleavedOffset,
+    scaleInterleaveVW, scaleRemapEnabled,
 )
 from rocisa.code import Module
 from rocisa.instruction import (
@@ -78,6 +84,28 @@ def _zigzag_order(rows, cols):
                 result.append((r, c))
     return result
 
+
+def flyStoreAccumulatorIndex(a, b):
+    """FlyDSL N-major accumulator packet index for one MFMA cell."""
+    sl, ji = divmod(a, 4)
+    return sl * 32 + b * 4 + ji
+
+
+def directScaleVmemOpsPerGR(kernel, config, tensor):
+    """Physical VMEM operations emitted by one direct-scale GR placement."""
+    if scaleLaneContiguousGFX950Enabled(kernel):
+        return 1
+    tc = 'MXSA' if tensor in ('A', 'SA', 'MXSA') else 'MXSB'
+    gr = config.grSA if tc == 'MXSA' else config.grSB
+    lr = config.lrSA if tc == 'MXSA' else config.lrSB
+    groups = (gr.mn + lr.mn - 1) // lr.mn
+    if scaleDirectCanonicalGatherEnabled(kernel, tc):
+        ops_per_group = 4
+    else:
+        ops_per_group = 2 if scaleRemapEnabled(kernel, tc) else 1
+    return groups * ops_per_group
+
+
 class InstructionEmitter:
     """Emits GPU instructions for each opType in the LogicalScheduler output.
 
@@ -130,7 +158,7 @@ class InstructionEmitter:
         self._dispatch = {
             'mfma':         lambda em, ui: self.emit_mfma(em.source, ui),
             'lr':           lambda em, ui: self.emit_lr(em.source, ui),
-            'gr':           lambda em, ui: self.emit_gr(em.source),
+            'gr':           lambda em, ui: self.emit_gr(em.source, ui),
             'wait_gr':      lambda em, ui: self.emit_wait_gr(em.source),
             'wait_lr':      lambda em, ui: self.emit_wait_lr(),
             'sync':         lambda em, ui: self.emit_sync(),
@@ -150,9 +178,6 @@ class InstructionEmitter:
     def emit_mfma(self, placement, unroll_iter=0):
         """Emit MFMA instructions from MFMAPlacement."""
         module = Module()
-        subIterK = placement.subIterK
-        tile_maps = {t: placement.vgpr_tile_maps[t][unroll_iter]
-                     for t in placement.vgpr_tile_maps}
 
         aTiles = placement.tileA.tileId_list
         bTiles = placement.tileB.tileId_list
@@ -171,34 +196,77 @@ class InstructionEmitter:
             abPairs = [(a, b) for a in aTiles for b in bTiles]
 
         for a, b in abPairs:
+            module.addItems(self.emit_mfma_cell(
+                placement, a, b, unroll_iter=unroll_iter))
+        return list(module.flatitems())
+
+    def emit_mfma_cell(self, placement, a, b, unroll_iter=0,
+                       operand_tiles=None):
+        """Emit one MFMA cell, optionally with explicit physical operands."""
+        operand_tiles = operand_tiles or {}
+        subIterK = placement.subIterK
+        tile_maps = {t: placement.vgpr_tile_maps[t][unroll_iter]
+                     for t in placement.vgpr_tile_maps}
+
+        if 'A' in operand_tiles:
+            aTile = operand_tiles['A']
+        else:
             groupA = (a // self.config.lrA.mn) * self.config.lrA.mn
-            groupB = (b // self.config.lrB.mn) * self.config.lrB.mn
             aTile = self.vgprTilesA[tile_maps['A'][groupA]]
+        if 'B' in operand_tiles:
+            bTile = operand_tiles['B']
+        else:
+            groupB = (b // self.config.lrB.mn) * self.config.lrB.mn
             bTile = self.vgprTilesB[tile_maps['B'][groupB]]
-            dTile = self.dtileInfo.vgprTiles[a + b * self.dtileInfo.localMMATileGrid[0]]
+        if self.kernel.get("SubtileFlyStorePacketGeometry", 0):
+            from Tensile.Components.Subtile.StoreInNLL import (
+                flyStorePacketGeometryEnabled,
+            )
+            flyStorePacketGeometryEnabled(self.kernel)
+            assert self.dtileInfo.localMMATileGrid == [8, 8]
+            dTile = self.dtileInfo.vgprTiles[
+                flyStoreAccumulatorIndex(a, b)]
+        elif self.kernel.get("SubtileFlyNMajor", 0):
+            # FlyDSL's accumulator q is N-major inside each original-M half:
+            # q = sl*32 + ii*4 + ji, where a=sl*4+ji and b=ii.
+            assert self.dtileInfo.localMMATileGrid == [8, 8]
+            sl, ji = divmod(a, 4)
+            q = sl * 32 + b * 4 + ji
+            dTile = self.dtileInfo.vgprTiles[q]
+        else:
+            dTile = self.dtileInfo.vgprTiles[
+                a + b * self.dtileInfo.localMMATileGrid[0]]
 
-            if self.hasScale:
-                scaleGroupA = (a // self.config.lrSA.mn) * self.config.lrSA.mn
-                scaleGroupB = (b // self.config.lrSB.mn) * self.config.lrSB.mn
-                scaleATile = self.vgprTilesSA[tile_maps['SA'][scaleGroupA]]
-                scaleBTile = self.vgprTilesSB[tile_maps['SB'][scaleGroupB]]
-                scaleAVgpr = next(iter(scaleATile))
-                scaleBVgpr = next(iter(scaleBTile))
-                mShapeA = self.tileInfoMap['SA'].lrSubtileShape[0]
-                mShapeB = self.tileInfoMap['SB'].lrSubtileShape[0]
-                kShapeA = self.tileInfoMap['SA'].lrSubtileShape[1]
-                kShapeB = self.tileInfoMap['SB'].lrSubtileShape[1]
-                sAsel = (a % mShapeA) + mShapeA * (subIterK % kShapeA)
-                sBsel = (b % mShapeB) + mShapeB * (subIterK % kShapeB)
+        if self.hasScale:
+            if 'SA' in operand_tiles:
+                scaleATile = operand_tiles['SA']
             else:
-                scaleAVgpr = scaleBVgpr = -1
-                sAsel = sBsel = 0
+                scaleGroupA = (a // self.config.lrSA.mn) * self.config.lrSA.mn
+                scaleATile = self.vgprTilesSA[tile_maps['SA'][scaleGroupA]]
+            if 'SB' in operand_tiles:
+                scaleBTile = operand_tiles['SB']
+            else:
+                scaleGroupB = (b // self.config.lrSB.mn) * self.config.lrSB.mn
+                scaleBTile = self.vgprTilesSB[tile_maps['SB'][scaleGroupB]]
+            scaleAVgpr = next(iter(scaleATile))
+            scaleBVgpr = next(iter(scaleBTile))
+            mShapeA = self.tileInfoMap['SA'].lrSubtileShape[0]
+            mShapeB = self.tileInfoMap['SB'].lrSubtileShape[0]
+            kShapeA = self.tileInfoMap['SA'].lrSubtileShape[1]
+            kShapeB = self.tileInfoMap['SB'].lrSubtileShape[1]
+            sAsel = (a % mShapeA) + mShapeA * (subIterK % kShapeA)
+            sBsel = (b % mShapeB) + mShapeB * (subIterK % kShapeB)
+        else:
+            scaleAVgpr = scaleBVgpr = -1
+            sAsel = sBsel = 0
 
-            module.add(emitMfmaInstruction(
-                self.writer, self.kernel, aTile, bTile, dTile, dTile,
-                scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
-                scaleAsel=sAsel, scaleBsel=sBsel,
-                comment=f"MFMA C[{a},{b}] += A[{a},K={subIterK}] * B[{b},K={subIterK}]"))
+        module = Module()
+        module.add(emitMfmaInstruction(
+            self.writer, self.kernel, aTile, bTile, dTile, dTile,
+            scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
+            scaleAsel=sAsel, scaleBsel=sBsel,
+            acc2Zero=getattr(placement, "firstProducerZero", False),
+            comment=f"MFMA C[{a},{b}] += A[{a},K={subIterK}] * B[{b},K={subIterK}]"))
         return list(module.flatitems())
 
     def emit_lr(self, placement, unroll_iter=0):
@@ -232,9 +300,15 @@ class InstructionEmitter:
                         ti, tileId, subtileK, subIterK_within, dstTile, swizzled=swizzled))
         elif tensor in ('SA', 'SB'):
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
+            if scaleDirectToVgprEnabled(self.kernel, tc):
+                return []
             ti = self.tileInfoMap[tensor]
             lrGran = self.config.lrSA if tensor == 'SA' else self.config.lrSB
             vgprTilesScale = self.vgprTilesSA if tensor == 'SA' else self.vgprTilesSB
+            batchPack = (
+                self.kernel.get("SubtileScaleBatchPack", 0)
+                and scaleRemapEnabled(self.kernel, tc))
+            deferredPacks = []
             for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, lrGran.mn):
                 scaleGroupIdx = tileId // lrGran.mn
                 groupKey = scaleGroupIdx * lrGran.mn
@@ -252,10 +326,20 @@ class InstructionEmitter:
                         % (tc, numKGroups))
                 module.add(emitScaleGroupLoad(
                     self.writer, self.kernel, ti, tc, vdst, scaleGroupIdx, dsOffset,
-                    f"scale{tc}[group{scaleGroupIdx},K={placement.tiles.subIterK_start}]: load 4B from LDS"))
+                    f"scale{tc}[group{scaleGroupIdx},K={placement.tiles.subIterK_start}]: load 4B from LDS",
+                    deferPack=batchPack))
+                if batchPack:
+                    deferredPacks.append((vdst, scaleGroupIdx))
+            if deferredPacks:
+                module.add(SWaitCnt(
+                    dscnt=0,
+                    comment=f"scale{tc}: batch pack needs all b64 reads landed"))
+                for vdst, scaleGroupIdx in deferredPacks:
+                    module.add(emitScaleGroupPack(
+                        ti, tc, vdst, scaleGroupIdx))
         return list(module.flatitems())
 
-    def emit_gr(self, placement):
+    def emit_gr(self, placement, unroll_iter=0):
         """Emit GR (buffer_load) instructions from GRPlacement."""
         module = Module()
         tensor = placement.tensor
@@ -269,7 +353,66 @@ class InstructionEmitter:
                     module.add(emitSingleBufferLoad(ti, self.kernel, tileId, subtileK))
         elif tensor in ('SA', 'SB'):
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
-            module.add(globalReadDoScaleSubtile(tc, self.writer, self.kernel))
+            if scaleDirectToVgprEnabled(self.kernel, tc):
+                ti = self.tileInfoMap[tensor]
+                lrGran = self.config.lrSA if tensor == 'SA' else self.config.lrSB
+                vgprTiles = self.vgprTilesSA if tensor == 'SA' else self.vgprTilesSB
+                tile_map = placement.vgpr_tile_map[unroll_iter]
+                if scaleLaneContiguousGFX950Enabled(self.kernel):
+                    groups = []
+                    for tileId in range(
+                            placement.tiles.tileId_start,
+                            placement.tiles.tileId_end, lrGran.mn):
+                        group = (tileId // lrGran.mn) * lrGran.mn
+                        groups.append(next(iter(vgprTiles[tile_map[group]])))
+                    assert len(groups) == 4, (
+                        f"scale{tc}: packed record requires exactly four groups, "
+                        f"got {len(groups)}")
+                    assert groups == list(range(groups[0], groups[0] + 4)), (
+                        f"scale{tc}: packed dwordx4 destination must be four "
+                        f"contiguous group VGPRs, got {groups}")
+                    module.add(emitScaleLaneContiguousGlobalRead(
+                        self.writer, self.kernel, ti, tc, groups[0]))
+                    return list(module.flatitems())
+                packs = []
+                vmemOps = 0
+                for tileId in range(
+                        placement.tiles.tileId_start,
+                        placement.tiles.tileId_end, lrGran.mn):
+                    group = (tileId // lrGran.mn) * lrGran.mn
+                    groupIdx = group // lrGran.mn
+                    vdst = next(iter(vgprTiles[tile_map[group]]))
+                    remapped = scaleRemapEnabled(self.kernel, tc)
+                    byteOffset = (
+                        scaleGroupInterleavedOffset(
+                            scaleInterleaveVW(self.kernel, tc), groupIdx)
+                        if remapped else
+                        scaleGroupBlockedOffset(ti, groupIdx))
+                    module.add(emitScaleGroupDirectGlobalRead(
+                        self.writer, self.kernel, ti, tc, vdst,
+                        groupIdx, byteOffset))
+                    canonicalGather = scaleDirectCanonicalGatherEnabled(
+                        self.kernel, tc)
+                    vmemOps += 4 if canonicalGather else (2 if remapped else 1)
+                    if remapped and not canonicalGather:
+                        packs.append((vdst, groupIdx))
+                if vmemOps and scaleDirectDeferredWaitEnabled(
+                        self.kernel, tc):
+                    expected = directScaleVmemOpsPerGR(
+                        self.kernel, self.config, tensor)
+                    assert vmemOps == expected, (
+                        f"scale{tc}: deferred wait count assumes {expected} "
+                        f"VMEM operations per GR, emitted {vmemOps}")
+                elif vmemOps:
+                    module.add(SWaitCnt(
+                        vlcnt=0,
+                        comment=f"scale{tc}: direct global groups landed"))
+                    for vdst, groupIdx in packs:
+                        module.add(emitScaleGroupPack(
+                            ti, tc, vdst, groupIdx))
+            else:
+                module.add(globalReadDoScaleSubtile(
+                    tc, self.writer, self.kernel))
         return list(module.flatitems())
 
     def emit_wait_gr(self, source):
@@ -292,8 +435,14 @@ class InstructionEmitter:
         # TODO. Hardcoded for now, but we should just get this from atomic emit codes (emitSingleBufferLoad, ...)
         grMap = {'A': max(1,int(1.0/self.tileInfoA.loadRatioGR)),
                  'B':  max(1,int(1.0/self.tileInfoB.loadRatioGR)),
-                 'SA': 1, 
-                 'SB': 1}  
+                 'SA': 1,
+                 'SB': 1}
+        if scaleDirectDeferredWaitEnabled(self.kernel, 'MXSB'):
+            # WaitGRCounts counts logical GR placements. A blocked MXSB
+            # placement emits one VMEM operation per scale group, so translate
+            # younger placement counts to the physical vmcnt threshold.
+            grMap['SB'] = directScaleVmemOpsPerGR(
+                self.kernel, self.config, 'SB')
         if force_drain:
             grCnt = 0
             label = "full drain"
@@ -327,6 +476,9 @@ class InstructionEmitter:
         tensor = source.tensor
         tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
         module = Module()
+        if tensor in ('SA', 'SB') \
+                and scaleDirectToVgprEnabled(self.kernel, tc):
+            return []
         module.add(localReadLDSBufferSwap(tc, self.writer, self.kernel))
         return list(module.flatitems())
 
@@ -339,7 +491,9 @@ class InstructionEmitter:
             module.add(globalReadScalePtrUpdates(tc, self.writer, self.kernel))
         else:
             module.add(globalReadPtrUpdates(tc, self.writer, self.kernel))
-        module.add(globalReadLDSBufferSwap(tc, self.writer, self.kernel))
+        if not (tensor in ('SA', 'SB')
+                and scaleDirectToVgprEnabled(self.kernel, tc)):
+            module.add(globalReadLDSBufferSwap(tc, self.writer, self.kernel))
         return list(module.flatitems())
 
     def emit_gl2_prefetch(self):

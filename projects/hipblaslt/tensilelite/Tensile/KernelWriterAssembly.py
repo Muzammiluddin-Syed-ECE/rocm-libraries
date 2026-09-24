@@ -138,6 +138,12 @@ class GlobalReadGprRecord:
   a: GprInfo                       = field(default_factory=GprInfo)
   b: GprInfo                       = field(default_factory=GprInfo)
 
+def _packedScaleSrdLimitShift(kernel, tc):
+  """Return log2 of the free rows owned by one packed-scale workgroup."""
+  macroTile = int(kernel["MacroTile0" if tc == "MXSA" else "MacroTile1"])
+  assert macroTile > 0 and macroTile & (macroTile - 1) == 0
+  return macroTile.bit_length() - 1
+
 ################################################################################
 # Assembly Kernel
 ################################################################################
@@ -4873,6 +4879,19 @@ class KernelWriterAssembly(KernelWriter):
     if kernel["DirectToLds%s"%tc] and kernel["UseInstOffsetForGRO"]:
       module.add(SSubU32(dst=sgpr("Srd%s+0"%tc), src0=sgpr("Srd%s+0"%tc), src1=self.buff_load_inst_offset_max, comment="make room for directToLDS instruction offset"))
       module.add(SSubBU32(dst=sgpr("Srd%s+1"%tc), src0=sgpr("Srd%s+1"%tc), src1=0, comment="make room for directToLDS instruction offset"))
+
+    if ("MXS" in tc
+        and kernel.get("MXScaleFormat") == "LaneContiguousGFX950"):
+      # StridesMXS is the canonical K-block count: one packed byte per
+      # (free row, K block).  The SRD therefore owns MacroTile{0,1}*stride
+      # bytes (two 128-row records for the focused 256x256 geometry).
+      # Pointer updates shrink this limit by one 1024-byte K tile so
+      # PGR2's final speculative phase is OOB-suppressed instead of reading
+      # the following operand/allocation.
+      module.add(SLShiftLeftB32(
+          dst=sgpr("Srd%s+2"%tc), src=sgpr("Strides%s"%tc),
+          shiftHex=hex(_packedScaleSrdLimitShift(kernel, tc)),
+          comment="packed scale limit = macro-tile free rows * K/32"))
 
     module.add(SMovB32(dst=sgpr("Srd%s+3"%tc), src="Srd127_96", comment="Set bits 127_96 in SRD"))
     if use64bShadowLimit and not useFixedSrd2:

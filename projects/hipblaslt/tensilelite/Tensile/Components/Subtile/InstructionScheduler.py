@@ -7,7 +7,7 @@ Interleaves non-MFMA instructions between MFMAs using a slot-based placer
 with pluggable scheduling rules.
 """
 
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from rocisa.code import Module
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
     LocalReadInstruction, GlobalReadInstruction, CommonInstruction
@@ -25,7 +25,8 @@ class _SlotPlacer:
 
     def __init__(self, intervals: int, numModules: int,
                  pathOrders: List[List[int]],
-                 validators=None, adjusters=None, onPlace=None):
+                 validators=None, adjusters=None, onPlace=None,
+                 maxPositions: Optional[Dict[int, int]] = None):
         self.totalSlots = intervals * 2
         self._n = numModules
         self._prevInPath: List[int] = [-1] * numModules
@@ -37,6 +38,7 @@ class _SlotPlacer:
         self._validators = validators or []
         self._adjusters = adjusters or []
         self._onPlace = onPlace
+        self._maxPositions = maxPositions or {}
 
         self._placed: List[List[Tuple[int, object]]] = [[] for _ in range(self.totalSlots)]
         self._firstPos: List[Optional[int]] = [None] * numModules
@@ -61,6 +63,8 @@ class _SlotPlacer:
         if 0 <= pred < self._n and self._lastPos[pred] is not None:
             lo = self._lastPos[pred] + 1
         hi = self.totalSlots - 1
+        if mid in self._maxPositions:
+            hi = min(hi, self._maxPositions[mid])
         succ = self._nextInPath[mid]
         if 0 <= succ < self._n and self._firstPos[succ] is not None:
             hi = self._firstPos[succ] - 1
@@ -366,6 +370,115 @@ def _flattenPath(order, emittedModules, reverse=False):
     return pathInsts
 
 
+def _splitPackedScaleRefillPaths(pathOrders, emittedModules):
+    """Keep packed dwordx4 refills after all old-record MFMA consumers.
+
+    Scale liveness is tracked per logical group, but one packed load aliases
+    all four group VGPRs. Scheduling that load after group 0 dies can overwrite
+    groups 1..3 while the current K phase still consumes them.
+    """
+    regular, postMfma = [], []
+    for order in pathOrders:
+        isPackedRefill = any(
+            isinstance(inst, GlobalReadInstruction)
+            and "packed-record-refill" in getattr(inst, "comment", "")
+            for mid in order for inst in emittedModules[mid].instructions)
+        (postMfma if isPackedRefill else regular).append(order)
+    return regular, postMfma
+
+
+def _extractPathsAndMfmaDeadlines(emittedModules):
+    """Extract paths plus their first dependent MFMA instruction boundary."""
+    idToIdx = {em.moduleId: i for i, em in enumerate(emittedModules)}
+    n = len(emittedModules)
+
+    mfmaIdxs = [i for i, em in enumerate(emittedModules) if em.opType == "mfma"]
+    assert mfmaIdxs, "instruction scheduling expects at least one MFMA emitted module"
+    nonMfmaIds = [i for i in range(n) if i not in set(mfmaIdxs)]
+    nonMfmaSet = set(nonMfmaIds)
+
+    pred: List[int] = [-1 for _ in range(n)]
+    child: List[int] = [-1 for _ in range(n)]
+    for i in nonMfmaIds:
+        parent = -1
+        before = emittedModules[i].before
+        if before is not None:
+            beforeIdx = idToIdx.get(before)
+            if beforeIdx is not None and beforeIdx != i and beforeIdx in nonMfmaSet:
+                parent = beforeIdx
+        pred[i] = parent
+        if parent != -1:
+            assert child[parent] == -1, \
+                f"instruction scheduling expects unique child per predecessor, got {child[parent]} and {i} for {parent}"
+            child[parent] = i
+
+    def findHead(mid: int) -> int:
+        cur = mid
+        seen = set()
+        while pred[cur] != -1 and cur not in seen:
+            seen.add(cur)
+            cur = pred[cur]
+        return cur
+
+    def walkFromHead(head: int, used: set) -> List[int]:
+        order = []
+        localSeen = set()
+        cur = head
+        while cur != -1 and cur not in used and cur not in localSeen:
+            order.append(cur)
+            localSeen.add(cur)
+            cur = child[cur]
+        return order
+
+    used = set()
+    paths = []
+    for mid in nonMfmaIds:
+        if mid in used:
+            continue
+        order = walkFromHead(findHead(mid), used)
+        assert order, f"instruction scheduling produced empty path for module {mid}"
+        used.update(order)
+        paths.append(order)
+
+    # A path named by an MFMA's before link must finish before that MFMA
+    # module's first instruction. Multiple MFMA modules are used by the unified
+    # two-K schedule, so retain the earliest such boundary for each path.
+    mfmaStart = {}
+    offset = 0
+    for idx in mfmaIdxs:
+        mfmaStart[idx] = offset
+        offset += len(emittedModules[idx].instructions)
+
+    deadlines = {}
+    for mfmaIdx in mfmaIdxs:
+        before = emittedModules[mfmaIdx].before
+        beforeIdx = idToIdx.get(before) if before is not None else None
+        if beforeIdx is None:
+            continue
+        for pathIdx, path in enumerate(paths):
+            if beforeIdx in path:
+                boundary = mfmaStart[mfmaIdx]
+                deadlines[pathIdx] = min(deadlines.get(pathIdx, boundary), boundary)
+                break
+
+    preMfmaPaths = []
+    regularPaths = []
+    maxPositions = {}
+    for pathIdx, path in enumerate(paths):
+        boundary = deadlines.get(pathIdx)
+        if boundary == 0:
+            preMfmaPaths.append(path)
+        else:
+            regularPaths.append(path)
+            if boundary is not None:
+                # Slots 2*i and 2*i+1 precede MFMA i+1.
+                maxPos = 2 * boundary - 1
+                for mid in path:
+                    maxPositions[mid] = maxPos
+
+    return mfmaIdxs, regularPaths, preMfmaPaths, maxPositions
+
+
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
     """Extract non-MFMA dependency paths using only EmittedModule.before links.
 
@@ -376,80 +489,10 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
       - preMfmaPaths: paths that must be emitted before the first MFMA
         (reachable from the MFMA's before link)
     """
-    idToIdx = {em.moduleId: i for i, em in enumerate(emittedModules)}
-    n = len(emittedModules)
-
-    mfmaModuleIds = [i for i, em in enumerate(emittedModules) if em.opType == "mfma"]
-    assert len(mfmaModuleIds) == 1, "extractPathsFromBeforeDeps expects exactly one MFMA emitted module"
-    mfmaIdx = mfmaModuleIds[0]
-    nonMfmaIds = [i for i in range(n) if i != mfmaIdx]
-    nonMfmaSet = set(nonMfmaIds)
-
-    # Identify the non-MFMA module the MFMA depends on (if any).
-    mfmaBefore = emittedModules[mfmaIdx].before
-    preMfmaTarget = None
-    if mfmaBefore is not None:
-        bi = idToIdx.get(mfmaBefore)
-        if bi is not None and bi in nonMfmaSet:
-            preMfmaTarget = bi
-
-    # Each non-MFMA module has at most one predecessor, and each predecessor
-    # has at most one child, so paths are simple chains.
-    pred: List[int] = [-1 for _ in range(n)]
-    child: List[int] = [-1 for _ in range(n)]
-    for i in nonMfmaIds:
-        parent = -1
-        b = emittedModules[i].before
-        if b is not None:
-            bi = idToIdx.get(b)
-            if bi is not None and bi != i and bi in nonMfmaSet:
-                parent = bi
-        pred[i] = parent
-        if parent != -1:
-            assert child[parent] == -1, \
-                f"extractPathsFromBeforeDeps expects unique child per predecessor, got {child[parent]} and {i} for {parent}"
-            child[parent] = i
-
-    def _findHead(mid: int) -> int:
-        cur = mid
-        seen = [False for _ in range(n)]
-        while pred[cur] != -1 and not seen[cur]:
-            seen[cur] = True
-            cur = pred[cur]
-        return cur
-
-    def _walkFromHead(head: int, used: List[bool]) -> List[int]:
-        order: List[int] = []
-        localSeen = [False for _ in range(n)]
-        cur = head
-        while cur != -1 and not used[cur] and not localSeen[cur]:
-            order.append(cur)
-            localSeen[cur] = True
-            cur = child[cur]
-        return order
-
-    used = [False for _ in range(n)]
-    paths: List[List[int]] = []
-    for mid in nonMfmaIds:
-        if used[mid]:
-            continue
-        head = _findHead(mid)
-        order = _walkFromHead(head, used)
-        assert order, f"extractPathsFromBeforeDeps produced empty path for module {mid}"
-        for i in order:
-            used[i] = True
-        paths.append(order)
-
-    # Separate paths that the MFMA depends on (must go before first MFMA).
-    preMfmaPaths: List[List[int]] = []
-    regularPaths: List[List[int]] = []
-    for path in paths:
-        if preMfmaTarget is not None and preMfmaTarget in path:
-            preMfmaPaths.append(path)
-        else:
-            regularPaths.append(path)
-
-    return mfmaIdx, regularPaths, preMfmaPaths
+    mfmaIdxs, paths, preMfmaPaths, _ = _extractPathsAndMfmaDeadlines(emittedModules)
+    assert len(mfmaIdxs) == 1, \
+        "extractPathsFromBeforeDeps expects exactly one MFMA emitted module"
+    return mfmaIdxs[0], paths, preMfmaPaths
 
 
 def instructionSchedule(emittedModules, multiDU: bool = False,
@@ -481,8 +524,12 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     isMFMA = lambda x: isinstance(x, (MFMAInstruction, MXMFMAInstruction))
     n = len(emittedModules)
 
-    mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
-    mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
+    mfmaIdxs, pathOrders, preMfmaOrders, maxPositions = \
+        _extractPathsAndMfmaDeadlines(emittedModules)
+    mfmas = [
+        inst for idx in mfmaIdxs
+        for inst in emittedModules[idx].instructions if isMFMA(inst)
+    ]
 
     def _emitPreMfma(result):
         for order in preMfmaOrders:
@@ -502,6 +549,8 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
                     result.add(inst)
         return result
 
+    pathOrders, postMfmaOrders = _splitPackedScaleRefillPaths(
+        pathOrders, emittedModules)
     paths = _classifyPaths(pathOrders, emittedModules)
     rules = _SchedulingRules(totalSlots=(len(mfmas) - 1) * 2,
                              minGapDsReadToWait=minGapDsReadToWait)
@@ -515,7 +564,8 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         len(mfmas) - 1, n, pathOrders,
         validators=base_validators,
         adjusters=base_adjusters,
-        onPlace=rules.trackPlacement)
+        onPlace=rules.trackPlacement,
+        maxPositions=maxPositions)
 
     for order, hasWaitGR in paths:
         if not order:
@@ -532,6 +582,10 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     scheduled = Module()
     _emitPreMfma(scheduled)
     scheduled.add(placer.assemble(mfmas))
+    for order in postMfmaOrders:
+        for mid in order:
+            for inst in emittedModules[mid].instructions:
+                scheduled.add(inst)
 
     # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
     # that the scheduler placed before it within this subIterK.

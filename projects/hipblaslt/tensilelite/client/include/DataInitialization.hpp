@@ -901,7 +901,13 @@ namespace TensileLite
             virtual void preSolution(ContractionSolution* const solution) override
             {
                 m_currentSolution = solution;
-                // Re-init MX inputs for solution-dependent HostPreSwizzle.
+                if(m_currentSolution != nullptr
+                   && m_currentSolution->problemType.mxScaleFormat == 3
+                   && m_mxScaleFormat != 3)
+                    throw std::runtime_error(
+                        "LaneContiguousGFX950 solution requires "
+                        "--mx-scale-format 3");
+                // Re-init MX inputs for solution-dependent host layouts.
                 if(m_currentSolution != nullptr
                    && m_currentGemmProblem != nullptr
                    && !m_gpuPtrs.empty()
@@ -1073,7 +1079,8 @@ namespace TensileLite
                 return isMXProblem(problem) && m_mxScaleFormat > 0
                        && m_mxScaleLayout == MXScaleLayout::GFX950
                        && solution != nullptr
-                       && solution->problemType.mxScaleFormat == 1;
+                       && (solution->problemType.mxScaleFormat == 1
+                           || solution->problemType.mxScaleFormat == 3);
             }
 
             void copyInputs(std::vector<void*>&               ptrs,

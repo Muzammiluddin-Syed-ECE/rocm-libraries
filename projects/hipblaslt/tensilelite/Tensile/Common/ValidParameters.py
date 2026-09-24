@@ -498,6 +498,39 @@ validParameters = { # we need to make sure this matches develop
     # Experimental subtile-only D-store overlap. This remains fail-closed in
     # Solution validation until SrdD and D coordinates are safely live in NLL.
     "SubtileStoreInNLL": [0, 1],
+    # Experimental four-phase rolling peeled exit layered on SubtileStoreInNLL.
+    "SubtileRollingPeel": [0, 1],
+    # FlyDSL-style transposed-problem ownership: four-column A interleave,
+    # split accumulator halves, and direct ji-adjacent dwordx2 stores.
+    "SubtileFlyNMajor": [0, 1],
+    # FlyDSL-style A4 parity-split/swizzled LDS address map.
+    "SubtileFlyAParityLds": [0, 1],
+    # FlyDSL accumulator packets with a 256-byte second output half.
+    "SubtileFlyStorePacketGeometry": [0, 1],
+    # Peel the first main-loop copy and use MFMA acc2=0 for first producers.
+    "SubtileFirstMfmaAccZero": [0, 1],
+    # Reorder ready main-loop MFMA slots to consume K0/K1 per accumulator.
+    "SubtileFlyKInner": [0, 1],
+    # Schedule both two-K emitted dependency graphs in one instruction window.
+    "SubtileUnifiedKSchedule": [0, 1],
+    # Native single-pool C0/C1 graph with exact final-use refill hazards.
+    "SubtileNativeWholeLoopScheduler": [0, 1],
+    # Batch scale b64 LDS reads behind one drain before their v_perm gathers.
+    "SubtileScaleBatchPack": [0, 1],
+    # Diagnostic Fly-style one-barrier main loop.
+    "SubtileSingleMainloopBarrier": [0, 1],
+    # Match FlyDSL's scalar issue separation after the data-ready barrier.
+    "SubtilePostBarrierNop": [0, 1],
+    # Match FlyDSL's partial VMEM/LDS phase wait before the data-ready barrier.
+    "SubtileFlyPhaseWait": [0, 1],
+    # Apply the composed barrier/wait/nop transforms to peeled first C0.
+    "SubtileFirstMainloopSync": [0, 1],
+    # Target-only experiment: load MX scales into subtile operand VGPRs.
+    "SubtileDirectToVgprScale": [0, 1, 2, 3],
+    # Defer blocked MXSB direct-scale waits to scheduler dependencies.
+    "SubtileDirectScaleDeferredWait": [0, 1],
+    # Align the hot-loop branch target to a 256-byte fetch boundary.
+    "SubtileAlignMainloop256": [0, 1],
     "BufferLoad": [False, True],
     "BufferStore": [False, True],
     # CompactLoopStore default (opt-in, off by default). When enabled, the
@@ -1180,6 +1213,8 @@ validParameters = { # we need to make sure this matches develop
     #                      unless TDMInst != 0, in which case InMemorySwizzle is the default).
     #   "HostPreSwizzle":  scales pre-swizzled on the host (gfx950 subtile pipeline);
     #                      requires MXLoadInst="BufferLoad" and gfx950 host pipeline.
+    #   "LaneContiguousGFX950": focused gfx950 FP4 TN SS1 host-packed records;
+    #                      requires the A+B direct-to-VGPR experimental gate.
     #   "InMemorySwizzle": scales swizzled in device memory by TDM;
     #                      requires MXLoadInst="TDM".
     # Internal sentinel (do NOT use in yamls):
@@ -1188,7 +1223,8 @@ validParameters = { # we need to make sure this matches develop
     #                      derivation fires; users should write one of the concrete values above.
     # Codegen + rejection logic combine MXScaleFormat with MXLoadInst and
     # archCaps["HasMXScaleSwizzle"].
-    "MXScaleFormat": ["Auto", "NoSwizzle", "HostPreSwizzle", "InMemorySwizzle"],
+    "MXScaleFormat": ["Auto", "NoSwizzle", "HostPreSwizzle",
+                      "LaneContiguousGFX950", "InMemorySwizzle"],
     # How A/MXSA and B/MXSB are loaded from VRAM to LDS.
     # User-facing values:
     #   "TDM":         tensor_load_to_lds (requires asmCaps["HasTDM"]; today always implies

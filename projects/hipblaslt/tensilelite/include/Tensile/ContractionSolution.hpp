@@ -648,6 +648,7 @@ namespace TensileLite
             //   0 = NoSwizzle       (default; canonical row/column layout)
             //   1 = HostPreSwizzle  (gfx950 subtile host-preswizzled layout)
             //   2 = InMemorySwizzle (gfx1250 TDM-populated swizzled layout)
+            //   3 = LaneContiguousGFX950 (focused FP4 TN SS1 direct-load records)
             // The host (DataInitialization) consults this to decide whether to
             // apply the K-dimension swizzle on the MX scale tensor before upload.
             int mxScaleFormat = 0;

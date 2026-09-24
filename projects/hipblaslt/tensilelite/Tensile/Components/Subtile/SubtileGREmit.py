@@ -37,7 +37,9 @@ from rocisa.instruction import (
 from .SubtileGeometry import (
     RegList,
     GRTag_1x1, GRTag_1x2, GRTag_2x2, GRTag_TLU1,
-    SUBTILE_LDS_BLOCK_BYTES, ldsBlockPadDelta, ldsBlockPadOffset,
+    FLY_A_PARITY_REGION_BYTES, SUBTILE_LDS_BLOCK_BYTES,
+    flyAParityLdsEnabled, flyAParitySubtileLogicalOffset,
+    ldsBlockPadDelta, ldsBlockPadOffset,
 )
 from .SubtileScaleEmit import emitScaleGRLDSSwap
 
@@ -638,6 +640,20 @@ def _grComputeSubtileOffsets(writer, module, tileInfo):
   for regId in range(len(tileInfo.localSubtilesRegister)):
     rl = tileInfo.localSubtilesRegister[regId]
     for i, reg in enumerate(rl):
+      if getattr(tileInfo, "flyAParityLds", False):
+        stmp = writer.sgprPool.checkOut(1, tag="_grComputeSubtileOffsets_legacy_flyA")
+        logicalRow = flyAParitySubtileLogicalOffset(regId)
+        module.add(SMulI32(dst=sgpr(stmp), src0=logicalRow, src1=sgpr(strideRef),
+                           comment="Fly A parity: subtile logical-row offset"))
+        module.add(SLShiftRightB32(dst=sgpr(stmp), src=sgpr(stmp), shiftHex=hex(1),
+                                   comment="Fly A parity: fp4 elements to bytes"))
+        if rl.is_sgpr:
+          module.add(SMovB32(dst=sgpr(reg), src=sgpr(stmp)))
+        else:
+          module.add(VAddU32(dst=vgpr(reg), src0=vgpr(tileInfo.sharedVgprGROffset[i]),
+                             src1=sgpr(stmp)))
+        writer.sgprPool.checkIn(stmp)
+        continue
       if rl.is_sgpr:
         module.add(SMulI32(dst=sgpr(reg), src0=hex(s_stride * regId), src1=sgpr(strideRef), comment="%s: %u rows offset, stride %u, %u"%(tc, rowOffset, s_stride, regId)))
       else:
@@ -885,7 +901,8 @@ def _graTileAssignment_legacy(writer, kernel, useSwizzling=True):
   assert subIterKBytes <= ldsRowBankSize
   blockSize = subIterKBytes // loadWidth
   numRowsPerLDSBanks = ldsRowBankSize // subIterKBytes
-  tmpVgpr = writer.vgprPool.checkOut(7, tag="_graTileAssignment_legacy_tmpVgpr")
+  flyAParity = flyAParityLdsEnabled(kernel)
+  tmpVgpr = writer.vgprPool.checkOut(8 if flyAParity else 7, tag="_graTileAssignment_legacy_tmpVgpr")
   colIdA = tmpVgpr
   colIdB = tmpVgpr + 1
   rowId = tmpVgpr + 2
@@ -905,9 +922,36 @@ def _graTileAssignment_legacy(writer, kernel, useSwizzling=True):
     # the interleaved local read needs. Must stay in step with the read side's
     # subtileLdsSwizzle branch in _lraTileAssignment_legacy.
     module.add(VMovB32(dst=vgpr(colIdB), src=vgpr(colIdA), comment="no swizzle: colIdB = colIdA"))
+    if kernel.get("SubtileFlyNMajor", 0):
+      # Fly's blocked B map pre-applies the inverse of its per-1KiB LDS
+      # bank rotation. DTL still writes lane c to physical chunk c, but
+      # that slot receives logical chunk (c-row) mod 8.
+      module.add(VSubU32(dst=vgpr(colIdB), src0=vgpr(colIdB), src1=vgpr(rowId),
+                         comment="Fly B source chunk = physical chunk - row"))
+      module.add(VAndB32(dst=vgpr(colIdB), src0=7, src1=vgpr(colIdB),
+                         comment="Fly B source chunk modulo 8"))
+  if flyAParity:
+    module.add(VSubU32(dst=vgpr(colIdA), src0=vgpr(colIdA), src1=vgpr(rowId),
+                       comment="Fly A parity: logical chunk = physical chunk - region row"))
+    module.add(VAndB32(dst=vgpr(colIdA), src0=7, src1=vgpr(colIdA),
+                       comment="Fly A parity: logical chunk modulo 8"))
   _grComputeRowPartition_legacy(module, kernel, writer, tileInfoA, waveId, rowOffsetA)
   _grComputeRowPartition_legacy(module, kernel, writer, tileInfoB, waveId, rowOffsetB)
-  _grComputeAllOffsets_legacy(module, writer, tileInfoA, colIdA, rowId, rowOffsetA)
+  rowIdA = rowId
+  if flyAParity:
+    rowIdA = tmpVgpr + 7
+    module.add(VLShiftRightB32(dst=vgpr(rowOffsetA), shiftHex=hex(1), src=vgpr(waveId),
+                               comment="Fly A parity: consumer M-wave"))
+    module.add(VLShiftLeftB32(dst=vgpr(rowOffsetA), shiftHex=hex(7), src=vgpr(rowOffsetA),
+                              comment="Fly A parity: M-wave row base"))
+    module.add(VAndB32(dst=vgpr(rowIdA), src0=1, src1=vgpr(waveId),
+                       comment="Fly A parity: producer lane half"))
+    module.add(VLShiftLeftB32(dst=vgpr(rowIdA), shiftHex=hex(5), src=vgpr(rowIdA),
+                              comment="Fly A parity: lane-half row base"))
+    module.add(VAddU32(dst=vgpr(rowOffsetA), src0=vgpr(rowOffsetA), src1=vgpr(rowIdA)))
+    module.add(VLShiftLeftB32(dst=vgpr(rowIdA), shiftHex=hex(2), src=vgpr(rowId),
+                              comment="Fly A parity: lane row stride four"))
+  _grComputeAllOffsets_legacy(module, writer, tileInfoA, colIdA, rowIdA, rowOffsetA)
   _grComputeAllOffsets_legacy(module, writer, tileInfoB, colIdB, rowId, rowOffsetB)
   writer.vgprPool.checkIn(tmpVgpr)
   _grComputeSubtileOffsets_legacy(writer, module, tileInfoA)
@@ -962,7 +1006,11 @@ def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1):
   subtileOffset = int(math.ceil(tileInfo.loadRatioGR*tileInfo.subtileSize))
   WriteBaseAddr = "LocalWriteBaseAddr%s"%tc
   for i in range(tileInfo.numGRPerSubtile):
-    m0Offset = int(i * subtileOffset + (sId0 + sId1 * tileInfo.globalSubtileGrid[0]) * tileInfo.subtileSize)
+    if getattr(tileInfo, "flyAParityLds", False):
+      m0Offset = int((sId0 & 1) * FLY_A_PARITY_REGION_BYTES
+                     + (sId0 >> 1) * 2 * SUBTILE_LDS_BLOCK_BYTES)
+    else:
+      m0Offset = int(i * subtileOffset + (sId0 + sId1 * tileInfo.globalSubtileGrid[0]) * tileInfo.subtileSize)
     m0Offset = _padM0Offset(tileInfo, m0Offset)
     module.add(SAddU32(dst=mgpr(0), src0=sgpr(WriteBaseAddr), src1=(m0Offset - offsetK)))
     mubuf = MUBUFModifiers(offen=True, offset12=offsetK, glc=isGlc, slc=isSlc, nt=isNT, lds=True)

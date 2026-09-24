@@ -251,6 +251,151 @@ INSTANTIATE_TEST_SUITE_P(
     )
 );
 
+TEST(MXPackedScaleGFX950, LaneContiguousRecordsMatchSS1Selectors)
+{
+    constexpr size_t freeDim = 128;
+    constexpr size_t kBlocks = 8;
+    std::vector<uint8_t> canonical(freeDim * kBlocks);
+    for(size_t row = 0; row < freeDim; ++row)
+        for(size_t k = 0; k < kBlocks; ++k)
+            canonical[row * kBlocks + k]
+                = static_cast<uint8_t>((37 * row + 11 * k + 3) & 0xff);
+
+    for(bool isMatrixA : {true, false})
+    {
+        auto packed
+            = packMXScaleLaneContiguousGFX950(canonical, freeDim, kBlocks, isMatrixA);
+        ASSERT_EQ(packed.size(), 1024u);
+        std::vector<size_t> visits(canonical.size(), 0);
+
+        for(size_t lane = 0; lane < 64; ++lane)
+            for(size_t group = 0; group < 4; ++group)
+                for(size_t byte = 0; byte < 4; ++byte)
+                {
+                    size_t const laneGroup = lane / 16;
+                    size_t const laneRow   = lane % 16;
+                    size_t const parity    = byte & 1;
+                    size_t const subIterK  = byte >> 1;
+                    size_t const kBlock    = 2 * laneGroup + subIterK;
+                    size_t const tile      = 2 * group + parity;
+                    size_t const row
+                        = isMatrixA
+                              ? 4 * laneRow + (tile % 4) + 64 * (tile / 4)
+                              : 32 * group + 16 * parity + laneRow;
+                    size_t const dst = ((lane * 4 + group) * 4 + byte);
+                    EXPECT_EQ(packed[dst], canonical[row * kBlocks + kBlock]);
+                    ++visits[row * kBlocks + kBlock];
+                }
+
+        EXPECT_TRUE(std::all_of(
+            visits.begin(), visits.end(), [](size_t count) { return count == 1; }));
+    }
+}
+
+TEST(MXPackedScaleGFX950, PadsFreeAndKDimensionsWithZero)
+{
+    constexpr size_t freeDim = 129;
+    constexpr size_t kBlocks = 9;
+    std::vector<uint8_t> canonical(freeDim * kBlocks);
+    for(size_t i = 0; i < canonical.size(); ++i)
+        canonical[i] = static_cast<uint8_t>(1 + (i % 255));
+
+    for(bool isMatrixA : {true, false})
+    {
+        auto packed
+            = packMXScaleLaneContiguousGFX950(canonical, freeDim, kBlocks, isMatrixA);
+        ASSERT_EQ(packed.size(), 256u * 16u);
+        EXPECT_EQ(static_cast<size_t>(
+                      std::count_if(packed.begin(), packed.end(), [](uint8_t value) {
+                          return value != 0;
+                      })),
+                  canonical.size());
+    }
+}
+
+TEST(MXPackedScaleGFX950, GeneratorUsesCanonicalFreeMajorInput)
+{
+    constexpr uint64_t rows      = 768;
+    constexpr uint64_t cols      = 256;
+    constexpr size_t   mxBlock   = 32;
+    constexpr size_t   kBlocks   = rows / mxBlock;
+    constexpr size_t   numPacked = rows * cols / 2;
+    constexpr size_t   numScales = kBlocks * cols;
+
+    for(bool isMatrixA : {true, false})
+    {
+        std::vector<uint8_t> dataCanonical(numPacked);
+        std::vector<uint8_t> dataPacked(numPacked);
+        std::vector<uint8_t> canonical(numScales);
+        std::vector<uint8_t> generatedPacked(numScales);
+
+        generateMXInput((hipDataType)HIP_R_4F_E2M1,
+                        HIP_R_8F_UE8M0,
+                        dataCanonical.data(),
+                        canonical.data(),
+                        rows,
+                        cols,
+                        rows,
+                        /*isTranspose=*/isMatrixA,
+                        mxBlock,
+                        1,
+                        isMatrixA,
+                        MXScaleLayout::None,
+                        "Bounded",
+                        -1.0f,
+                        1.0f);
+        generateMXInput((hipDataType)HIP_R_4F_E2M1,
+                        HIP_R_8F_UE8M0,
+                        dataPacked.data(),
+                        generatedPacked.data(),
+                        rows,
+                        cols,
+                        rows,
+                        /*isTranspose=*/isMatrixA,
+                        mxBlock,
+                        1,
+                        isMatrixA,
+                        MXScaleLayout::LaneContiguousGFX950,
+                        "Bounded",
+                        -1.0f,
+                        1.0f);
+
+        EXPECT_EQ(dataCanonical, dataPacked);
+        EXPECT_EQ(generatedPacked,
+                  packMXScaleLaneContiguousGFX950(
+                      canonical, cols, kBlocks, isMatrixA));
+    }
+}
+
+TEST(MXPackedScaleGFX950, GeneratorRejectsGeometryThatWouldGrowScaleAllocation)
+{
+    constexpr uint64_t rows      = 256;
+    constexpr uint64_t cols      = 129;
+    constexpr size_t   mxBlock   = 32;
+    constexpr size_t   numPacked = (rows * cols + 1) / 2;
+    constexpr size_t   numScales = (rows / mxBlock) * cols;
+    std::vector<uint8_t> data(numPacked);
+    std::vector<uint8_t> scale(numScales);
+
+    EXPECT_THROW(
+        generateMXInput((hipDataType)HIP_R_4F_E2M1,
+                        HIP_R_8F_UE8M0,
+                        data.data(),
+                        scale.data(),
+                        rows,
+                        cols,
+                        rows,
+                        /*isTranspose=*/true,
+                        mxBlock,
+                        1,
+                        /*isMatrixA=*/true,
+                        MXScaleLayout::LaneContiguousGFX950,
+                        "Bounded",
+                        -1.0f,
+                        1.0f),
+        std::runtime_error);
+}
+
 // ============================================================================
 // Init-mode coverage
 //

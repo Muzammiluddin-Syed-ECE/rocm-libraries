@@ -153,7 +153,7 @@ globalParameters["CMakeBuildType"] = (
 )
 globalParameters["LogicFormat"] = "yaml"  # set library backend (yaml, or json)
 globalParameters["LibraryFormat"] = "yaml"  # set library backend (yaml, or msgpack)
-globalParameters["MXScaleFormat"] = 0  # MX scale data format (0=none, 1=pre-swizzle for GPU kernel layout). Only the gfx950 subtile MX kernels need the pre-swizzle; gfx1250 reads canonical scales. The two gfx950 yamls that need it set MXScaleFormat: 1 explicitly.
+globalParameters["MXScaleFormat"] = 0  # Client host-layout gate: 0=off, 1=legacy host pre-swizzle, 2=in-memory swizzle, 3=experimental gfx950 lane-contiguous records.
 
 # True/False: CSV will/won't export WinnerGFlops, WinnerTimeUS, WinnerIdx, WinnerName.
 # TODO - if no side-effect, we can set default to True. This can make analyzing "LibraryLogic" (AddFromCSV) faster
@@ -493,6 +493,22 @@ defaultBenchmarkCommonParameters = [
     {"InterleaveAlpha": [0]},
     {"OptNoLoadLoop": [1]},
     {"SubtileStoreInNLL": [0]},
+    {"SubtileRollingPeel": [0]},
+    {"SubtileFlyNMajor": [0]},
+    {"SubtileFlyAParityLds": [0]},
+    {"SubtileFlyStorePacketGeometry": [0]},
+    {"SubtileFirstMfmaAccZero": [0]},
+    {"SubtileFlyKInner": [0]},
+    {"SubtileUnifiedKSchedule": [0]},
+    {"SubtileNativeWholeLoopScheduler": [0]},
+    {"SubtileScaleBatchPack": [0]},
+    {"SubtileSingleMainloopBarrier": [0]},
+    {"SubtilePostBarrierNop": [0]},
+    {"SubtileFlyPhaseWait": [0]},
+    {"SubtileFirstMainloopSync": [0]},
+    {"SubtileDirectToVgprScale": [0]},
+    {"SubtileDirectScaleDeferredWait": [0]},
+    {"SubtileAlignMainloop256": [0]},
     {"BufferLoad": [True]},
     {"BufferStore": [True]},
     {"CompactLoopStore": [False]},

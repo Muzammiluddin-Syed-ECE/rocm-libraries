@@ -871,7 +871,9 @@ class Solution:
         # Plumb it onto problemType so the host can read it post-solution-pick.
         rv.problemType.mxScaleFormat = {"NoSwizzle": 0,
                                         "HostPreSwizzle": 1,
-                                        "InMemorySwizzle": 2}.get(d.get("MXScaleFormat", "NoSwizzle"), 0)
+                                        "InMemorySwizzle": 2,
+                                        "LaneContiguousGFX950": 3}.get(
+                                            d.get("MXScaleFormat", "NoSwizzle"), 0)
 
         rv.problemPredicate = ProblemPredicate.FromOriginalState(d, rv.problemType)
         rv.taskPredicate = TaskPredicate.FromOriginalState(d, rv.problemType)

@@ -5017,7 +5017,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     # Should check for is swizzled instead of usesubtileimpl
     # TODO: Move this calculation to host-side?
-    if kernel["ProblemType"]["MXBlockA"] and kernel["ProblemType"]["MXBlockA"] and kernel["UseSubtileImpl"]:
+    if (kernel["ProblemType"]["MXBlockA"]
+        and kernel["ProblemType"]["MXBlockA"]
+        and kernel["UseSubtileImpl"]
+        and kernel.get("MXScaleFormat") != "LaneContiguousGFX950"):
       module.addComment("Scale StridesMXSA by 32")
       module.add(SLShiftLeftB32(sgpr("StridesMXSA"), 5, sgpr("StridesMXSA")))
       module.add(SLShiftLeftB32(sgpr("StridesMXSB"), 5, sgpr("StridesMXSB")))

@@ -30,6 +30,87 @@ SUBTILE_LDS_BLOCK_BYTES = 1024
 # Stage 5 sweep knob. 32 B is what the non-subtile SourceSwap kernel uses.
 _LDS_BLOCK_PAD_ENV = "TENSILE_SUBTILE_LDS_BLOCK_PAD"
 
+FLY_A_PARITY_ROW_BYTES = 128
+FLY_A_PARITY_CHUNK_BYTES = 16
+FLY_A_PARITY_ROWS_PER_WAVE = 128
+FLY_A_PARITY_REGION_BYTES = (
+    FLY_A_PARITY_ROWS_PER_WAVE // 2 * FLY_A_PARITY_ROW_BYTES)
+
+
+def flyAParityLdsEnabled(kernel) -> bool:
+  """Validate and return the target-only Fly A parity-layout gate."""
+  if not kernel.get("SubtileFlyAParityLds", 0):
+    return False
+  supported = (
+      tuple(kernel.get("ISA", ())) == (9, 5, 0)
+      and kernel.get("UseSubtileImpl", False)
+      and kernel.get("SourceSwap", False)
+      and kernel.get("SubtileFlyNMajor", 0)
+      and kernel.get("DirectToLdsA", False)
+      and not kernel.get("enableTDMA", False)
+      and int(kernel.get("MacroTileA", 0)) == 256
+      and int(kernel.get("_DepthUA", 0)) == 256
+      and int(kernel.get("MatrixInstM", 0)) == 16
+      and int(kernel.get("MatrixInstK", 0)) == 128
+      and list(kernel.get("MIWaveGroup", [])) == [2, 2]
+      and list(kernel.get("MIWaveTile", [])) == [8, 8]
+  )
+  if not supported:
+    raise ValueError(
+        "SubtileFlyAParityLds requires the gfx950 SS1 FP4 MT256x256x256 "
+        "A4 geometry (SourceSwap, SubtileFlyNMajor, DTL-A, WG2x2, WT8x8)")
+  return True
+
+
+def flyAParityReadAddress(lane16: int, tile: int, chunk: int) -> int:
+  """A4 consumer byte address within one wave's 16-KiB A partition.
+
+  A4's two-level logical row is ``4*lane16 + tile%4 + 64*(tile//4)``.
+  Rows in each parity region are reordered by tile-pair then lane, making the
+  2-KiB tile-pair stride preserve the per-row 8-way chunk rotation.
+  """
+  lane16, tile, chunk = int(lane16), int(tile), int(chunk)
+  assert 0 <= lane16 < 16 and 0 <= tile < 8 and 0 <= chunk < 8
+  parity = tile & 1
+  region_row = 16 * (tile >> 1) + lane16
+  physical_chunk = (chunk + region_row) & 7
+  return (parity * FLY_A_PARITY_REGION_BYTES
+          + region_row * FLY_A_PARITY_ROW_BYTES
+          + physical_chunk * FLY_A_PARITY_CHUNK_BYTES)
+
+
+def flyAParitySubtileLogicalOffset(subtile: int) -> int:
+  """Logical A4 row offset represented by one physical subtile block."""
+  subtile = int(subtile)
+  assert 0 <= subtile < 8
+  tilePair, parity = subtile >> 1, subtile & 1
+  return 64 * (tilePair >> 1) + 2 * (tilePair & 1) + parity
+
+
+def flyAParityWriteMapping(waveId: int, subtile: int, laneRow: int):
+  """Inverse producer map: return (logical row, physical byte destination).
+
+  Four producer waves are arranged as two consumer-M partitions and two
+  eight-row halves. ``subtile`` selects parity/tile-pair.
+  """
+  waveId, subtile, laneRow = int(waveId), int(subtile), int(laneRow)
+  assert 0 <= waveId < 4 and 0 <= subtile < 8 and 0 <= laneRow < 8
+  waveM, laneHalf = waveId >> 1, waveId & 1
+  parity, tilePair = subtile & 1, subtile >> 1
+  logical_row = (waveM * 128 + laneHalf * 32 + 4 * laneRow
+                 + flyAParitySubtileLogicalOffset(subtile))
+  physical = (waveM * 2 * FLY_A_PARITY_REGION_BYTES
+              + parity * FLY_A_PARITY_REGION_BYTES
+              + (2 * tilePair + laneHalf) * SUBTILE_LDS_BLOCK_BYTES)
+  return logical_row, physical
+
+
+def flyAParityReadBanks(tile: int, chunk: int):
+  """gfx950 LDS start-bank per lane for one A ds_read_b128."""
+  return tuple(
+      (flyAParityReadAddress(lane, tile, chunk) // 4) % 64
+      for lane in range(16))
+
 
 def subtileInterleaveVW(kernel, tc: str) -> int:
   """Local-read tile->row interleave factor for one tensor.
@@ -37,6 +118,9 @@ def subtileInterleaveVW(kernel, tc: str) -> int:
   VectorWidth<tc> under SourceSwap, 1 otherwise. Mirrors TileInfo.lrInterleaveVW,
   for the call sites that only have a kernel dict.
   """
+  if kernel.get("SubtileFlyNMajor", 0):
+    # Fly's logical B is original A after transposing the problem.
+    return 4 if tc == "A" else 1
   if not kernel.get("SourceSwap", False):
     return 1
   return int(kernel.get("VectorWidth%s" % tc, 1))
@@ -72,7 +156,9 @@ def subtileLdsBlockPadBytes(kernel, ldsRowStride=None) -> int:
   """
   if not kernel.get("SourceSwap", False):
     return 0
-  if ldsRowStride is not None and not subtileLdsBlockPadFolds(kernel, ldsRowStride):
+  if (ldsRowStride is not None
+      and not subtileLdsBlockPadFolds(kernel, ldsRowStride)
+      and not kernel.get("SubtileFlyNMajor", 0)):
     return 0
   pad = int(os.environ.get(_LDS_BLOCK_PAD_ENV, 32))
   if pad == 0:

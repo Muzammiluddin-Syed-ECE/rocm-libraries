@@ -20,9 +20,10 @@ import math
 from rocisa.code import Module
 from rocisa.container import DSModifiers, MUBUFModifiers, vgpr, sgpr, mgpr
 from rocisa.instruction import (
-    BufferLoadB128,
+    BufferLoadB32, BufferLoadB128, BufferLoadU8,
     DSLoadB32, DSLoadB64,
-    SAddCU32, SAddU32, SLShiftLeftB32, SMovB32, SMulI32, SNop, SWaitCnt, SXorB32,
+    SAddCU32, SAddU32, SCSelectB32, SLShiftLeftB32, SMovB32, SMulI32, SNop,
+    SSubU32, SWaitCnt, SXorB32,
     VAddU32, VAndB32, VMovB32, VMulLOU32, VPermB32, VReadfirstlaneB32, VXorB32,
     VLShiftLeftB32, VLShiftRightB32,
 )
@@ -307,6 +308,39 @@ def graTileAssignmentScaleSwizzled(writer, kernel):
   module = Module()
   if not kernel["ProblemType"].get("MXBlockA", 0) and not kernel["ProblemType"].get("MXBlockB", 0):
     return module
+  if scaleLaneContiguousGFX950Enabled(kernel):
+    for tc in ('MXSA', 'MXSB'):
+      ti_ = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
+      tmp = writer.vgprPool.checkOut(1, tag="graScaleLaneContiguous_tmp")
+      # Packed record address:
+      #   waveFreeTile * (128 * totalKBlocks) + lane * 16.
+      # The SRD already includes the workgroup's 256-row free-tile base.
+      module.add(VLShiftRightB32(
+          dst=vgpr(tmp), shiftHex=hex(6 if tc == 'MXSA' else 7),
+          src=vgpr("Serial"), comment="scale%s: wave free-tile index" % tc))
+      if tc == 'MXSA':
+        module.add(VAndB32(
+            dst=vgpr(tmp), src0=1, src1=vgpr(tmp),
+            comment="scaleMXSA: waveM"))
+      module.add(VMulLOU32(
+          dst=vgpr(tmp), src0=sgpr("Strides%s" % tc), src1=vgpr(tmp),
+          comment="scale%s: waveFreeTile * totalKBlocks" % tc))
+      module.add(VLShiftLeftB32(
+          dst=vgpr(tmp), shiftHex=hex(7), src=vgpr(tmp),
+          comment="scale%s: * 128 rows" % tc))
+      module.add(VAndB32(
+          dst=vgpr(ti_.sharedVgprGROffset[0]), src0=63, src1=vgpr("Serial"),
+          comment="scale%s: lane" % tc))
+      module.add(VLShiftLeftB32(
+          dst=vgpr(ti_.sharedVgprGROffset[0]), shiftHex=hex(4),
+          src=vgpr(ti_.sharedVgprGROffset[0]),
+          comment="scale%s: lane * 16-byte record" % tc))
+      module.add(VAddU32(
+          dst=vgpr(ti_.sharedVgprGROffset[0]),
+          src0=vgpr(ti_.sharedVgprGROffset[0]), src1=vgpr(tmp),
+          comment="scale%s: packed lane record address" % tc))
+      writer.vgprPool.checkIn(tmp)
+    return module
   module.add(_graTileAssignmentScaleSwizzledCommon('MXSA', writer, kernel))
   module.add(_graTileAssignmentScaleSwizzledCommon('MXSB', writer, kernel))
   return module
@@ -415,6 +449,11 @@ def scaleInterleaveVW(kernel, tc) -> int:
   return subtileInterleaveVW(kernel, 'A' if tc in ('A', 'MXSA') else 'B')
 
 
+def scaleLaneContiguousGFX950Enabled(kernel) -> bool:
+  """Whether the focused gfx950 lane-record scale transport is selected."""
+  return kernel.get("MXScaleFormat") == "LaneContiguousGFX950"
+
+
 def scaleRemapEnabled(kernel, tc=None) -> bool:
   """True when the scale rows have to follow an interleaved data local-read map.
 
@@ -425,10 +464,60 @@ def scaleRemapEnabled(kernel, tc=None) -> bool:
 
   `tc` selects one tensor; None asks whether any tensor is remapped, which is what
   the register-allocation sites need (they size both scale tiles alike)."""
+  if scaleLaneContiguousGFX950Enabled(kernel):
+    return False
   if not kernel.get("SourceSwap", False):
     return False
   tcs = ('A', 'B') if tc is None else (tc,)
   return any(scaleInterleaveVW(kernel, t) > 1 for t in tcs)
+
+
+def scaleDirectToVgprEnabled(kernel, tc=None) -> bool:
+  """Whether the focused subtile scale-DTV experiment applies to a tensor.
+
+  SubtileDirectToVgprScale is a bitmask: bit 0 selects A and bit 1 selects B.
+  With no tensor, report whether either selected tensor is active; callers that
+  change per-tensor behavior must pass tc explicitly.
+  """
+  mask = int(kernel.get("SubtileDirectToVgprScale", 0))
+
+  def enabled(t):
+    if t in ('A', 'SA', 'MXSA'):
+      bit, scaleTc = 1, 'MXSA'
+    elif t in ('B', 'SB', 'MXSB'):
+      bit, scaleTc = 2, 'MXSB'
+    else:
+      raise ValueError("unknown scale tensor %s" % t)
+    return bool(mask & bit) and kernel.get(
+        "DirectToVgpr%s" % scaleTc, False)
+
+  if tc is None:
+    return enabled('MXSA') or enabled('MXSB')
+  return enabled(tc)
+
+
+def scaleDirectDeferredWaitEnabled(kernel, tc) -> bool:
+  """Whether blocked MXSB direct loads rely on scheduler dependency waits.
+
+  A/remapped paths retain their immediate wait because their v_perm pack reads
+  the just-loaded VGPRs inside the GR emission itself.
+  """
+  return (
+      (scaleLaneContiguousGFX950Enabled(kernel)
+       or tc in ('B', 'SB', 'MXSB'))
+      and (scaleLaneContiguousGFX950Enabled(kernel)
+           or bool(kernel.get("SubtileDirectScaleDeferredWait", 0)))
+      and scaleDirectToVgprEnabled(kernel, tc)
+      and not scaleRemapEnabled(kernel, tc))
+
+
+def scaleDirectCanonicalGatherEnabled(kernel, tc) -> bool:
+  """Whether MXSA needs a canonical row gather instead of a dword load."""
+  return (
+      tc in ('A', 'SA', 'MXSA')
+      and kernel.get("SubtileFlyNMajor", 0)
+      and scaleInterleaveVW(kernel, tc) == 4
+      and scaleDirectToVgprEnabled(kernel, tc))
 
 
 def _emitScaleLaneBaseInterleaved(module, acc, tmp, laneId, vw, tag):
@@ -500,7 +589,6 @@ def _emitScaleLaneOffsetInterleaved(module, writer, kernel, laneId, tileInfos):
   writer.vgprPool.checkIn(acc)
   writer.vgprPool.checkIn(tmp)
 
-
 def lraTileAssignmentScaleSwizzled(writer, kernel):
   return _lraTileAssignmentScaleSwizzled_legacy(writer, kernel)
 
@@ -533,12 +621,24 @@ def _lraTileAssignmentScaleSwizzled_legacy(writer, kernel):
                          comment="scale%s: lrOffset = laneId * 4" % ('A' if ti_.tc == 'MXSA' else 'B')))
   writer.vgprPool.checkIn(laneOffset)
   tmpSgpr = writer.sgprPool.checkOut(1, tag="_lraTileAssignmentScaleSwizzled_legacy_tmpSgpr")
-  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(writer.ldsStartOffsetMXSA), comment="scale: LDS offset for A scale"))
-  module.add(VAddU32(dst=vgpr(tiA_.sharedVgprLROffset[0]), src0=vgpr(tiA_.sharedVgprLROffset[0]), src1=sgpr(tmpSgpr), comment="scaleA: +=LDS offset"))
-  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(writer.ldsStartOffsetMXSB), comment="scale: LDS offset for B scale"))
-  module.add(VAddU32(dst=vgpr(tiB_.sharedVgprLROffset[0]), src0=vgpr(tiB_.sharedVgprLROffset[0]), src1=sgpr(tmpSgpr), comment="scaleB: +=LDS offset"))
+  for ti_, ldsStart in (
+      (tiA_, writer.ldsStartOffsetMXSA),
+      (tiB_, writer.ldsStartOffsetMXSB)):
+    if scaleDirectToVgprEnabled(kernel, ti_.tc):
+      # Keep the scale-region-relative consumer byte address. The direct GR
+      # path inverts the DTL layout from this value.
+      continue
+    module.add(SMovB32(
+        dst=sgpr(tmpSgpr), src=hex(ldsStart),
+        comment="scale%s: LDS region offset" % ti_.tc))
+    module.add(VAddU32(
+        dst=vgpr(ti_.sharedVgprLROffset[0]),
+        src0=vgpr(ti_.sharedVgprLROffset[0]), src1=sgpr(tmpSgpr),
+        comment="scale%s: +=LDS offset" % ti_.tc))
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=writer.ldsTotalSize, comment="scale: total LDS size for swap"))
   for ti_ in [tiA_, tiB_]:
+    if scaleDirectToVgprEnabled(kernel, ti_.tc):
+      continue
     for i in range(len(ti_.sharedVgprLROffset)):
       vgprId     = ti_.sharedVgprLROffset[i]
       vgprSwapId = ti_.sharedVgprLROffsetSwap[i]
@@ -617,7 +717,54 @@ def scaleGroupInterleavedOffset(vw, scaleGroupIdx) -> int:
   return 4 * (j % vw) + 128 * vw * (j // vw)
 
 
-def emitScaleGroupLoad(writer, kernel, tileInfo, tc, vdst, scaleGroupIdx, blockedOffset, comment):
+def scaleGroupBlockedOffset(tileInfo, scaleGroupIdx) -> int:
+  """LDS byte offset of one blocked two-tile scale group."""
+  if hasattr(tileInfo, 'lrSubtileSize'):
+    groupStride = int(tileInfo.lrSubtileSize)
+  else:
+    groupStride = SCALE_GROUP_TILES * int(tileInfo.subtileSize)
+  return groupStride * scaleGroupIdx
+
+
+def mxsaDirectCanonicalByte(lane, waveM, tile, subIterK):
+  """Canonical (row, K/32-byte) consumed by one MXSA MFMA lane.
+
+  The exact Fly-N-major equality kernel interleaves A rows four-way.  A lane
+  therefore computes row ``128*waveM + 4*(lane%16) + tile%4 +
+  64*(tile//4)``.  Its four MFMA lane groups own consecutive pairs of scale
+  bytes, so sub-iterations 0/1 select K bytes ``2*(lane//16) + subIterK``.
+  """
+  assert 0 <= lane < 64
+  assert 0 <= tile < 8
+  assert 0 <= subIterK < 2
+  row = (128 * waveM + 4 * (lane % 16)
+         + (tile % 4) + 64 * (tile // 4))
+  kByte = 2 * (lane // 16) + subIterK
+  return row, kByte
+
+
+def mxsaDirectCanonicalByteFromConsumerQ(q, lane, subIterK):
+  """Decode an interleaved LDS consumer dword to its canonical scale byte."""
+  lprime = (q & 255) // 4
+  pprime = (lane // 4) & 1
+  row = 32 * (q // 256) + 16 * pprime + (lprime % 16)
+  kByte = 2 * (lprime // 16) + subIterK
+  return row, kByte
+
+
+def emitScaleGroupPack(tileInfo, tc, vdst, scaleGroupIdx):
+  module = Module()
+  sel = tileInfo.sharedVgprScalePermSel
+  assert sel, "scale%s: SourceSwap remap needs its v_perm selector VGPR" % tc
+  module.add(VPermB32(dst=vgpr(vdst), src0=vgpr(vdst + 1),
+                      src1=vgpr(vdst), src2=vgpr(sel[0]),
+                      comment="scale%s[group%u]: pack lane bytes into MFMA select order"
+                              % (tc, scaleGroupIdx)))
+  return module
+
+
+def emitScaleGroupLoad(writer, kernel, tileInfo, tc, vdst, scaleGroupIdx,
+                       blockedOffset, comment, deferPack=False):
   module = Module()
   if not scaleRemapEnabled(kernel, tc):
     module.add(DSLoadB32(dst=vgpr(vdst),
@@ -639,15 +786,230 @@ def emitScaleGroupLoad(writer, kernel, tileInfo, tc, vdst, scaleGroupIdx, blocke
                        src=vgpr(tileInfo.sharedVgprLROffset[0]),
                        ds=DSModifiers(offset=scaleGroupInterleavedOffset(scaleInterleaveVW(kernel, tc), scaleGroupIdx)),
                        comment=comment + " (interleaved: dwords for tiles 2g, 2g+1)"))
+  if deferPack:
+    return module
   # The pack consumes the load's own destination, so it cannot be left for the
   # scheduler's wait before the MFMA: without a wait here the v_perm reads stale
   # registers and the landing ds_read then overwrites its result, which degenerates
   # to passing the first dword through unchanged.
   module.add(SWaitCnt(dscnt=0, comment="scale%s[group%u]: pack needs the b64 landed" % (tc, scaleGroupIdx)))
-  module.add(VPermB32(dst=vgpr(vdst), src0=vgpr(vdst + 1), src1=vgpr(vdst), src2=vgpr(sel[0]),
-                      comment="scale%s[group%u]: pack lane bytes into MFMA select order" % (tc, scaleGroupIdx)))
+  module.add(emitScaleGroupPack(tileInfo, tc, vdst, scaleGroupIdx))
   return module
 
+
+def emitScaleGroupDirectGlobalRead(writer, kernel, tileInfo, tc, vdst,
+                                   scaleGroupIdx, byteOffset):
+  """Load one SourceSwap scale group from its SRD into its MFMA tile VGPRs.
+
+  DTL writes each producer lane's 16-byte payload linearly in LDS. Inverting
+  that swizzle for an LDS-relative consumer byte q gives:
+
+      globalOffset = (q >> 8) * scaleStrideBytes + (q & 255)
+
+  q includes the wave's 1024-byte scale partition, so q>>8 also selects the
+  exact producer-wave group used by the old DTL load. The caller batches the
+  VMEM wait and any required v_perm packs.
+  """
+  module = Module()
+  assert scaleDirectToVgprEnabled(kernel, tc)
+  isGlc = bool(kernel["NonTemporal%s" % tc] & 0x1)
+  isSlc = bool(kernel["NonTemporal%s" % tc] & 0x2)
+  isNT = bool(kernel["NonTemporal%s" % tc] & 0x4)
+  canonicalMxsaGather = scaleDirectCanonicalGatherEnabled(kernel, tc)
+
+  if canonicalMxsaGather:
+    # The interleaved LDS consumer dwords are not contiguous in canonical
+    # global memory.  Decode each tile row and gather its two K bytes:
+    #
+    #   q       = wave partition + interleaved lane base + tile offset
+    #   L'      = (q & 255) / 4
+    #   p'      = (lane / 4) & 1
+    #   row     = 32*(q / 256) + 16*p' + (L' % 16)
+    #   kByte   = 2*(L' / 16) + subIterK
+    #
+    # q and q+4 are the group's even/odd tiles.  Loading kByte and kByte+1
+    # for each row yields MFMA byte order [even k0, odd k0, even k1, odd k1].
+    addr = writer.vgprPool.checkOut(3, tag="emitScaleGroupDirectGlobalRead_mxsaAddr")
+    q, row, tmp = addr, addr + 1, addr + 2
+    gathered = writer.vgprPool.checkOut(
+        4, tag="emitScaleGroupDirectGlobalRead_mxsaBytes")
+    if byteOffset:
+      offsetSgpr = writer.sgprPool.checkOut(
+          1, tag="emitScaleGroupDirectGlobalRead_mxsaOffset")
+      module.add(SMovB32(
+          dst=sgpr(offsetSgpr), src=byteOffset,
+          comment="scaleMXSA: interleaved even-tile offset"))
+      module.add(VAddU32(
+          dst=vgpr(q), src0=vgpr(tileInfo.sharedVgprLROffset[0]),
+          src1=sgpr(offsetSgpr),
+          comment="scaleMXSA: q for even tile"))
+      writer.sgprPool.checkIn(offsetSgpr)
+    else:
+      module.add(VMovB32(
+          dst=vgpr(q), src=vgpr(tileInfo.sharedVgprLROffset[0]),
+          comment="scaleMXSA: q for even tile"))
+
+    for tileInGroup in range(2):
+      if tileInGroup:
+        module.add(VAddU32(
+            dst=vgpr(q), src0=4, src1=vgpr(q),
+            comment="scaleMXSA: q for odd tile"))
+      module.add(VLShiftRightB32(
+          dst=vgpr(row), shiftHex=hex(8), src=vgpr(q),
+          comment="scaleMXSA: canonical 32-row line"))
+      module.add(VLShiftLeftB32(
+          dst=vgpr(row), shiftHex=hex(5), src=vgpr(row),
+          comment="scaleMXSA: first row of line"))
+      module.add(VLShiftRightB32(
+          dst=vgpr(tmp), shiftHex=hex(2), src=vgpr(q),
+          comment="scaleMXSA: L'"))
+      module.add(VAndB32(
+          dst=vgpr(tmp), src0=15, src1=vgpr(tmp),
+          comment="scaleMXSA: row within 16-row half"))
+      module.add(VAddU32(
+          dst=vgpr(row), src0=vgpr(row), src1=vgpr(tmp),
+          comment="scaleMXSA: add row within half"))
+      module.add(VLShiftRightB32(
+          dst=vgpr(tmp), shiftHex=hex(2), src=vgpr("Serial"),
+          comment="scaleMXSA: lane / 4"))
+      module.add(VAndB32(
+          dst=vgpr(tmp), src0=1, src1=vgpr(tmp),
+          comment="scaleMXSA: p'"))
+      module.add(VLShiftLeftB32(
+          dst=vgpr(tmp), shiftHex=hex(4), src=vgpr(tmp),
+          comment="scaleMXSA: 16*p'"))
+      module.add(VAddU32(
+          dst=vgpr(row), src0=vgpr(row), src1=vgpr(tmp),
+          comment="scaleMXSA: exact canonical row"))
+      module.add(VMulLOU32(
+          dst=vgpr(row), src0=sgpr("StridesMXSA"), src1=vgpr(row),
+          comment="scaleMXSA: canonical row * scale stride"))
+      module.add(VLShiftRightB32(
+          dst=vgpr(tmp), shiftHex=hex(5), src=vgpr(q),
+          comment="scaleMXSA: 2*(L'/16) plus high bits"))
+      module.add(VAndB32(
+          dst=vgpr(tmp), src0=6, src1=vgpr(tmp),
+          comment="scaleMXSA: canonical K-byte pair"))
+      module.add(VAddU32(
+          dst=vgpr(row), src0=vgpr(row), src1=vgpr(tmp),
+          comment="scaleMXSA: canonical byte address"))
+      for subIterK in range(2):
+        dst = gathered + 2 * subIterK + tileInGroup
+        module.add(BufferLoadU8(
+            dst=vgpr(dst), vaddr=vgpr(row),
+            saddr=sgpr("SrdMXSA", 4), soffset=0,
+            mubuf=MUBUFModifiers(
+                offen=True, offset12=subIterK,
+                glc=isGlc, slc=isSlc, nt=isNT),
+            comment=("scaleMXSA[group%u]: tile %u K-byte %u"
+                     % (scaleGroupIdx, 2 * scaleGroupIdx + tileInGroup,
+                        subIterK))))
+
+    module.add(SWaitCnt(
+        vlcnt=0, comment="scaleMXSA: canonical byte gather landed"))
+    # Each u8 load is zero-extended.  First form [even, odd] pairs, then join
+    # the two K pairs as [even k0, odd k0, even k1, odd k1].
+    packSel = writer.sgprPool.checkOut(
+        2, tag="emitScaleGroupDirectGlobalRead_mxsaPackSel")
+    module.add(SMovB32(
+        dst=sgpr(packSel), src=0x05010400,
+        comment="scaleMXSA: two-byte pair selector"))
+    module.add(SMovB32(
+        dst=sgpr(packSel + 1), src=0x05040100,
+        comment="scaleMXSA: K-pair join selector"))
+    module.add(VPermB32(
+        dst=vgpr(gathered), src0=vgpr(gathered + 1),
+        src1=vgpr(gathered), src2=sgpr(packSel),
+        comment="scaleMXSA: pack K0 tile pair"))
+    module.add(VPermB32(
+        dst=vgpr(gathered + 2), src0=vgpr(gathered + 3),
+        src1=vgpr(gathered + 2), src2=sgpr(packSel),
+        comment="scaleMXSA: pack K1 tile pair"))
+    module.add(VPermB32(
+        dst=vgpr(vdst), src0=vgpr(gathered + 2),
+        src1=vgpr(gathered), src2=sgpr(packSel + 1),
+        comment="scaleMXSA: pack MFMA sAsel byte order"))
+    writer.sgprPool.checkIn(packSel)
+    writer.vgprPool.checkIn(gathered)
+    writer.vgprPool.checkIn(addr)
+    return module
+
+  vaddr = writer.vgprPool.checkOut(2, tag="emitScaleGroupDirectGlobalRead_vaddr")
+  line = vaddr + 1
+  mubuf = MUBUFModifiers(
+      offen=True, offset12=0, glc=isGlc, slc=isSlc, nt=isNT)
+
+  def emitAddress(offset):
+    if offset:
+      offsetSgpr = writer.sgprPool.checkOut(
+          1, tag="emitScaleGroupDirectGlobalRead_offset")
+      module.add(SMovB32(
+          dst=sgpr(offsetSgpr), src=offset,
+          comment="scale%s[group%u]: LDS group byte offset" %
+                  (tc, scaleGroupIdx)))
+      module.add(VAddU32(
+          dst=vgpr(vaddr), src0=vgpr(tileInfo.sharedVgprLROffset[0]),
+          src1=sgpr(offsetSgpr),
+          comment="scale%s[group%u]: q = LDS consumer byte" %
+                  (tc, scaleGroupIdx)))
+      writer.sgprPool.checkIn(offsetSgpr)
+    else:
+      module.add(VMovB32(
+          dst=vgpr(vaddr), src=vgpr(tileInfo.sharedVgprLROffset[0]),
+          comment="scale%s[group%u]: q = LDS consumer byte" %
+                  (tc, scaleGroupIdx)))
+    module.add(VLShiftRightB32(
+        dst=vgpr(line), shiftHex=hex(8), src=vgpr(vaddr),
+        comment="scale%s[group%u]: producer 256B line" %
+                (tc, scaleGroupIdx)))
+    module.add(VMulLOU32(
+        dst=vgpr(line), src0=sgpr("Strides%s" % tc), src1=vgpr(line),
+        comment="scale%s[group%u]: line * global scale stride" %
+                (tc, scaleGroupIdx)))
+    module.add(VAndB32(
+        dst=vgpr(vaddr), src0=255, src1=vgpr(vaddr),
+        comment="scale%s[group%u]: byte within producer line" %
+                (tc, scaleGroupIdx)))
+    module.add(VAddU32(
+        dst=vgpr(vaddr), src0=vgpr(line), src1=vgpr(vaddr),
+        comment="scale%s[group%u]: exact global byte offset" %
+                (tc, scaleGroupIdx)))
+
+  emitAddress(byteOffset)
+  module.add(BufferLoadB32(
+      dst=vgpr(vdst),
+      vaddr=vgpr(vaddr),
+      saddr=sgpr("Srd%s" % tc, 4), soffset=0, mubuf=mubuf,
+      comment="scale%s[group%u]: direct global dword 0 to MFMA VGPR"
+              % (tc, scaleGroupIdx)))
+  if scaleRemapEnabled(kernel, tc):
+    emitAddress(byteOffset + 4)
+    module.add(BufferLoadB32(
+        dst=vgpr(vdst + 1),
+        vaddr=vgpr(vaddr),
+        saddr=sgpr("Srd%s" % tc, 4), soffset=0, mubuf=mubuf,
+        comment="scale%s[group%u]: direct global dword 1 to pack VGPR"
+                % (tc, scaleGroupIdx)))
+  writer.vgprPool.checkIn(vaddr)
+  return module
+
+
+def emitScaleLaneContiguousGlobalRead(writer, kernel, tileInfo, tc, vdst):
+  """Load one lane's four packed scale-group dwords for a K/256 phase."""
+  assert scaleLaneContiguousGFX950Enabled(kernel)
+  assert scaleDirectToVgprEnabled(kernel, tc)
+  isGlc = bool(kernel["NonTemporal%s" % tc] & 0x1)
+  isSlc = bool(kernel["NonTemporal%s" % tc] & 0x2)
+  isNT = bool(kernel["NonTemporal%s" % tc] & 0x4)
+  module = Module()
+  module.add(BufferLoadB128(
+      dst=vgpr(vdst, 4),
+      vaddr=vgpr(tileInfo.sharedVgprGROffset[0]),
+      saddr=sgpr("Srd%s" % tc, 4), soffset=0,
+      mubuf=MUBUFModifiers(
+          offen=True, offset12=0, glc=isGlc, slc=isSlc, nt=isNT),
+      comment="scale%s: packed-record-refill groups 0..3 for one K/256 phase" % tc))
+  return module
 
 def emitSubtileScaleDsRead(tc, writer, kernel, scaleGroupIdx):
   """Emit the LDS read for a scale group (2 M-adjacent [1,2] subtiles)."""
@@ -659,11 +1021,7 @@ def emitSubtileScaleDsRead(tc, writer, kernel, scaleGroupIdx):
 
   # TileInfo LR subtile (2,2) already spans 2 M-adjacent tiles -> stride = lrSubtileSize.
   # Legacy TileInfo subtile (1,2) spans 1 M-tile -> stride = 2 * subtileSize.
-  if hasattr(tileInfo, 'lrSubtileSize'):
-    groupStride = int(tileInfo.lrSubtileSize)
-  else:
-    groupStride = 2 * tileInfo.subtileSize
-  dsOffset = groupStride * scaleGroupIdx
+  dsOffset = scaleGroupBlockedOffset(tileInfo, scaleGroupIdx)
   vdst = tileInfo.vgprTiles[4 * scaleGroupIdx].regList.indices[0]
   module.add(emitScaleGroupLoad(writer, kernel, tileInfo, tc, vdst, scaleGroupIdx, dsOffset,
                                 "scale%s[group%u]: load 4B from LDS" % (tc, scaleGroupIdx)))
@@ -690,6 +1048,20 @@ def localReadDoScaleSubtile(tc, writer, kernel):
 #
 def globalReadScalePtrUpdates(tc, writer, kernel):
   ti_ = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
+  if scaleLaneContiguousGFX950Enabled(kernel):
+    module = Module()
+    module.addComment0("Packed scale SRD update: %s += 1024-byte K tile" % tc)
+    module.add(SAddU32(
+        dst=sgpr("Srd%s" % tc), src0=sgpr("Srd%s" % tc), src1=1024))
+    module.add(SAddCU32(
+        dst=sgpr("Srd%s+1" % tc), src0=sgpr("Srd%s+1" % tc), src1=0))
+    module.add(SSubU32(
+        dst=sgpr("Srd%s+2" % tc), src0=sgpr("Srd%s+2" % tc), src1=1024,
+        comment="packed scale: shrink remaining buffer limit"))
+    module.add(SCSelectB32(
+        dst=sgpr("Srd%s+2" % tc), src0=sgpr("Srd%s+2" % tc), src1=0,
+        comment="packed scale: saturate limit at zero"))
+    return module
   return emitScaleGRPtrUpdate(ti_, writer, kernel)
 
 ##################################################

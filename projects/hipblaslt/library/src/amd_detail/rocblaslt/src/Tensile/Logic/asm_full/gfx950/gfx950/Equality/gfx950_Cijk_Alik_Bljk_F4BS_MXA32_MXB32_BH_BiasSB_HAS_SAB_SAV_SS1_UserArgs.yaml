@@ -145,11 +145,11 @@
     DirectToLds: 1
     DirectToLdsA: true
     DirectToLdsB: true
-    DirectToLdsMXSA: true
+    DirectToLdsMXSA: false
     DirectToLdsMXSB: true
     DirectToVgprA: false
     DirectToVgprB: false
-    DirectToVgprMXSA: false
+    DirectToVgprMXSA: true
     DirectToVgprMXSB: false
     DirectToVgprSparseMetadata: false
     DtlPlusLdsBuf: 0
@@ -250,7 +250,7 @@
     LocalWritePerMfma: -1
     LocalWriteUseSgprA: true
     LocalWriteUseSgprB: true
-    LocalWriteUseSgprMXSA: true
+    LocalWriteUseSgprMXSA: false
     LocalWriteUseSgprMXSB: true
     LoopIters: 2
     LoopUnroll: 256
@@ -379,7 +379,20 @@
     StoreSyncOpt: 0
     StoreVectorWidth: -1
     StreamK: 0
+    SubtileDirectToVgprScale: 0
+    SubtileFirstMfmaAccZero: 1
+    SubtileFlyKInner: 1
+    SubtileUnifiedKSchedule: 0
+    SubtileNativeWholeLoopScheduler: 0
+    SubtileFlyPhaseWait: 1
+    SubtileFlyNMajor: 1
+    SubtileFlyAParityLds: 1
+    SubtileFlyStorePacketGeometry: 0
+    SubtilePostBarrierNop: 1
+    SubtileScaleBatchPack: 0
+    SubtileSingleMainloopBarrier: 0
     SubtileStoreInNLL: 1
+    SubtileRollingPeel: 1
     StreamKAtomic: 0
     StreamKFixupTreeReduction: 0
     StreamKXCCMapping: 0

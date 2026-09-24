@@ -34,6 +34,7 @@ happy paths; this module fills the negative-coverage gap.
 
 import pytest
 
+from Tensile.KernelWriterAssembly import _packedScaleSrdLimitShift
 from Tensile.SolutionStructs.Solution import (
     _deriveAndValidateMXScaleLayoutAndTransport,
 )
@@ -42,6 +43,14 @@ from Tensile.SolutionStructs.Solution import (
 ISA_GFX942  = (9, 4, 2)
 ISA_GFX950  = (9, 5, 0)
 ISA_GFX1250 = (12, 5, 0)
+
+def test_lane_contiguous_srd_limit_covers_free_macro_tile():
+    kernel = {"MacroTile0": 256, "MacroTile1": 256}
+    assert _packedScaleSrdLimitShift(kernel, "MXSA") == 8
+    assert _packedScaleSrdLimitShift(kernel, "MXSB") == 8
+    # Runtime StridesMXS is K/32. At K=768 the complete workgroup
+    # allocation is 256 free rows * 24 K blocks, not 8 * 24.
+    assert (24 << _packedScaleSrdLimitShift(kernel, "MXSA")) == 6144
 
 
 def _make_state(*,
@@ -208,6 +217,18 @@ REJECT_CASES = [
         dict(),
         id="host_pre_swizzle_off_gfx950",
     ),
+    pytest.param(
+        dict(isa=ISA_GFX1250, mxLoadInst="BufferLoad",
+             mxScaleFormat="LaneContiguousGFX950", tdmInst=0, streamK=0),
+        dict(),
+        id="lane_contiguous_off_gfx950",
+    ),
+    pytest.param(
+        dict(isa=ISA_GFX950, mxLoadInst="TDM",
+             mxScaleFormat="LaneContiguousGFX950", tdmInst=3, streamK=0),
+        dict(),
+        id="lane_contiguous_with_tdm",
+    ),
     # 8. MXLoadInst=TDM currently only produces InMemorySwizzle.
     pytest.param(
         dict(mxLoadInst="TDM", mxScaleFormat="NoSwizzle", tdmInst=3),
@@ -272,7 +293,8 @@ class TestRejectComplements:
 @pytest.mark.parametrize("isa,mxLoadInst,mxScaleFormat,tdmInst,streamK", [
     (ISA_GFX1250, "TDM",        "InMemorySwizzle", 3, 3),
     (ISA_GFX950,  "BufferLoad", "HostPreSwizzle",  0, 0),
-], ids=["TDM_IMS_gfx1250", "BL_HPS_gfx950"])
+    (ISA_GFX950,  "BufferLoad", "LaneContiguousGFX950", 0, 0),
+], ids=["TDM_IMS_gfx1250", "BL_HPS_gfx950", "BL_LC_gfx950"])
 def test_explicit_valid_pair(isa, mxLoadInst, mxScaleFormat, tdmInst, streamK):
     state = _make_state(isa=isa, mxLoadInst=mxLoadInst,
                         mxScaleFormat=mxScaleFormat, tdmInst=tdmInst,

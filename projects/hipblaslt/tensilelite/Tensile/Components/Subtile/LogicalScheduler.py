@@ -24,11 +24,12 @@ The schedule is built in these passes:
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Callable, ClassVar, Dict, List, Optional, Tuple, Union
+from typing import Callable, ClassVar, Dict, Iterable, List, Optional, Tuple, Union
 from bisect import bisect_left
 import copy
 import io
 import math
+import re
 
 from rocisa.code import Module
 from .ScheduleTypes import (
@@ -52,7 +53,9 @@ def _scale_tile_vgpr_count(kernel, defaultCount):
     register with a v_perm; that needs an aligned pair. Condition mirrors
     TileInfo.lrInterleaveVW.
     """
-    if kernel is not None and kernel.get("SourceSwap", False) \
+    if kernel is not None \
+       and kernel.get("MXScaleFormat") != "LaneContiguousGFX950" \
+       and kernel.get("SourceSwap", False) \
        and int(kernel.get("VectorWidthA", 1)) > 1:
         return 2
     return defaultCount
@@ -73,7 +76,25 @@ def _checkout_tile(pool, numRegs, tag):
 
 def _checkin_tile(tile):
     """Return a contiguous tile to its pool via its base-register handle."""
+    if getattr(tile, "_sharedAllocationOwner", True) is False:
+        return
     tile.regList.pool.checkIn(tile.regList.indices[0])
+
+
+def _checkout_packed_scale_records(pool, count, tag):
+    """Allocate scale tiles as four-dword records for dwordx4 destinations."""
+    from Tensile.Components.Subtile.Kernel import RegisterTileInfo
+    assert count % 4 == 0, (
+        "lane-contiguous scale allocation requires a multiple of four groups")
+    tiles = []
+    for _ in range(count // 4):
+        base = pool.checkOutAligned(4, 4, tag=tag)
+        for group in range(4):
+            tile = RegisterTileInfo(pool)
+            tile.append(base + group)
+            tile._sharedAllocationOwner = (group == 0)
+            tiles.append(tile)
+    return tiles
 
 
 def _hoistSetupBeforeLastMFMA(loopBody, setupInsts):
@@ -130,6 +151,153 @@ def _emitBodySetupBranch(module, loopBody, setupInsts, branch, hoist):
         for s in setupInsts:
             module.add(s)
     module.add(branch)
+
+
+_MFMA_K_COMMENT_RE = re.compile(r"K=(\d+)")
+
+
+def _reorderMainloopMFMAsKInner(module):
+    """Interleave ready K0/K1 MFMAs by accumulator, preserving instruction slots."""
+    from rocisa.container import RegisterContainer
+    from rocisa.instruction import (
+        LocalReadInstruction, MFMAInstruction, MXMFMAInstruction, SWaitCnt)
+
+    def vgpr_indices(container):
+        if not isinstance(container, RegisterContainer) or container.regType != 'v':
+            return set()
+        return set(range(container.regIdx, container.regIdx + container.regNum))
+
+    items = list(module.flatitems())
+    records = []
+    for idx, inst in enumerate(items):
+        if not isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            continue
+        match = _MFMA_K_COMMENT_RE.search(getattr(inst, "comment", "") or "")
+        if match is None:
+            continue
+        records.append((idx, int(match.group(1)), inst))
+
+    k0 = [(idx, inst) for idx, k, inst in records if k == 0]
+    k1 = [(idx, inst) for idx, k, inst in records if k == 1]
+    if not k0 or not k1:
+        return module
+    assert len(k0) == len(k1), "K-inner reorder requires paired K0/K1 MFMAs"
+
+    k1_sources = set()
+    for _, inst in k1:
+        k1_sources.update(vgpr_indices(inst.a))
+        k1_sources.update(vgpr_indices(inst.b))
+
+    last_k1_read = -1
+    for idx, inst in enumerate(items):
+        if not isinstance(inst, LocalReadInstruction):
+            continue
+        params = inst.getParams()
+        dst = params[0] if params else None
+        if vgpr_indices(dst) & k1_sources:
+            last_k1_read = idx
+    assert last_k1_read >= 0, "K-inner reorder could not find K1 operand reads"
+
+    first_k1 = min(idx for idx, _ in k1)
+    waits = [
+        idx for idx in range(last_k1_read + 1, first_k1)
+        if isinstance(items[idx], SWaitCnt) and items[idx].dscnt == 0
+    ]
+    assert waits, "K-inner reorder could not find K1 readiness wait"
+    # Preserve every scheduler-imposed drain before the original K1 block.
+    ready = waits[-1]
+
+    movable_slots = [
+        idx for idx, _, _ in records if idx > ready
+    ]
+    fixed_ids = {
+        id(inst) for idx, _, inst in records if idx <= ready
+    }
+    by_acc = {}
+    k0_order = []
+    for _, k, inst in records:
+        acc = (inst.acc.regType, inst.acc.regIdx, inst.acc.regNum)
+        if acc not in by_acc:
+            by_acc[acc] = {}
+            k0_order.append(acc)
+        by_acc[acc][k] = inst
+
+    reordered = []
+    for acc in k0_order:
+        pair = by_acc[acc]
+        for k in (0, 1):
+            inst = pair[k]
+            if id(inst) not in fixed_ids:
+                reordered.append(inst)
+    assert len(reordered) == len(movable_slots)
+
+    rebuilt = Module(module.name)
+    replacements = dict(zip(movable_slots, reordered))
+    for idx, inst in enumerate(items):
+        rebuilt.add(replacements.get(idx, inst))
+    return rebuilt
+
+
+def _removeFirstMainloopBarrier(module):
+    """Drop the read-complete barrier while retaining the data-ready barrier."""
+    from rocisa.instruction import SBarrier
+
+    rebuilt = Module(module.name)
+    removed = False
+    for inst in module.flatitems():
+        if not removed and isinstance(inst, SBarrier):
+            removed = True
+            continue
+        rebuilt.add(inst)
+    assert removed, "single-barrier experiment found no main-loop barrier"
+    return rebuilt
+
+
+def _insertNopAfterLastMainloopBarrier(module):
+    """Separate the data-ready barrier from its first post-barrier issue."""
+    from rocisa.instruction import SBarrier, SNop
+
+    items = list(module.flatitems())
+    barriers = [idx for idx, inst in enumerate(items)
+                if isinstance(inst, SBarrier)]
+    assert barriers, "post-barrier nop experiment found no main-loop barrier"
+    target = barriers[-1]
+
+    rebuilt = Module(module.name)
+    for idx, inst in enumerate(items):
+        rebuilt.add(inst)
+        if idx == target:
+            rebuilt.add(SNop(
+                waitState=0,
+                comment="FlyDSL-style post data-ready barrier separation"))
+    return rebuilt
+
+
+def _replaceLastMainloopPhaseWait(module):
+    """Use FlyDSL's partial VMEM/LDS threshold at the data-ready barrier."""
+    from rocisa.instruction import SBarrier, SWaitCnt
+
+    items = list(module.flatitems())
+    barriers = [idx for idx, inst in enumerate(items)
+                if isinstance(inst, SBarrier)]
+    assert barriers, "Fly phase-wait experiment found no main-loop barrier"
+    target = -1
+    for idx in range(barriers[-1] - 1, -1, -1):
+        inst = items[idx]
+        if isinstance(inst, SWaitCnt) and inst.vlcnt >= 0:
+            target = idx
+            break
+    assert target >= 0, "Fly phase-wait experiment found no VMEM wait"
+
+    rebuilt = Module(module.name)
+    for idx, inst in enumerate(items):
+        if idx == target:
+            rebuilt.add(SWaitCnt(
+                vlcnt=10, dscnt=9,
+                comment="FlyDSL-style phase wait before data-ready barrier"))
+        else:
+            rebuilt.add(inst)
+    return rebuilt
 
 
 class Pass(IntEnum):
@@ -247,6 +415,8 @@ class SchedulerConfig:
     pgr: int = 2              # Prefetch Global Read
     grPlacement: GRPlacementStrategy = GRPlacementStrategy.SPREAD
     pgl: int = 0              # Prefetch GL2 (0=off, 1 or 2 tiles ahead)
+    rollingPeel: bool = False # Experimental FlyDSL-style in-place peeled exit
+    nativeWholeLoop: bool = False # Native 32-slot C0/C1 operand graph
 
     # Resolve a partition spec into per-partition sizes along one dimension.
     # spec is either:
@@ -458,7 +628,7 @@ class GRPlacement(Emittable):
     deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     postOps: List['BaseOp'] = field(default_factory=list)    # populated by insert_gr_lr_inc()
-
+    vgpr_tile_map: List[dict] = field(default_factory=list)  # direct-GR destination map per unroll iter
     def __post_init__(self):
         self.kind = 'gr'
 
@@ -671,6 +841,321 @@ class Dep:
 
 
 
+@dataclass(frozen=True, order=True)
+class PeeledOperandValue:
+    """One logical operand fragment in the combined NGLL/NLL exit."""
+    tensor: str
+    phase: int
+    group: int
+
+
+@dataclass(frozen=True)
+class PeeledOperandLifetime:
+    """Closed live interval for one peeled-exit operand fragment."""
+    value: PeeledOperandValue
+    define_at: int
+    first_use: int
+    last_use: int
+    pinned_id: Optional[int] = None
+    reuse_after: Optional[PeeledOperandValue] = None
+
+    def __post_init__(self):
+        if self.first_use < self.define_at:
+            raise ValueError(f"{self.value} is used before it is defined")
+        if self.last_use < self.first_use:
+            raise ValueError(f"{self.value} has an invalid use interval")
+        if self.pinned_id is not None and self.pinned_id < 0:
+            raise ValueError("pinned operand tile IDs must be non-negative")
+
+
+@dataclass(frozen=True)
+class PeeledOperandAllocation:
+    """Physical tile IDs and per-tensor peaks for a peeled exit."""
+    tile_ids: Dict[PeeledOperandValue, int]
+    peaks: Dict[str, int]
+
+
+def buildPeeledOperandLifetimes(
+    uses: Iterable[Tuple[int, PeeledOperandValue]],
+    definitions: Dict[PeeledOperandValue, int],
+    entry_tile_ids: Dict[PeeledOperandValue, int],
+    refill_of: Optional[Dict[PeeledOperandValue, PeeledOperandValue]] = None,
+) -> List[PeeledOperandLifetime]:
+    """Build exact operand intervals from peeled-exit definitions and uses."""
+    refill_of = refill_of or {}
+    by_value: Dict[PeeledOperandValue, List[int]] = {}
+    for sequence, value in uses:
+        if sequence < 0:
+            raise ValueError("peeled operand use positions must be non-negative")
+        by_value.setdefault(value, []).append(sequence)
+
+    known = set(definitions) | set(entry_tile_ids)
+    missing = set(by_value) - known
+    if missing:
+        raise ValueError(f"peeled operands have no definition or live-in: {missing}")
+    unused = set(definitions) - set(by_value)
+    if unused:
+        raise ValueError(f"peeled operand definitions have no consumers: {unused}")
+    duplicate = set(definitions) & set(entry_tile_ids)
+    if duplicate:
+        raise ValueError(f"peeled operands cannot be definitions and live-ins: {duplicate}")
+
+    lifetimes = []
+    for value, positions in by_value.items():
+        lifetimes.append(PeeledOperandLifetime(
+            value=value,
+            define_at=definitions.get(value, -1),
+            first_use=min(positions),
+            last_use=max(positions),
+            pinned_id=entry_tile_ids.get(value),
+            reuse_after=refill_of.get(value),
+        ))
+    return sorted(lifetimes, key=lambda lifetime: (
+        lifetime.define_at, lifetime.first_use, lifetime.value))
+
+
+def allocatePeeledOperandLifetimes(
+    lifetimes: Iterable[PeeledOperandLifetime],
+    base_peaks: Dict[str, int],
+) -> PeeledOperandAllocation:
+    """Allocate peeled operands, reusing a tile only after its final use."""
+    intervals = list(lifetimes)
+    by_value = {interval.value: interval for interval in intervals}
+    if len(by_value) != len(intervals):
+        raise ValueError("peeled operand values must have one lifetime")
+
+    tile_ids: Dict[PeeledOperandValue, int] = {}
+    peaks = dict(base_peaks)
+    active: Dict[str, Dict[int, PeeledOperandValue]] = {}
+
+    for interval in sorted(intervals, key=lambda item: (
+            item.define_at, item.first_use, item.value)):
+        tensor = interval.value.tensor
+        owners = active.setdefault(tensor, {})
+        for tile_id, owner in list(owners.items()):
+            if by_value[owner].last_use < interval.define_at:
+                del owners[tile_id]
+
+        if interval.pinned_id is not None:
+            tile_id = interval.pinned_id
+        elif interval.reuse_after is not None:
+            predecessor = interval.reuse_after
+            if predecessor not in tile_ids:
+                raise ValueError(f"{interval.value} reuses unknown {predecessor}")
+            if by_value[predecessor].last_use >= interval.define_at:
+                raise ValueError(
+                    f"{interval.value} overwrites live operand {predecessor}")
+            tile_id = tile_ids[predecessor]
+        else:
+            limit = peaks.get(tensor, 0)
+            tile_id = next(
+                (candidate for candidate in range(limit)
+                 if candidate not in owners),
+                limit,
+            )
+
+        if tile_id in owners:
+            raise ValueError(
+                f"{interval.value} overlaps {owners[tile_id]} on "
+                f"{tensor} tile {tile_id}")
+        owners[tile_id] = interval.value
+        tile_ids[interval.value] = tile_id
+        peaks[tensor] = max(peaks.get(tensor, 0), tile_id + 1)
+
+    return PeeledOperandAllocation(tile_ids=tile_ids, peaks=peaks)
+
+
+def planRollingPeeledMFMAOrder(
+    num_m: int,
+    num_n: int,
+    m_block: int = 4,
+    phases: int = 4,
+) -> List[Tuple[int, int, int]]:
+    """Return FlyDSL's two-macro ``(phase, m, n)`` peeled order."""
+    if (min(num_m, num_n, m_block, phases) <= 0
+            or num_m % m_block or num_n % 8 or phases != 4):
+        raise ValueError(
+            "faithful peel requires four phases, divisible M blocks, "
+            "and divisible N blocks")
+    return [
+        (phase_base + sub_k, tile_m, tile_n)
+        for phase_base in (0, 2)
+        for n_start in range(0, num_n, 2)
+        for tile_m in range(num_m)
+        for sub_k in range(2)
+        for tile_n in range(n_start, n_start + 2)
+    ]
+
+
+@dataclass(frozen=True)
+class WholeLoopOperand:
+    """One logical A/B value in the native two-copy loop."""
+    tensor: str
+    phase: int
+    tile: int
+
+
+@dataclass
+class WholeLoopEvent:
+    """A node in the native whole-loop dependency graph."""
+    event_id: int
+    kind: str
+    copy: int
+    phase: Optional[int] = None
+    tile_m: Optional[int] = None
+    tile_n: Optional[int] = None
+    operand: Optional[WholeLoopOperand] = None
+    slot: Optional[int] = None
+    deps: set = field(default_factory=set)
+    final_uses: Tuple[WholeLoopOperand, ...] = ()
+
+
+@dataclass
+class NativeWholeLoopSchedule:
+    """Single dependency graph for C0, C1, refills, readiness and barriers."""
+    events: List[WholeLoopEvent]
+    slots: Dict[WholeLoopOperand, int]
+    final_use: Dict[WholeLoopOperand, int]
+
+    @property
+    def live_slot_count(self) -> int:
+        return len(set(self.slots.values()))
+
+    def topological_events(self) -> List[WholeLoopEvent]:
+        """Return the deterministic executable order of the whole graph."""
+        by_id = {event.event_id: event for event in self.events}
+        pending = {event.event_id: set(event.deps) for event in self.events}
+        ready = [event_id for event_id, deps in pending.items() if not deps]
+        ordered = []
+        while ready:
+            event_id = min(ready)
+            ready.remove(event_id)
+            ordered.append(by_id[event_id])
+            del pending[event_id]
+            for candidate, deps in pending.items():
+                deps.discard(event_id)
+                if not deps and candidate not in ready:
+                    ready.append(candidate)
+        if pending:
+            raise RuntimeError(
+                f"native whole-loop dependency cycle: {sorted(pending)}")
+        return ordered
+
+
+def buildNativeWholeLoopSchedule(
+    num_m: int = 8,
+    num_n: int = 8,
+) -> NativeWholeLoopSchedule:
+    """Build the native C0/C1 operand graph for FlyDSL's 32-slot pool.
+
+    Phases 0/1 are consumed by C0 and refill their physical slots with
+    phases 2/3 for C1.  C1 similarly refills phases 4/5 for the next C0.
+    Refill nodes are inserted immediately after the overwritten value's exact
+    final use.  A copy-level LDS drain and barrier makes all of those refills
+    visible to the following copy; scale readiness is an explicit predecessor
+    of every MFMA in its phase.
+    """
+    if num_m != 8 or num_n != 8:
+        raise ValueError("native whole-loop scheduling requires an 8x8 MFMA tile")
+
+    peeled_order = planRollingPeeledMFMAOrder(num_m, num_n)
+    # C0 uses Fly's blocked two-column stream so each dead A/B slot can be
+    # refilled promptly. C1 is the terminating copy: complete one output
+    # column at a time. The folded-store lowering starts reading an accumulator
+    # packet as soon as its final producer is observed, so the later columns
+    # provide the required producer-to-read runway. Using C0's blocked order
+    # for C1 made all column packets become ready together at the loop tail.
+    order = peeled_order[:128] + sorted(
+        peeled_order[128:], key=lambda cell: (cell[2], cell[1], cell[0]))
+    # Extend the same C0/C1 order by one C0 so C1 refills have real consumers.
+    uses = order + [(phase + 4, m, n)
+                    for phase, m, n in peeled_order[:128]]
+    slots = {}
+    for phase in range(6):
+        bank = phase & 1
+        for tile in range(8):
+            slots[WholeLoopOperand("A", phase, tile)] = bank * 8 + tile
+            slots[WholeLoopOperand("B", phase, tile)] = 16 + bank * 8 + tile
+
+    last_sequence = {}
+    for sequence, (phase, tile_m, tile_n) in enumerate(uses):
+        last_sequence[WholeLoopOperand("A", phase, tile_m)] = sequence
+        last_sequence[WholeLoopOperand("B", phase, tile_n)] = sequence
+
+    events = []
+    event_by_use = {}
+    scale_ready = {}
+
+    def add(kind, copy, **kwargs):
+        event = WholeLoopEvent(len(events), kind, copy, **kwargs)
+        events.append(event)
+        return event
+
+    for phase in range(4):
+        scale_ready[phase] = add("scale_ready", phase // 2, phase=phase)
+
+    prior_copy_barrier = None
+    refill_event = {}
+    final_use = {}
+    for sequence, (phase, tile_m, tile_n) in enumerate(order):
+        copy_id = phase // 2
+        mfma = add("mfma", copy_id, phase=phase,
+                   tile_m=tile_m, tile_n=tile_n)
+        mfma.deps.add(scale_ready[phase].event_id)
+        if prior_copy_barrier is not None:
+            mfma.deps.add(prior_copy_barrier.event_id)
+        for operand in (
+                WholeLoopOperand("A", phase, tile_m),
+                WholeLoopOperand("B", phase, tile_n)):
+            incoming = refill_event.get(operand)
+            if incoming is not None:
+                mfma.deps.add(incoming.event_id)
+            event_by_use[(sequence, operand)] = mfma
+            if last_sequence[operand] == sequence:
+                final_use[operand] = mfma.event_id
+                target = WholeLoopOperand(
+                    operand.tensor, operand.phase + 2, operand.tile)
+                refill = add("refill", copy_id, phase=target.phase,
+                             operand=target, slot=slots[target])
+                refill.deps.add(mfma.event_id)
+                refill_event[target] = refill
+                mfma.final_uses += (operand,)
+
+        # The final MFMA of each copy is followed by one readiness fence.
+        if sequence in (127, 255):
+            copy_refills = [
+                event for event in events
+                if event.kind == "refill" and event.copy == copy_id
+            ]
+            drain = add("refill_wait", copy_id)
+            drain.deps.update(event.event_id for event in copy_refills)
+            barrier = add("barrier", copy_id)
+            barrier.deps.add(drain.event_id)
+            prior_copy_barrier = barrier
+            for next_phase in (2 * copy_id + 2, 2 * copy_id + 3):
+                if next_phase < 4:
+                    scale_ready[next_phase].deps.add(barrier.event_id)
+
+    # Validate every overwrite and every cross-K/copy consumer edge in the
+    # graph itself, rather than relying on emitted instruction order.
+    for target, refill in refill_event.items():
+        predecessor = WholeLoopOperand(
+            target.tensor, target.phase - 2, target.tile)
+        assert final_use[predecessor] in refill.deps
+    final_barrier = next(
+        event for event in events
+        if event.kind == "barrier" and event.copy == 1)
+    next_c0 = add("next_c0_ready", 2)
+    next_c0.deps.add(final_barrier.event_id)
+    next_c0.deps.update(
+        event.event_id for event in events
+        if event.kind == "refill" and event.copy == 1)
+    if len({event.slot for event in events if event.kind == "refill"}) != 32:
+        raise RuntimeError("native whole-loop schedule must refill all 32 slots")
+
+    return NativeWholeLoopSchedule(events, slots, final_use)
+
+
 # ── Emitted output ─────────────────────────────────────────
 
 @dataclass
@@ -688,6 +1173,57 @@ class EmittedModule:
     @property
     def opType(self) -> str:
         return self.source.kind if self.source else ""
+
+
+def combineEmittedSubIterK(emittedLists: List[List[EmittedModule]]) -> List[EmittedModule]:
+    """Clone independent emitted graphs into one dense-ID scheduler graph.
+
+    GR chains are serialized across subIterK boundaries. The logical
+    remove_unnecessary_wait_lr_sync pass deliberately removes the later
+    chain's dependency when the preceding subIterK GR chain already contains
+    the LR drain/barrier. Separate instructionSchedule calls supplied that
+    ordering implicitly; a unified window must make it explicit.
+    """
+    combined = []
+    previousGrTail = None
+    for emitted in emittedLists:
+        idMap = {}
+        for em in emitted:
+            assert em.moduleId not in idMap, \
+                f"duplicate EmittedModule id {em.moduleId} in subIterK graph"
+            idMap[em.moduleId] = len(combined)
+            combined.append(EmittedModule(
+                moduleId=len(combined),
+                instructions=list(em.instructions),
+                source=em.source,
+            ))
+        first = len(combined) - len(emitted)
+        for offset, em in enumerate(emitted):
+            if em.before is not None:
+                assert em.before in idMap, \
+                    f"cross-graph or dangling before reference {em.before}"
+                combined[first + offset].before = idMap[em.before]
+
+        grIds = {em.moduleId for em in emitted if em.opType == "gr"}
+        if grIds:
+            grChildren = {
+                em.before for em in emitted
+                if em.before in grIds
+            }
+            grTails = [moduleId for moduleId in grIds
+                       if moduleId not in grChildren]
+            assert len(grTails) == 1, \
+                f"unified K scheduling expects one GR chain tail, got {grTails}"
+
+            rootGrs = [em for em in emitted
+                       if em.opType == "gr" and em.before is None]
+            if previousGrTail is not None and rootGrs:
+                assert len(rootGrs) == 1, \
+                    f"unified K scheduling expects one dependency-free GR root, got {len(rootGrs)}"
+                combined[idMap[rootGrs[0].moduleId]].before = previousGrTail
+
+            previousGrTail = idMap[grTails[0]]
+    return combined
 
 
 # ── Main scheduler class ───────────────────────────────────
@@ -709,6 +1245,10 @@ class LogicalScheduler:
 
     def __init__(self, config: SchedulerConfig):
         self.config = config
+        self.native_whole_loop_schedule = (
+            buildNativeWholeLoopSchedule(
+                config.numMFMATilesM, config.numMFMATilesN)
+            if config.nativeWholeLoop else None)
         self.tensors: List[str] = ['A', 'B'] + (['SA', 'SB'] if config.hasScale else [])
         # Shared mutable state across passes. The same field holds different
         # stage representations over time; see ScheduleTypes for stage meanings.
@@ -1209,10 +1749,56 @@ class LogicalScheduler:
 
         num_sets = 1 if pgr0 else 2
         self.tile_peaks = {t: num_sets * max_groups[t] for t in self.tensors}
+        if cfg.rollingPeel:
+            assert (cfg.pgr == 2 and not self._is_multi_du()
+                    and cfg.numPartitions == 1
+                    and cfg.numSubIterK == 2
+                    and cfg.numMFMATilesM == 8
+                    and cfg.numMFMATilesN == 8), \
+                "rolling peel is only defined for the 8x8 two-K single-DU PGR2 path"
+            # The peel aliases the ordinary two operand banks. Phases 2/3
+            # refill the phase 0/1 slots only after their final consumers.
         self.compact_b_overlay = False
         self.unroll_factor = unroll_factor
         self.needs_unrolling = unroll_factor > 1
+        self._deterministic_vgpr_state = (
+            lr_grans, group_to_pos, max_groups, num_k_groups, pgr0)
 
+    def _assign_gr_vgpr_tiles_deterministic(self, placements=None):
+        """Attach direct-GR destination maps after GR placement."""
+        state = getattr(self, "_deterministic_vgpr_state", None)
+        if state is None:
+            return
+        lr_grans, group_to_pos, max_groups, num_k_groups, pgr0 = state
+        if placements is None:
+            placements = [
+                gr for slots in self._partitions
+                for slot in slots for gr in slot.grs
+            ]
+        for gr in placements:
+            gr.vgpr_tile_map.clear()
+            for unroll_iter in range(self.unroll_factor):
+                tensor = gr.tensor
+                if tensor not in ("SA", "SB"):
+                    continue
+                gran = lr_grans[tensor]
+                if pgr0:
+                    set_idx = 0
+                else:
+                    nkg = num_k_groups[tensor]
+                    target_mt = unroll_iter + gr.mtIteration
+                    set_idx = (
+                        target_mt * nkg
+                        + gr.tiles.subIterK_start // gran.k) % 2
+                tile_map = {}
+                for t in gr.tiles.tileId_list:
+                    group = (t // gran.mn) * gran.mn
+                    if group in tile_map:
+                        continue
+                    pos = group_to_pos[tensor][group]
+                    tile_map[group] = (
+                        set_idx * max_groups[tensor] + pos)
+                gr.vgpr_tile_map.append(tile_map)
 
     # ── Place GRs ─────────────────────────────────────────
 
@@ -1511,6 +2097,7 @@ class LogicalScheduler:
             else:
                 self._distribute_grs(gr_list, gr_slot_bounds, unrollId=uid)
 
+        self._assign_gr_vgpr_tiles_deterministic()
         return self._partitions[0]
 
     # ── Annotate dependencies ─────────────────────────────
@@ -3419,6 +4006,10 @@ class LogicalScheduler:
                     SkipOp(compare='LE', value=2, target='NGLL'),
                 ])
 
+        self._assign_gr_vgpr_tiles_deterministic([
+            em.source for em in emitted
+            if em.opType == "gr" and em.source.tensor in ("SA", "SB")
+        ])
         self._preloop_emitted = [[emitted]]
         return self._preloop_emitted
 
@@ -3458,8 +4049,41 @@ class LogicalScheduler:
         pap_merge_label = Label("SubtilePAPPreloopFirstGRMerge", "") if use_pap_preloop_skip else None
         skipping_first_gr_group = False
         first_gr_group_done = False
+        unifiedK = bool(
+            schedule
+            and kernel.get("SubtileUnifiedKSchedule", 0)
+            and label.startswith("MAINLOOP_C")
+        )
+        if kernel.get("SubtileUnifiedKSchedule", 0):
+            supported = (
+                tuple(kernel.get("ISA", ())) == (9, 5, 0)
+                and kernel.get("UseSubtileImpl", False)
+                and kernel.get("SourceSwap", False)
+                and self.config.numPartitions == 1
+                and self.config.numSubIterK == 2
+                and self.config.pgr == 2
+                and list(kernel.get("MIWaveTile", [])) == [8, 8]
+            )
+            if not supported:
+                raise ValueError(
+                    "SubtileUnifiedKSchedule requires gfx950, UseSubtileImpl, "
+                    "SourceSwap, one partition, two subIterK steps, PGR2, and "
+                    "MIWaveTile 8x8")
+
+        if unifiedK:
+            # Each MAINLOOP_C copy is scheduled independently, so no operation
+            # can cross the copy's externally emitted exit branch.
+            module.addComment0("partition=0 subIterK=0,1 unified")
+            combined = combineEmittedSubIterK(emitted_3d[0])
+            module.add(instructionSchedule(
+                combined,
+                multiDU=self._is_multi_du(),
+                minGapDsReadToWait=minGapDsReadToWait))
+
         for pi, partition_emitted in enumerate(emitted_3d):
             for k, em_list in enumerate(partition_emitted):
+                if unifiedK:
+                    continue
                 module.addComment0(f"partition={pi} subIterK={k}")
                 has_mfma = any(em.opType == 'mfma' for em in em_list)
 
@@ -3491,6 +4115,26 @@ class LogicalScheduler:
             module.add(SMovB32(dst=sgpr("SkPrefetchPrimed"), src=0,
                                comment="Subtile PAP: clear after first PRELOOP GR merge"))
         module.addComment0(f"{label} end")
+        if (kernel.get("SubtileFlyKInner", 0)
+                and not unifiedK
+                and label.startswith("MAINLOOP_C")):
+            module = _reorderMainloopMFMAsKInner(module)
+        phaseTransformLoop = (
+            label.startswith("MAINLOOP_C")
+            or (
+                label == "FIRST_MAINLOOP_C0"
+                and kernel.get("SubtileFirstMainloopSync", 0)
+            )
+        )
+        if (kernel.get("SubtileSingleMainloopBarrier", 0)
+                and phaseTransformLoop):
+            module = _removeFirstMainloopBarrier(module)
+        if (kernel.get("SubtilePostBarrierNop", 0)
+                and phaseTransformLoop):
+            module = _insertNopAfterLastMainloopBarrier(module)
+        if (kernel.get("SubtileFlyPhaseWait", 0)
+                and phaseTransformLoop):
+            module = _replaceLastMainloopPhaseWait(module)
         if label.startswith("NLL_C") and kernel.get("SubtileStoreInNLL", 0):
             from Tensile.Components.Subtile.StoreInNLL import interleaveSubtileStoreInNLL
             module = interleaveSubtileStoreInNLL(
@@ -3512,6 +4156,302 @@ class LogicalScheduler:
         from Tensile.Components.Subtile.ClusterBarrier import insertClusterBarrier
         module = insertClusterBarrier(module, writer, kernel)
         return module
+
+    def _use_rolling_peeled_exit(self, kernel) -> bool:
+        """Whether the target-only four-phase rolling exit is enabled."""
+        return bool(
+            self.config.rollingPeel
+            and kernel.get("SubtileRollingPeel", 0)
+            and kernel.get("SubtileStoreInNLL", 0)
+            and self.config.numPartitions == 1
+            and self.config.numSubIterK == 2
+            and self.config.numMFMATilesM == 8
+            and self.config.numMFMATilesN == 8
+        )
+
+    def _use_first_mfma_acc_zero(self, kernel) -> bool:
+        """Whether to peel C0 and zero accumulators in its first producers."""
+        return bool(
+            kernel.get("SubtileFirstMfmaAccZero", 0)
+            and self._use_rolling_peeled_exit(kernel)
+            and self.config.pgr == 2
+            and self.unroll_factor == 2
+        )
+
+    @staticmethod
+    def _find_exit_mfma_placement(emitted, sub_iter_k):
+        matches = [
+            em.source
+            for partition in emitted
+            for slot in partition
+            for em in slot
+            if em.opType == "mfma" and em.source.subIterK == sub_iter_k
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"rolling peel expected one MFMA placement for K={sub_iter_k}, "
+                f"found {len(matches)}")
+        return matches[0]
+
+    def _emit_rolling_peeled_exit(self, writer, kernel, label,
+                                  ngll_ui, nll_ui):
+        """Emit a two-macro exit with last-use in-place operand refills."""
+        from rocisa.code import Module
+        from rocisa.instruction import (
+            LocalReadInstruction,
+            MFMAInstruction,
+            MXMFMAInstruction,
+            SBarrier,
+            SWaitCnt,
+            VPermB32,
+            VXorB32,
+        )
+        from Tensile.Components.Subtile.StoreInNLL import (
+            interleaveSubtileStoreInNLL,
+        )
+        from Tensile.Components.Subtile.SubtileLREmit import (
+            emitSingleDsRead,
+            localReadLDSBufferSwap,
+        )
+        from Tensile.Components.Subtile.SubtileScaleEmit import (
+            emitScaleGroupLoad,
+            scaleDirectToVgprEnabled,
+            scaleGroupBlockedOffset,
+        )
+
+        emitter = self._emitter
+        phases = [
+            self._find_exit_mfma_placement(self._ngll_emitted, 0),
+            self._find_exit_mfma_placement(self._ngll_emitted, 1),
+            self._find_exit_mfma_placement(self._nll_emitted, 0),
+            self._find_exit_mfma_placement(self._nll_emitted, 1),
+        ]
+        phase_uis = [ngll_ui, ngll_ui, nll_ui, nll_ui]
+
+        module = Module(label)
+        module.addComment0(f"{label} faithful full-K peel start")
+
+        # Reuse the proven NGLL control schedule, but replace every MFMA/LR,
+        # LR wait/pack, and canonical LR swap with the explicit rolling stream.
+        control = self._emitLoop(
+            writer, kernel, f"{label}_CONTROL",
+            self._ngll_per_unroll[ngll_ui])
+        for item in control.flatitems():
+            if isinstance(item, (MFMAInstruction, MXMFMAInstruction,
+                                 LocalReadInstruction, VXorB32, VPermB32)):
+                continue
+            if isinstance(item, SWaitCnt):
+                comment = getattr(item, "comment", "")
+                if "LR" in comment or "scale" in comment:
+                    continue
+            module.add(item)
+
+        ti_a = emitter.tileInfoMap["A"]
+        ti_b = emitter.tileInfoMap["B"]
+        swizzled = writer.states.subtileLdsSwizzle
+
+        def read_a(row, k, tile_id):
+            module.add(emitSingleDsRead(
+                ti_a, row, 0, k, emitter.vgprTilesA[tile_id],
+                swizzled=swizzled))
+
+        def read_b(column, k, tile_id):
+            module.add(emitSingleDsRead(
+                ti_b, column, 0, k, emitter.vgprTilesB[tile_id],
+                swizzled=swizzled))
+
+        def swap(tensor):
+            tc = {"SA": "MXSA", "SB": "MXSB"}.get(tensor, tensor)
+            module.add(localReadLDSBufferSwap(tc, writer, kernel))
+
+        def wait_lr():
+            module.add(SWaitCnt(
+                dscnt=0, vlcnt=-1, vscnt=-1,
+                comment="faithful peel: in-place refills ready"))
+
+        def group_for(tensor, tile):
+            gran = {
+                "A": self.config.lrA, "B": self.config.lrB,
+                "SA": self.config.lrSA, "SB": self.config.lrSB,
+            }[tensor]
+            return (tile // gran.mn) * gran.mn
+
+        def tile_id(phase, tensor, tile):
+            maps = phases[phase].vgpr_tile_maps[tensor][phase_uis[phase]]
+            return maps[group_for(tensor, tile)]
+
+        # Materialize fallback tensors' two LDS scale banks because their
+        # canonical local reads were removed with the control schedule.
+        # A direct tensor already populated the corresponding tile-map banks,
+        # so it must retain those banks without an LDS read or scale swap.
+        for tensor, tc, tiles, count in (
+                ("SA", "MXSA", emitter.vgprTilesSA, 8),
+                ("SB", "MXSB", emitter.vgprTilesSB, 8)):
+            if scaleDirectToVgprEnabled(kernel, tc):
+                continue
+            ti = emitter.tileInfoMap[tensor]
+            for group in range(0, count, 2):
+                entry_id = tile_id(0, tensor, group)
+                blocked_offset = scaleGroupBlockedOffset(ti, group // 2)
+                module.add(emitScaleGroupLoad(
+                    writer, kernel, ti, tc, next(iter(tiles[entry_id])),
+                    group // 2, blocked_offset,
+                    f"faithful peel {tc} group {group // 2} first macro"))
+            swap(tensor)
+            for group in range(0, count, 2):
+                target_id = tile_id(2, tensor, group)
+                blocked_offset = scaleGroupBlockedOffset(ti, group // 2)
+                module.add(emitScaleGroupLoad(
+                    writer, kernel, ti, tc,
+                    next(iter(tiles[target_id])),
+                    group // 2, blocked_offset,
+                    f"faithful peel {tc} group {group // 2} second macro"))
+            swap(tensor)
+
+        # Reload the first macro into the ordinary two banks.
+        for row in range(8):
+            read_a(row, 0, tile_id(0, "A", row))
+            read_a(row, 1, tile_id(1, "A", row))
+        for column in range(8):
+            read_b(column, 0, tile_id(0, "B", column))
+            read_b(column, 1, tile_id(1, "B", column))
+        wait_lr()
+
+        swap("A")
+        swap("B")
+
+        order = planRollingPeeledMFMAOrder(8, 8)
+
+        if not kernel.get("SubtileNativeWholeLoopScheduler", 0):
+            # Keep the retained control byte-for-byte on its original lowering
+            # path. Native scheduling must not share ordering, refill, or
+            # lifetime helpers with this block.
+            first_macro = order[:128]
+            last_use = {}
+            for sequence, (phase, row, column) in enumerate(first_macro):
+                last_use[("A", phase, row)] = sequence
+                last_use[("B", phase, column)] = sequence
+
+            refilled = set()
+            for sequence, (phase, row, column) in enumerate(first_macro):
+                operand_tiles = {
+                    tensor: tiles[tile_id(phase, tensor, tile)]
+                    for tensor, tiles, tile in (
+                        ("A", emitter.vgprTilesA, row),
+                        ("B", emitter.vgprTilesB, column),
+                        ("SA", emitter.vgprTilesSA, row),
+                        ("SB", emitter.vgprTilesSB, column),
+                    )
+                }
+                module.addItems(emitter.emit_mfma_cell(
+                    phases[phase], row, column,
+                    unroll_iter=phase_uis[phase],
+                    operand_tiles=operand_tiles))
+
+                for tensor, tile, read in (
+                        ("A", row, read_a), ("B", column, read_b)):
+                    key = (tensor, phase, tile)
+                    if last_use[key] != sequence or key in refilled:
+                        continue
+                    old_id = tile_id(phase, tensor, tile)
+                    new_id = tile_id(phase + 2, tensor, tile)
+                    if old_id != new_id:
+                        raise RuntimeError(
+                            f"faithful peel requires in-place {tensor} reuse: "
+                            f"phase {phase} tile {tile} maps "
+                            f"{old_id}->{new_id}")
+                    read(tile, (phase + 2) & 1, old_id)
+                    refilled.add(key)
+
+            if len(refilled) != 32:
+                raise RuntimeError(
+                    f"faithful peel expected 32 operand refills, "
+                    f"got {len(refilled)}")
+            wait_lr()
+            swap("A")
+            swap("B")
+
+            second_macro = sorted(
+                order[128:], key=lambda cell: (cell[2], cell[1], cell[0]))
+            for phase, row, column in second_macro:
+                operand_tiles = {
+                    tensor: tiles[tile_id(phase, tensor, tile)]
+                    for tensor, tiles, tile in (
+                        ("A", emitter.vgprTilesA, row),
+                        ("B", emitter.vgprTilesB, column),
+                        ("SA", emitter.vgprTilesSA, row),
+                        ("SB", emitter.vgprTilesSB, column),
+                    )
+                }
+                module.addItems(emitter.emit_mfma_cell(
+                    phases[phase], row, column,
+                    unroll_iter=phase_uis[phase],
+                    operand_tiles=operand_tiles))
+        else:
+            assert self.native_whole_loop_schedule is not None
+
+            def emit_native_cell(phase, row, column):
+                operand_tiles = {
+                    tensor: tiles[tile_id(phase, tensor, tile)]
+                    for tensor, tiles, tile in (
+                        ("A", emitter.vgprTilesA, row),
+                        ("B", emitter.vgprTilesB, column),
+                        ("SA", emitter.vgprTilesSA, row),
+                        ("SB", emitter.vgprTilesSB, column),
+                    )
+                }
+                module.addItems(emitter.emit_mfma_cell(
+                    phases[phase], row, column,
+                    unroll_iter=phase_uis[phase],
+                    operand_tiles=operand_tiles))
+
+            def emit_native_refill(event):
+                tensor = event.operand.tensor
+                phase = event.operand.phase
+                tile = event.operand.tile
+                old_id = tile_id(phase - 2, tensor, tile)
+                new_id = tile_id(phase, tensor, tile)
+                if old_id != new_id:
+                    raise RuntimeError(
+                        f"native whole-loop requires in-place {tensor} reuse: "
+                        f"phase {phase - 2} tile {tile} maps "
+                        f"{old_id}->{new_id}")
+                (read_a if tensor == "A" else read_b)(
+                    tile, phase & 1, old_id)
+
+            native_events = self.native_whole_loop_schedule.topological_events()
+            native_refills = 0
+            for event in native_events:
+                if event.copy != 0:
+                    continue
+                if event.kind == "mfma":
+                    emit_native_cell(
+                        event.phase, event.tile_m, event.tile_n)
+                elif event.kind == "refill":
+                    emit_native_refill(event)
+                    native_refills += 1
+                elif event.kind == "refill_wait":
+                    wait_lr()
+                elif event.kind == "barrier":
+                    module.add(SBarrier(
+                        comment="native whole-loop C0/C1 refill barrier"))
+                    swap("A")
+                    swap("B")
+
+            if native_refills != 32:
+                raise RuntimeError(
+                    f"native whole-loop expected 32 operand refills, "
+                    f"got {native_refills}")
+
+            for event in self.native_whole_loop_schedule.topological_events():
+                if event.copy == 1 and event.kind == "mfma":
+                    emit_native_cell(
+                        event.phase, event.tile_m, event.tile_n)
+
+        module.addComment0(f"{label} faithful full-K peel end")
+        return interleaveSubtileStoreInNLL(
+            module, writer, kernel, writer.states.d.tileInfo,
+            minMfmaGap=0, issueRate=6, fourRowPackets=True)
 
     def _emit_pgr2_tail_lw_align(self, kernel):
         """Re-align LW_base parity with the LR vgpr at the tail entry.
@@ -3562,8 +4502,8 @@ class LogicalScheduler:
         runtime K%DU counter setup and skip branch.
         """
         from rocisa.code import Module, Label
-        from rocisa.instruction import (SSubU32, SCmpEQU32, SCBranchSCC0,
-                                        SCBranchSCC1, SBranch)
+        from rocisa.instruction import (SSubU32, SCmpEQU32, SCmpLeU32,
+                                        SCBranchSCC0, SCBranchSCC1, SBranch)
         from rocisa.container import sgpr
 
         assert self._emitter is not None, \
@@ -3571,6 +4511,7 @@ class LogicalScheduler:
 
         module = Module("MainAndExitLoops")
         uf = self.unroll_factor
+        firstMfmaAccZero = self._use_first_mfma_acc_zero(kernel)
 
         # gfx1250 requires a loop-back/exit s_cbranch to be alone/first after an
         # MFMA, so hoist the per-copy dec+compare above the body's last MFMA.
@@ -3650,6 +4591,12 @@ class LogicalScheduler:
         # Operate on a copy so self._preloop_emitted (read by PAP and the
         # per-unroll copies) stays untouched.
         preloop_emitted = copy.deepcopy(self._preloop_emitted)
+        if kernel["NoTailLoop"] and firstMfmaAccZero:
+            em_list = preloop_emitted[0][0]
+            init_idx = next((i for i, em in enumerate(em_list)
+                             if getattr(em.source, 'label', None) == 'initC_overlap'), None)
+            assert init_idx is not None, "preloop must contain the canonical initC op"
+            em_list.pop(init_idx)
         if not kernel["NoTailLoop"]:
             em_list = preloop_emitted[0][0]
             init_idx = next((i for i, em in enumerate(em_list)
@@ -3666,6 +4613,22 @@ class LogicalScheduler:
                                     comment="K < DepthU: jump to tail loop"),
                 ]))
             next_id += 1
+            if firstMfmaAccZero:
+                skipInitLabel = Label("SkipInitCForFirstProducerZero", "")
+                em_list.insert(init_idx + 2, EmittedModule(
+                    moduleId=next_id,
+                    instructions=[skipInitLabel]))
+                next_id += 1
+                em_list.insert(init_idx, EmittedModule(
+                    moduleId=next_id,
+                    instructions=[
+                        SCmpLeU32(src0=sgpr("LoopCounterL"), src1=self.config.pgr,
+                                  comment="short path still needs explicit initC"),
+                        SCBranchSCC0(
+                            labelName=skipInitLabel.getLabelName(),
+                            comment="full mainloop uses first-producer acc2=0"),
+                    ]))
+                next_id += 1
             if skipGRForTail:
                 # Land the skip-GR guard right before initC.
                 em_list.insert(init_idx, EmittedModule(
@@ -3676,11 +4639,34 @@ class LogicalScheduler:
 
         # ── Mainloop ──
         module.addComment0("MAINLOOP")
-        loopBegin = Label("LoopBeginL", "", alignment=16)
+        loopBegin = Label(
+            "LoopBeginL", "",
+            alignment=256 if kernel.get("SubtileAlignMainloop256", 0) else 16)
 
         exitValue = self.config.pgr
 
-        exitLabels = [Label(f"ExitC{ui}", "") for ui in range(uf - 1)]
+        exitLabels = [
+            Label(f"ExitC{ui}", "")
+            for ui in range(uf if firstMfmaAccZero else uf - 1)
+        ]
+        if firstMfmaAccZero:
+            assert self._first_mainloop_emitted is not None
+            module.addComment0("FIRST_MAINLOOP_C0_ACC2_ZERO")
+            firstBody = self._emitLoop(
+                writer, kernel, "FIRST_MAINLOOP_C0",
+                self._first_mainloop_emitted)
+            firstSetup = [
+                SSubU32(dst=sgpr("LoopCounterL"),
+                        src0=sgpr("LoopCounterL"), src1=1,
+                        comment="dec counterL (peeled first C0)"),
+                SCmpEQU32(src0=sgpr("LoopCounterL"), src1=exitValue,
+                          comment="counterL == exit after peeled first C0?"),
+            ]
+            _emitBodySetupBranch(
+                module, firstBody, firstSetup,
+                SCBranchSCC1(labelName=exitLabels[0].getLabelName(),
+                              comment="peeled first C0 exit"),
+                hoist=isGfx1250)
         module.add(loopBegin)
         # Debug: emit `s_mov_b32 m0, LoopCounterL; s_ttracedata` at the start of
         # every mainloop iteration so SQTT / trace decoders can identify iterations
@@ -3690,7 +4676,8 @@ class LogicalScheduler:
             from rocisa.container import mgpr
             from rocisa.instruction import SMovB32 as _SMovB32
             from rocisa.instruction import STtraceData as _STtraceData
-        for ui in range(uf):
+        loopOrder = [1, 0] if firstMfmaAccZero else list(range(uf))
+        for orderIdx, ui in enumerate(loopOrder):
             if emitTraceMarker:
                 # Mainloop iteration marker for SQTT / trace decoder: write
                 # LoopCounterL into M0 then emit it via s_ttracedata. Decoder
@@ -3708,7 +4695,7 @@ class LogicalScheduler:
                 SCmpEQU32(src0=sgpr("LoopCounterL"), src1=exitValue,
                           comment=f"counterL == {exitValue}? (copy {ui} exit)"),
             ]
-            if ui < uf - 1:
+            if orderIdx < len(loopOrder) - 1:
                 branch = SCBranchSCC1(
                     labelName=exitLabels[ui].getLabelName(),
                     comment=f"copy {ui} exit → NGLL_C{ui}")
@@ -3731,6 +4718,42 @@ class LogicalScheduler:
         # We place SkipToNLL before whichever NLL block uses index 0.
         pgr = self.config.pgr
         last = uf - 1
+
+        if self._use_rolling_peeled_exit(kernel):
+            # Normal exits consume both reserved DepthU iterations in one
+            # four-phase stream.  The preloop's small-K entry still needs the
+            # ordinary standalone NLL because it has no NGLL producers.
+            fallthrough_ui = 0 if firstMfmaAccZero else last
+            nll_ft = (fallthrough_ui + pgr) % uf
+            if firstMfmaAccZero:
+                module.add(exitLabels[fallthrough_ui])
+            module.add(self._emit_rolling_peeled_exit(
+                writer, kernel, f"ROLLING_EXIT_C{fallthrough_ui}",
+                (fallthrough_ui + 1) % uf, nll_ft))
+            module.add(self._emit_pgr2_tail_lw_align(kernel))
+            module.add(SBranch(labelName=endLabel.getLabelName(),
+                               comment="skip other rolling exit paths"))
+
+            for ui in range(uf):
+                if ui == fallthrough_ui:
+                    continue
+                nll_idx = (ui + pgr) % uf
+                module.add(exitLabels[ui])
+                module.add(self._emit_rolling_peeled_exit(
+                    writer, kernel, f"ROLLING_EXIT_C{ui}",
+                    (ui + 1) % uf, nll_idx))
+                module.add(self._emit_pgr2_tail_lw_align(kernel))
+                module.add(SBranch(labelName=endLabel.getLabelName(),
+                                   comment="skip standalone early NLL"))
+
+            module.add(Label("SkipToNLL", ""))
+            module.addComment0("NLL_CEarly")
+            module.add(self._emitLoop(
+                writer, kernel, "NLL_CEarly",
+                inject_pap_after_nll_drain(self._nll_per_unroll[0])))
+            module.add(self._emit_pgr2_tail_lw_align(kernel))
+            module.add(endLabel)
+            return module
 
         # Fall-through from last mainloop copy
         nll_ft = (last + pgr) % uf
@@ -3868,10 +4891,18 @@ class LogicalScheduler:
             # Under the interleaved data map a scale group's two M-adjacent tiles sit in
             # adjacent dwords, so the group is read as a b64 and packed back down with a
             # v_perm. That needs an aligned pair per group instead of a single register.
-            self.vgprTilesSA = _alloc_tiles(self.tile_peaks.get('SA', 0),
-                                            _scale_tile_vgpr_count(kernel, _tile_vgpr_count(scaleTileInfoA, cfg.lrSA)))
-            self.vgprTilesSB = _alloc_tiles(self.tile_peaks.get('SB', 0),
-                                            _scale_tile_vgpr_count(kernel, _tile_vgpr_count(scaleTileInfoB, cfg.lrSB)))
+            if (kernel or {}).get("MXScaleFormat") == "LaneContiguousGFX950":
+                self.vgprTilesSA = _checkout_packed_scale_records(
+                    writer.vgprPool, self.tile_peaks.get('SA', 0),
+                    "allocVgprTiles_packedScaleA")
+                self.vgprTilesSB = _checkout_packed_scale_records(
+                    writer.vgprPool, self.tile_peaks.get('SB', 0),
+                    "allocVgprTiles_packedScaleB")
+            else:
+                self.vgprTilesSA = _alloc_tiles(self.tile_peaks.get('SA', 0),
+                                                _scale_tile_vgpr_count(kernel, _tile_vgpr_count(scaleTileInfoA, cfg.lrSA)))
+                self.vgprTilesSB = _alloc_tiles(self.tile_peaks.get('SB', 0),
+                                                _scale_tile_vgpr_count(kernel, _tile_vgpr_count(scaleTileInfoB, cfg.lrSB)))
         else:
             self.vgprTilesSA = []
             self.vgprTilesSB = []
@@ -4034,14 +5065,24 @@ class LogicalScheduler:
               _alloc_tiles(peaks.get('B', 0),
                            _tile_vgpr_count(info['tileInfoB'], cfg.lrB)))
         if cfg.hasScale and info['scaleTileInfoA'] and info['scaleTileInfoB']:
-            _swap(self.vgprTilesSA,
-                  _alloc_tiles(peaks.get('SA', 0),
-                               _scale_tile_vgpr_count(info.get('kernel'),
-                                                      _tile_vgpr_count(info['scaleTileInfoA'], cfg.lrSA))))
-            _swap(self.vgprTilesSB,
-                  _alloc_tiles(peaks.get('SB', 0),
-                               _scale_tile_vgpr_count(info.get('kernel'),
-                                                      _tile_vgpr_count(info['scaleTileInfoB'], cfg.lrSB))))
+            if (info.get('kernel') or {}).get("MXScaleFormat") == "LaneContiguousGFX950":
+                _swap(self.vgprTilesSA,
+                      _checkout_packed_scale_records(
+                          writer.vgprPool, peaks.get('SA', 0),
+                          "reallocTailTilesFlat_packedScaleA"))
+                _swap(self.vgprTilesSB,
+                      _checkout_packed_scale_records(
+                          writer.vgprPool, peaks.get('SB', 0),
+                          "reallocTailTilesFlat_packedScaleB"))
+            else:
+                _swap(self.vgprTilesSA,
+                      _alloc_tiles(peaks.get('SA', 0),
+                                   _scale_tile_vgpr_count(info.get('kernel'),
+                                                          _tile_vgpr_count(info['scaleTileInfoA'], cfg.lrSA))))
+                _swap(self.vgprTilesSB,
+                      _alloc_tiles(peaks.get('SB', 0),
+                                   _scale_tile_vgpr_count(info.get('kernel'),
+                                                          _tile_vgpr_count(info['scaleTileInfoB'], cfg.lrSB))))
         else:
             _swap(self.vgprTilesSA, [])
             _swap(self.vgprTilesSB, [])
@@ -4096,10 +5137,21 @@ class LogicalScheduler:
         self._emitted_per_unroll = []
         self._ngll_per_unroll = []
         self._nll_per_unroll = []
+        self._first_mainloop_emitted = None
         for ui in range(self.unroll_factor):
             em_copy = copy.deepcopy(self._emitted)
             emitter.populate(em_copy, unroll_iter=ui)
             self._emitted_per_unroll.append(em_copy)
+
+            if ui == 0 and self._use_first_mfma_acc_zero(kernel):
+                first_copy = copy.deepcopy(self._emitted)
+                for partition in first_copy:
+                    for slot in partition:
+                        for em in slot:
+                            if em.opType == "mfma" and em.source.subIterK == 0:
+                                em.source.firstProducerZero = True
+                emitter.populate(first_copy, unroll_iter=ui)
+                self._first_mainloop_emitted = first_copy
 
             ngll_copy = copy.deepcopy(self._ngll_emitted)
             emitter.populate(ngll_copy, unroll_iter=ui)

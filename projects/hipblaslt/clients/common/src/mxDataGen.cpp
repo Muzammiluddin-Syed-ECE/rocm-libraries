@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -364,6 +365,23 @@ std::vector<float> generateData(T                           dgen,
 
     switch(scaleLayout)
     {
+    case MXScaleLayout::LaneContiguousGFX950:
+    {
+        if((isMatrixA && !isTranspose) || (!isMatrixA && isTranspose))
+            throw std::runtime_error(
+                "LaneContiguousGFX950 is restricted to TN matrices");
+        auto packed = packMXScaleLaneContiguousGFX950(
+            scaleBytes, scaleCols, scaleRows, isMatrixA);
+        // The public client allocated the canonical scale element count.
+        // Focused kernels require complete 128-row x 8-K-block records, so
+        // reject geometries that would make packing grow that allocation.
+        if(packed.size() != scaleBytes.size())
+            throw std::runtime_error(
+                "LaneContiguousGFX950 requires free dimensions divisible by "
+                "128 and K-block counts divisible by 8");
+        scaleBytes = std::move(packed);
+        break;
+    }
     case MXScaleLayout::GFX950:
         scaleBytes = DGen::preSwizzleScalesGFX950(scaleBytes, {scaleCols, scaleRows});
         break;
@@ -604,6 +622,62 @@ void restrideMXScaleBufferKFast(uint8_t* buffer,
     std::memset(buffer + compactRow, 0x00, padTail);
 }
 
+size_t packedMXScaleLaneContiguousGFX950Size(size_t freeDim, size_t kBlocks)
+{
+    size_t const paddedFree = ((freeDim + 127) / 128) * 128;
+    size_t const paddedK    = ((kBlocks + 7) / 8) * 8;
+    return paddedFree * paddedK;
+}
+
+std::vector<uint8_t>
+    packMXScaleLaneContiguousGFX950(std::vector<uint8_t> const& canonical,
+                                    size_t                      freeDim,
+                                    size_t                      kBlocks,
+                                    bool                        isMatrixA)
+{
+    if(canonical.size() != freeDim * kBlocks)
+        throw std::runtime_error(
+            "packMXScaleLaneContiguousGFX950: canonical size mismatch");
+
+    size_t const freeTiles = (freeDim + 127) / 128;
+    size_t const kTiles    = (kBlocks + 7) / 8;
+    std::vector<uint8_t> packed(
+        packedMXScaleLaneContiguousGFX950Size(freeDim, kBlocks), 0);
+
+    for(size_t freeTile = 0; freeTile < freeTiles; ++freeTile)
+        for(size_t kTile = 0; kTile < kTiles; ++kTile)
+            for(size_t lane = 0; lane < 64; ++lane)
+                for(size_t group = 0; group < 4; ++group)
+                    for(size_t byte = 0; byte < 4; ++byte)
+                    {
+                        size_t const laneGroup = lane / 16;
+                        size_t const laneRow   = lane % 16;
+                        size_t const parity    = byte & 1;
+                        size_t const subIterK  = byte >> 1;
+                        size_t const kBlock    = 8 * kTile + 2 * laneGroup + subIterK;
+
+                        size_t row;
+                        if(isMatrixA)
+                        {
+                            size_t const tile = 2 * group + parity;
+                            row = 128 * freeTile + 4 * laneRow + (tile % 4)
+                                  + 64 * (tile / 4);
+                        }
+                        else
+                        {
+                            row = 128 * freeTile + 32 * group + 16 * parity + laneRow;
+                        }
+
+                        size_t const dst
+                            = ((((freeTile * kTiles + kTile) * 64 + lane) * 4 + group)
+                               * 4
+                               + byte);
+                        if(row < freeDim && kBlock < kBlocks)
+                            packed[dst] = canonical[row * kBlocks + kBlock];
+                    }
+    return packed;
+}
+
 void applyMXScaleLayoutInPlace(uint8_t*      scale,
                                size_t        scaleElemCount,
                                MXScaleLayout scaleLayout,
@@ -617,6 +691,9 @@ void applyMXScaleLayoutInPlace(uint8_t*      scale,
     std::vector<uint8_t> scaleBytes(scale, scale + scaleElemCount);
     switch(scaleLayout)
     {
+    case MXScaleLayout::LaneContiguousGFX950:
+        throw std::runtime_error(
+            "applyMXScaleLayoutInPlace requires operand identity for lane-contiguous packing");
     case MXScaleLayout::GFX950:
         scaleBytes = DGen::preSwizzleScalesGFX950(scaleBytes, {slowDim, fastDim});
         break;
@@ -643,7 +720,13 @@ MXScaleLayout mxScaleLayoutForFormat(hipblaslt_scaling_format scalingFormat,
                                      std::string_view       archName)
 {
     if(scalingFormat == hipblaslt_scaling_format::Block_32_UE8M0_32_8_EXT)
+    {
+        auto const* laneContiguous = std::getenv("HIPBLASLT_MX_LANE_CONTIGUOUS_GFX950");
+        if(laneContiguous != nullptr && laneContiguous[0] == '1'
+           && archName.find("gfx950") != std::string_view::npos)
+            return MXScaleLayout::LaneContiguousGFX950;
         return MXScaleLayout::GFX950;
+    }
     if(mxScaleLayoutForArchName(archName) == MXScaleLayout::GFX1250)
         return MXScaleLayout::GFX1250;
     return MXScaleLayout::None;

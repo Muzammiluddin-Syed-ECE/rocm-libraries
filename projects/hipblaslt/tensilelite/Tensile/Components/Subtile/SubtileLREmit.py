@@ -27,7 +27,9 @@ from rocisa.instruction import (
 )
 
 from .SubtileGeometry import (
+    FLY_A_PARITY_REGION_BYTES, FLY_A_PARITY_ROW_BYTES,
     SUBTILE_LDS_BLOCK_BYTES, assertLdsBlockPadSeparable, ldsBlockPadDelta, ldsBlockPadOffset,
+    flyAParityLdsEnabled,
     LRTag_1x1, LRTag_1x2, LRTag_TLU1,
 )
 from .SubtileScaleEmit import emitScaleLRLDSSwap
@@ -407,8 +409,31 @@ def _emitLaneRowBase(module, writer, tileInfo, ldsRowStride, vw, lane16, dstVgpr
   """
   tc = tileInfo.tc
   laneRowStride = ldsRowStride * vw
-  assert laneRowStride % SUBTILE_LDS_BLOCK_BYTES == 0 or not int(getattr(tileInfo, "ldsBlockPadBytes", 0)), \
-    "subtile LDS block pad: %s lane row stride %d must be a multiple of %d" % (tc, laneRowStride, SUBTILE_LDS_BLOCK_BYTES)
+  padBytes = int(getattr(tileInfo, "ldsBlockPadBytes", 0))
+  if padBytes and laneRowStride % SUBTILE_LDS_BLOCK_BYTES:
+    # The A4/B1 Fly map has sub-block lane strides, so pad(base) is not a
+    # constant multiplied by lane16. Form the exact runtime byte base first,
+    # then add one pad for every complete block it crosses.
+    if laneRowStride & (laneRowStride - 1) == 0:
+      module.add(VLShiftLeftB32(dst=vgpr(dstVgpr), shiftHex=hex(laneRowStride.bit_length()-1), src=vgpr(lane16), comment="offsetRow = %d*lane16" % laneRowStride))
+    else:
+      strideSgpr = writer.sgprPool.checkOut(1, tag="_lraTileAssignment_legacy_laneRowStride")
+      module.add(SMovB32(dst=sgpr(strideSgpr), src=hex(laneRowStride), comment="lane row stride %d" % laneRowStride))
+      module.add(VMulLOU32(dst=vgpr(dstVgpr), src0=sgpr(strideSgpr), src1=vgpr(lane16), comment="offsetRow = %d*lane16" % laneRowStride))
+      writer.sgprPool.checkIn(strideSgpr)
+    pad = writer.vgprPool.checkOut(1, tag="_lraTileAssignment_legacy_lanePad")
+    module.add(VLShiftRightB32(dst=vgpr(pad), shiftHex=hex(SUBTILE_LDS_BLOCK_BYTES.bit_length()-1), src=vgpr(dstVgpr), comment="%s: completed LDS pad blocks" % tc))
+    if padBytes & (padBytes - 1) == 0:
+      module.add(VLShiftLeftB32(dst=vgpr(pad), shiftHex=hex(padBytes.bit_length()-1), src=vgpr(pad), comment="%s: block padding bytes" % tc))
+    else:
+      padSgpr = writer.sgprPool.checkOut(1, tag="_lraTileAssignment_legacy_padBytes")
+      module.add(SMovB32(dst=sgpr(padSgpr), src=padBytes, comment="%s block padding bytes" % tc))
+      module.add(VMulLOU32(dst=vgpr(pad), src0=sgpr(padSgpr), src1=vgpr(pad), comment="%s: block padding bytes" % tc))
+      writer.sgprPool.checkIn(padSgpr)
+    module.add(VAddU32(dst=vgpr(dstVgpr), src0=vgpr(dstVgpr), src1=vgpr(pad), comment="%s: add exact lane block padding" % tc))
+    writer.vgprPool.checkIn(pad)
+    return
+
   laneRowStride = ldsBlockPadOffset(tileInfo, laneRowStride)
   # TDM pad (and any non-pow2 interleave) breaks the shift; fall back to VMul.
   if laneRowStride & (laneRowStride - 1) == 0:
@@ -632,7 +657,9 @@ def _lraTileAssignment_legacy(writer, kernel):
   ldsRowStride = ldsKBytes + padBytes
   numRowsPerLDSBanks = ldsRowBankSize // ldsKBytes
   blockSize = ldsKBytes // loadWidth
-  tmpVgpr = writer.vgprPool.checkOut(6, tag="_lraTileAssignment_legacy_tmpVgpr")
+  flyAParity = flyAParityLdsEnabled(kernel)
+  tmpCount = 8 if flyAParity else (7 if kernel.get("SubtileFlyNMajor", 0) else 6)
+  tmpVgpr = writer.vgprPool.checkOut(tmpCount, tag="_lraTileAssignment_legacy_tmpVgpr")
   lane16, lane16Group, rotation, rowOffset, colOffset = range(tmpVgpr, tmpVgpr + 5)
   module.add(VAndB32(dst=vgpr(lane16Group), src0=vgpr("Serial"), src1=wavesize-1, comment="laneId"))
   module.add(VLShiftRightB32(dst=vgpr(lane16Group), shiftHex=hex(mi_m.bit_length()-1), src=vgpr(lane16Group), comment="lane16Group"))
@@ -654,13 +681,32 @@ def _lraTileAssignment_legacy(writer, kernel):
   # each needs its own base; they share one register when the factors agree.
   vwA = int(getattr(tileInfoA, "lrInterleaveVW", 1))
   vwB = int(getattr(tileInfoB, "lrInterleaveVW", 1))
-  _emitLaneRowBase(module, writer, tileInfoA, ldsRowStride, vwA, lane16, rowOffset)
+  colOffsetA = colOffset
+  if flyAParity:
+    # A4 logical row = 4*lane16+tile.  In the parity layout its dynamic
+    # region-row component is lane16, and chunk c is stored at (c+lane16)%8.
+    module.add(VLShiftLeftB32(dst=vgpr(rowOffset), shiftHex=hex(7), src=vgpr(lane16),
+               comment="Fly A parity: region row lane16 * 128"))
+    colOffsetA = tmpVgpr + 7
+    module.add(VAddU32(dst=vgpr(colOffsetA), src0=vgpr(colOffset), src1=vgpr(lane16),
+                       comment="Fly A parity: swizzle chunk by region row"))
+    module.add(VAndB32(dst=vgpr(colOffsetA), src0=7, src1=vgpr(colOffsetA),
+                       comment="Fly A parity: physical chunk modulo 8"))
+  else:
+    _emitLaneRowBase(module, writer, tileInfoA, ldsRowStride, vwA, lane16, rowOffset)
   rowOffsetB = rowOffset
   if vwB != vwA:
     rowOffsetB = tmpVgpr + 5
     _emitLaneRowBase(module, writer, tileInfoB, ldsRowStride, vwB, lane16, rowOffsetB)
-  _computeLROffset(module, tileInfoA, colOffset, rowOffset, writer.states.subtileLdsSwizzle)
-  _computeLROffset(module, tileInfoB, colOffset, rowOffsetB, writer.states.subtileLdsSwizzle)
+  colOffsetB = colOffset
+  if kernel.get("SubtileFlyNMajor", 0):
+    colOffsetB = tmpVgpr + 6
+    module.add(VAddU32(dst=vgpr(colOffsetB), src0=vgpr(colOffset), src1=vgpr(lane16),
+                       comment="Fly B physical chunk = logical chunk + row"))
+    module.add(VAndB32(dst=vgpr(colOffsetB), src0=7, src1=vgpr(colOffsetB),
+                       comment="Fly B physical chunk modulo 8"))
+  _computeLROffset(module, tileInfoA, colOffsetA, rowOffset, writer.states.subtileLdsSwizzle)
+  _computeLROffset(module, tileInfoB, colOffsetB, rowOffsetB, writer.states.subtileLdsSwizzle)
   writer.vgprPool.checkIn(tmpVgpr)
   _lraWavePartitioning_legacy(module, writer, kernel)
   for vgprId in range(len(tileInfoB.sharedVgprLROffset)):
@@ -735,7 +781,14 @@ def emitSingleDsRead(tileInfo, sId0, sId1, subIterK, dstTile, swizzled=True):
       rowIdx = (sId0 % vw) + (instM * vw) * (sId0 // vw)
     else:
       rowIdx = sId0 * subtileShapeM * instM
-    offset = rowIdx * rowStride + sId1 * subtileShapeK * instK * int(tileInfo.bpe)
+    if getattr(tileInfo, "flyAParityLds", False):
+      # Dynamic address contains lane16's region row and swizzled chunk.
+      # Tile parity selects the 8-KiB region; each tile pair advances 16
+      # region rows (2 KiB), preserving the lane-dependent chunk rotation.
+      offset = ((sId0 & 1) * FLY_A_PARITY_REGION_BYTES
+                + (sId0 >> 1) * 16 * FLY_A_PARITY_ROW_BYTES)
+    else:
+      offset = rowIdx * rowStride + sId1 * subtileShapeK * instK * int(tileInfo.bpe)
     # These immediates cross block boundaries (unlike the non-subtile path, whose
     # reads all sit inside one block), so they need the pad applied too. The base
     # they are added to contributes at most one K-row below a block boundary.

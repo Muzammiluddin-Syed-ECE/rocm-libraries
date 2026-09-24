@@ -67,7 +67,9 @@ from .SubtileGeometry import (
   LoadShape,
   MMALayout,
   MMAScaleLayout,
+  flyAParityLdsEnabled,
   ldsBlockPadDelta,
+  subtileInterleaveVW,
   subtileLdsBlockPadBytes,
   MFMA_16x16_1B_4K_4V,
   MFMA_16x16_1B_4K_8V,
@@ -481,6 +483,15 @@ class TileInfo:
       # so a row is one contiguous DepthU, and row padding is mutually exclusive
       # with block padding.
       self.ldsBlockPadBytes = 0 if isTDM else subtileLdsBlockPadBytes(kernel, self.depthUBytes)
+      flyAParity = flyAParityLdsEnabled(kernel)
+      self.flyAParityLds = bool(flyAParity and tc == "A")
+      if flyAParity and tc == "A":
+        # This layout is a size-preserving bijection; generic LDS padding would
+        # invalidate its parity-region and 1-KiB producer-block boundaries.
+        self.ldsBlockPadBytes = 0
+      if kernel.get("SubtileFlyNMajor", 0) and tc == "B":
+        # B uses Fly's exact 1-KiB chunk swizzle instead of physical padding.
+        self.ldsBlockPadBytes = 0
       self.ldsRowPadBytes = 0 if self.ldsBlockPadBytes else (16 if isTDM else 0)
 
       # Local-read tile->row interleave factor.
@@ -489,7 +500,7 @@ class TileInfo:
       # SourceSwap gives up the intra-tile run of consecutive M values, so the store
       # can only reassemble a run of 8 if consecutive subtile rows are adjacent M rows.
       # That is what the interleaved map provides. See LAYOUT_MODEL.md sections 4 and 8.
-      self.lrInterleaveVW = int(kernel.get("VectorWidth%s" % tc, 1)) if kernel.get("SourceSwap", False) else 1
+      self.lrInterleaveVW = subtileInterleaveVW(kernel, tc)
       # Interleave groups per wave: VW consecutive rows per lane covers instM*VW of
       # the wave's rows in one pass, so MIWaveTile/VW passes cover them all. 1 is the
       # exact-tiling case (MIWaveTile == VW); above that the local read uses the
@@ -725,7 +736,9 @@ class TileInfo:
       # in the dword, which the MFMA's compile-time byte select cannot express. The
       # scale ds_read becomes a b64 and a v_perm with this per-lane selector packs the
       # four bytes into the layout the existing select already uses.
-      if kernel.get("SourceSwap", False) and int(kernel.get("VectorWidthA", 1)) > 1:
+      if kernel.get("MXScaleFormat") != "LaneContiguousGFX950" \
+         and kernel.get("SourceSwap", False) \
+         and int(kernel.get("VectorWidthA", 1)) > 1:
         self._sharedVgprScalePermSel = [writer.vgprPool.checkOut(1, tag="allocOffsetRegisters_sharedVgprScalePermSel")]
 
   def allocVgprTileRegisters_legacy(self, writer, kernel):
@@ -744,6 +757,7 @@ class TileInfo:
     # dwords, so the group is read as a b64 and packed back into the low register with
     # a v_perm; that needs an aligned pair. Condition mirrors lrInterleaveVW above.
     if isinstance(self.geometry, MXScaleTilePair) \
+       and kernel.get("MXScaleFormat") != "LaneContiguousGFX950" \
        and kernel.get("SourceSwap", False) and int(kernel.get("VectorWidthA", 1)) > 1:
       numDword = 2
 
@@ -1119,7 +1133,9 @@ def _selectF8F6F4InstType(kernel):
 # Given RegisterTileInfo inputs for A,B,C,D operands
 # emit corresponding mfma instruction
 #
-def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTileD, scaleAVgpr=-1, scaleBVgpr=-1, scaleAsel=-1, scaleBsel=-1, comment = ""):
+def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTileD,
+                        scaleAVgpr=-1, scaleBVgpr=-1, scaleAsel=-1,
+                        scaleBsel=-1, acc2Zero=False, comment=""):
   module = Module()
 
   vgprAStart = vgprTileA.regList.indices[0]
@@ -1138,6 +1154,8 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
   cIsVgpr = (vgprTileC.regList.pool == writer.vgprPool)
   dAccAlias = vgpr if (dIsVgpr or kernel["MIArchVgpr"]) else accvgpr
   cAccAlias = vgpr if (cIsVgpr or kernel["MIArchVgpr"]) else accvgpr
+  acc2Kwargs = ({"acc2_imm": 0} if acc2Zero
+                else {"acc2": cAccAlias(vgprCStart,opCSize)})
 
   aOperand = vgpr(vgprBStart,opBSize) if kernel["SourceSwap"] else vgpr(vgprAStart,opASize)
   bOperand = vgpr(vgprAStart,opASize) if kernel["SourceSwap"] else vgpr(vgprBStart,opBSize)
@@ -1161,9 +1179,9 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
                                    acc=dAccAlias(vgprDStart,opDSize), \
                                    a=aOperand, \
                                    b=bOperand, \
-                                   acc2=cAccAlias(vgprCStart,opCSize), \
                                    mxsa=vgpr(aScaleVgpr), mxsb=vgpr(bScaleVgpr), \
                                    vop3=VOP3PModifiers(op_sel=[aScaleSel%2, bScaleSel%2], op_sel_hi=[(aScaleSel>>1)%2, (bScaleSel>>1)%2]), \
+                                   **acc2Kwargs, \
                                    comment=comment))
     else:
       # Fallback: use unit scale VGPR pre-initialized to 0x7f7f7f7f (scale=1.0 E8M0).
@@ -1176,8 +1194,8 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
                                    acc=dAccAlias(vgprDStart,opDSize), \
                                    a=aOperand, \
                                    b=bOperand, \
-                                   acc2=cAccAlias(vgprCStart,opCSize), \
                                    mxsa=vgpr(unitScaleVgpr), mxsb=vgpr(unitScaleVgpr), \
+                                   **acc2Kwargs, \
                                    comment=comment))
   else:
     # BF16: 16x16x32
@@ -1185,7 +1203,7 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
                                acc=dAccAlias(vgprDStart,opDSize), \
                                a=aOperand, \
                                b=bOperand, \
-                               acc2=cAccAlias(vgprCStart,opCSize), \
+                               **acc2Kwargs, \
                                comment=comment))
 
   return module
@@ -1422,7 +1440,46 @@ def mainLoop(writer, kernel):
   vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
   M = tiA.localMMATileGrid[0]
   N = tiB.localMMATileGrid[0]
-  candidates = [(M, N)] if pgr == 0 else MFMASchedulerConfig.get_partition_candidates(tiA, tiB)
+  unifiedK = bool(kernel.get("SubtileUnifiedKSchedule", 0))
+  nativeWholeLoop = bool(kernel.get("SubtileNativeWholeLoopScheduler", 0))
+  if nativeWholeLoop:
+    supported = (
+        tuple(kernel.get("ISA", ())) == (9, 5, 0)
+        and kernel.get("UseSubtileImpl", False)
+        and kernel.get("SourceSwap", False)
+        and pgr == 2
+        and tiA.localMMATileGrid[1] == 2
+        and list(kernel.get("MIWaveTile", [])) == [8, 8]
+        and M == 8 and N == 8
+        and kernel.get("StreamK", 0) == 0
+        and not kernel.get("PrefetchAcrossPersistent", False)
+        and not unifiedK
+        and kernel.get("SubtileRollingPeel", 0)
+        and kernel.get("SubtileStoreInNLL", 0)
+    )
+    if not supported:
+      raise ValueError(
+          "SubtileNativeWholeLoopScheduler requires gfx950, UseSubtileImpl, "
+          "SourceSwap, an 8x8 two-K tile, PGR2, StreamK0, PAP0, and "
+          "SubtileUnifiedKSchedule=0 with RollingPeel+StoreInNLL")
+  if unifiedK:
+    supported = (
+        tuple(kernel.get("ISA", ())) == (9, 5, 0)
+        and kernel.get("UseSubtileImpl", False)
+        and kernel.get("SourceSwap", False)
+        and pgr == 2
+        and tiA.localMMATileGrid[1] == 2
+        and list(kernel.get("MIWaveTile", [])) == [8, 8]
+    )
+    if not supported:
+      raise ValueError(
+          "SubtileUnifiedKSchedule requires gfx950, UseSubtileImpl, SourceSwap, "
+          "two subIterK steps, PGR2, and MIWaveTile 8x8")
+  # The unified graph is audited only as one full 8x8 partition. Keeping the
+  # full-tile candidate also prevents a later VGPR-fit retry from silently
+  # changing the dependency geometry.
+  candidates = ([(M, N)] if pgr == 0 or unifiedK or nativeWholeLoop
+                else MFMASchedulerConfig.get_partition_candidates(tiA, tiB))
   for partSizeM, partSizeN in candidates:
       hasTDM = bool(kernel.get("enableTDMA")) and bool(kernel.get("enableTDMB"))
       grPlacement = (GRPlacementStrategy.BUNCHED if hasTDM
@@ -1444,6 +1501,18 @@ def mainLoop(writer, kernel):
           pgr=schedulerPgr,
           grPlacement=grPlacement,
           pgl=kernel.get("PrefetchGL2", 0),
+          nativeWholeLoop=nativeWholeLoop,
+          rollingPeel=bool(
+              kernel.get("SubtileRollingPeel", 0)
+              and kernel.get("SubtileStoreInNLL", 0)
+              and kernel.get("SourceSwap", False)
+              and tuple(kernel.get("ISA", ())) == (9, 5, 0)
+              and schedulerPgr == 2
+              and M == 8 and N == 8
+              and partSizeM == M and partSizeN == N
+              and tiA.localMMATileGrid[1] == 2
+              and not kernel.get("PrefetchAcrossPersistent", False)
+              and kernel.get("StreamK", 0) == 0),
       )
 
       scheduler = LogicalScheduler(cfg)
