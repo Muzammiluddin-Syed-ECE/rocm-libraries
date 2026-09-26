@@ -18485,7 +18485,47 @@ class KernelWriterAssembly(KernelWriter):
                          and kernel.get("UseSubtileImpl")
                          and len(miwt) >= 2 and miwt[0] >= 4
                          and (miwt[0] == 8 or foldFits))
-        numCvtVgprs = 9 if isSubtileFold else (7 if kernel.get("UseSubtileImpl") else 4)
+        # Running cursor over the cvt block.  +0..+6 are the shared staging window; each
+        # active feature appends its own disjoint sub-window, so no two offsets collide.
+        base = 7 if kernel.get("UseSubtileImpl") else 4
+        nxt  = base
+        foldVoff = foldBlend = -1
+        if isSubtileFold:
+          foldVoff, foldBlend = nxt, nxt + 1
+          nxt += 2
+        scalarAddrOff = scalarRingOff = -1
+        if scalarStore:
+          scalarAddrOff, scalarRingOff = nxt, nxt + 1
+          nxt += 1 + 2 * packPairs
+        col128Base = -1
+        if kernel.get("UseSubtileImpl") and \
+           plsinStoreCol128Active(kernel, True if self.states.subtileFusedFullTileStore else None):
+          col128Base = (nxt + 1) & ~1   # 2-align the second pack quad
+          nxt = col128Base + 7
+        numCvtVgprs = nxt if kernel.get("UseSubtileImpl") else 4
+        # Paired-store pack ring is blk-sched's permlane16 paired-store mechanism, held in
+        # its own allocation rather than appended to the cvt block (growing that block
+        # shifts store batching and drops the unpaired dwordx4 store).  Fold's dead-ValuC
+        # repack never names the ring, so keep it off under the fold.
+        pairQuads = 1
+        # plsinBlockSchedTile, not UseSubtileImpl alone: the ring is the only part
+        # of this store that spends registers, and permlane16 reaches every gfx950
+        # MI16 subtile kernel, including bf16-input ones whose accumulators already
+        # fill the VGPR file. Four more registers there push ValuC past the 256 cap
+        # and the kernel fails to assemble.  Fold's dead-ValuC repack never names the
+        # ring either, so keep it off under the fold as well (not isSubtileFold).
+        permForRing = plsinStorePermlane16Active(kernel, True if self.states.subtileFusedFullTileStore else None)
+        # Fold<->ring composition (TENSILE_PLSIN_FOLD_RING): the ring buffers the two
+        # M-adjacent pairs the DPP repack already blends (batchA in the cvt quad, batchB
+        # in ring slot 1), so the fold can source batchB from the ring instead of the
+        # dead-ValuC slots -- letting batchA's pack spread to the first pair. Needs one
+        # extra quad, so gate it on the same block-sched-tile budget as the paired ring.
+        _foldRing = (isSubtileFold and col128Base < 0 and permForRing
+                     and plsinBlockSchedTile(kernel)
+                     and plsinDebugEnv("TENSILE_PLSIN_FOLD_RING", "0") != "0")
+        if (kernel.get("UseSubtileImpl") and not isSubtileFold and col128Base < 0
+            and plsinBlockSchedTile(kernel) and permForRing) or _foldRing:
+          pairQuads = max(2, int(plsinDebugEnv("TENSILE_PLSIN_STORE_QUADS", "2")))
         cvtAlign    = 2 if kernel.get("UseSubtileImpl") else 1
         cvtVgpr = self.vgprPool.checkOutAligned(numCvtVgprs, cvtAlign, tag="globalWriteElements_cvtVgpr")
         # vgprBf16Temp2/vgprStoreData (the batchB pack + store src) are NOT cvt-allocated under
