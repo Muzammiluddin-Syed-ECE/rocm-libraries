@@ -495,6 +495,8 @@ defaultBenchmarkCommonParameters = [
     {"SubtileStoreInNLL": [0]},
     {"SubtileRollingPeel": [0]},
     {"SubtileFlyNMajor": [0]},
+    {"SubtileDeferredStoreInterleave": [0]},
+    {"SubtileIdentityStoreFastPath": [0]},
     {"SubtileFlyAParityLds": [0]},
     {"SubtileFlyStorePacketGeometry": [0]},
     {"SubtileFirstMfmaAccZero": [0]},

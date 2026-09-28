@@ -38,7 +38,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB192, BufferLoadB32, Bu
   GlobalLoadB64, GlobalLoadB96, GlobalLoadD16B16, GlobalLoadD16U8, GlobalLoadD16HIU8, \
   GlobalStoreB128, GlobalStoreB32, GlobalStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, MXMFMAInstruction, SAndB32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpEQU64, SCmpGeU32, SCmpLeU32, \
-  SCSelectB32, SLShiftLeftB32, SLShiftRightB32, SMFMAInstruction, SMovB32, SMovB64, SNop, SEndpgm, SOrB32, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
+  SCSelectB32, SLShiftLeftB32, SLShiftRightB32, SLoadB64, SMFMAInstruction, SMovB32, SMovB64, SNop, SEndpgm, SOrB32, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
   SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VNop, VReadfirstlaneB32, TensorLoadToLds, SCMovB32, SCMovB64
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
@@ -5179,6 +5179,51 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.add(self.notLocalSplitUGlobalWriteIndices(kernel))
       module.add(emitSubtileStoreInNLLAddressInit(self, kernel))
 
+    self.states.subtileDeferFlyNMajorSecondMacro = bool(
+      kernel.get("SubtileStoreInNLL", 0)
+      and kernel.get("SubtileFlyNMajor", 0)
+      and kernel.get("SubtileRollingPeel", 0)
+      and kernel.get("SubtileDeferredStoreInterleave", 0)
+      and not kernel.get("SubtileNativeWholeLoopScheduler", 0))
+    self.states.subtileIdentityStoreInterleave = bool(
+      kernel.get("SubtileIdentityStoreFastPath", 0)
+      and kernel.get("SubtileStoreInNLL", 0)
+      and kernel.get("SubtileFlyNMajor", 0)
+      and kernel.get("SubtileRollingPeel", 0)
+      and not kernel.get("SubtileDeferredStoreInterleave", 0)
+      and not kernel.get("SubtileNativeWholeLoopScheduler", 0))
+    if self.states.subtileIdentityStoreInterleave:
+      self.states.subtileIdentityScaleAlphaSgpr = self.defineSgprIdx(
+        "SubtileIdentityScaleAlpha", 2, align=2)
+      self.states.subtileIdentityBiasSgpr = self.defineSgprIdx(
+        "SubtileIdentityBias", 2, align=2)
+      self.states.nonPostLoopSgpr.extend([
+        "SubtileIdentityScaleAlpha", "SubtileIdentityBias"])
+      module.add(RegSet(
+        "s", "sgprSubtileIdentityScaleAlpha",
+        self.states.subtileIdentityScaleAlphaSgpr))
+      module.add(RegSet(
+        "s", "sgprSubtileIdentityBias",
+        self.states.subtileIdentityBiasSgpr))
+      module.add(SLoadB64(
+        dst=sgpr("SubtileIdentityScaleAlpha", 2),
+        base=sgpr("KernArgAddress", 2), soffset=hex(152),
+        comment="hoist ScaleAlphaVec pointer for peeled identity path"))
+      module.add(SLoadB64(
+        dst=sgpr("SubtileIdentityBias", 2),
+        base=sgpr("KernArgAddress", 2), soffset=hex(160),
+        comment="hoist Bias pointer for peeled identity path"))
+    if self.states.subtileDeferFlyNMajorSecondMacro:
+      self.states.subtileDeferredPathSgpr = self.defineSgprIdx(
+        "SubtileDeferredPath", 1)
+      self.states.nonPostLoopSgpr.append("SubtileDeferredPath")
+      self.states.subtileDeferredFlyNMajorSecondMacros = []
+      module.add(RegSet(
+        "s", "sgprSubtileDeferredPath",
+        self.states.subtileDeferredPathSgpr))
+      module.add(SMovB32(
+        dst=sgpr("SubtileDeferredPath"), src=-1,
+        comment="no deferred Fly N-major path selected"))
     module.add(mainLoop(self, kernel))
 
     # Deallocate offset registers
@@ -5254,9 +5299,52 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
 
       if foldStoreInNLL:
-        from Tensile.Components.Subtile.StoreInNLL import cleanupSubtileStoreInNLL
+        from Tensile.Components.Subtile.StoreInNLL import (
+          cleanupSubtileStoreInNLL,
+          emitSubtileStoreInNLLGroupedDrain,
+        )
         deferredGSU0 = None
-        module.addComment1("SubtileStoreInNLL: D already stored in NLL")
+        if kernel.get("SubtileFlyNMajor", 0):
+          module.addComment1("SubtileStoreInNLL: post-loop grouped D drain")
+          module.add(self.globalWriteWorkGroupInit(kernel))
+          module.add(self.emitSubtileStoreVectorLdsInit(kernel))
+          deferredMacros = getattr(
+            self.states, "subtileDeferredFlyNMajorSecondMacros", [])
+          if deferredMacros:
+            deferredDone = Label(
+              self.labels.getNameInc("SubtileStoreDeferredDone"), "")
+            for pathId, deferredMacro in enumerate(deferredMacros):
+              nextPath = Label(
+                self.labels.getNameInc("SubtileStoreDeferredNext"), "")
+              module.add(SCmpEQU32(
+                src0=sgpr("SubtileDeferredPath"), src1=pathId,
+                comment=f"deferred Fly N-major path {pathId}?"))
+              module.add(SCBranchSCC0(
+                labelName=nextPath.getLabelName(),
+                comment="try next deferred Fly N-major path"))
+              module.add(deferredMacro)
+              module.add(SBranch(
+                labelName=deferredDone.getLabelName(),
+                comment="deferred Fly N-major path complete"))
+              module.add(nextPath)
+            module.add(emitSubtileStoreInNLLGroupedDrain(
+              self, kernel, dtileInfo))
+            module.add(deferredDone)
+            del self.states.subtileDeferredFlyNMajorSecondMacros
+          else:
+            foldedDrain = Label(
+              self.labels.getNameInc("SubtileStoreFoldedDrain"), "")
+            module.add(SBranch(
+              labelName=foldedDrain.getLabelName(),
+              comment="enter folded-store epilogue basic block"))
+            module.add(SNop(
+              waitState=0,
+              comment="unreachable folded-store block separator"))
+            module.add(foldedDrain)
+            module.add(emitSubtileStoreInNLLGroupedDrain(
+              self, kernel, dtileInfo))
+        else:
+          module.addComment1("SubtileStoreInNLL: D already stored in NLL")
         self.cleanupGlobalWrite(kernel)
         cleanupSubtileStoreInNLL(self)
       else:

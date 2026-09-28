@@ -379,13 +379,16 @@
     StoreSyncOpt: 0
     StoreVectorWidth: -1
     StreamK: 0
-    SubtileDirectToVgprScale: 0
-    SubtileFirstMfmaAccZero: 1
+    MXLoadInst: BufferLoad
+    MXScaleFormat: LaneContiguousGFX950
+    SubtileDirectToVgprScale: 3
+    SubtileFirstMfmaAccZero: 0
     SubtileFlyKInner: 1
     SubtileUnifiedKSchedule: 0
     SubtileNativeWholeLoopScheduler: 0
     SubtileFlyPhaseWait: 1
     SubtileFlyNMajor: 1
+    SubtileIdentityStoreFastPath: 1
     SubtileFlyAParityLds: 1
     SubtileFlyStorePacketGeometry: 0
     SubtilePostBarrierNop: 1

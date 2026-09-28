@@ -731,15 +731,15 @@ def mxsaDirectCanonicalByte(lane, waveM, tile, subIterK):
 
   The exact Fly-N-major equality kernel interleaves A rows four-way.  A lane
   therefore computes row ``128*waveM + 4*(lane%16) + tile%4 +
-  64*(tile//4)``.  Its four MFMA lane groups own consecutive pairs of scale
-  bytes, so sub-iterations 0/1 select K bytes ``2*(lane//16) + subIterK``.
+  64*(tile//4)``.  One K/128 MFMA phase assigns its four consecutive
+  K/32 scale bytes to lane groups 0..3; the next phase starts four bytes later.
   """
   assert 0 <= lane < 64
   assert 0 <= tile < 8
   assert 0 <= subIterK < 2
   row = (128 * waveM + 4 * (lane % 16)
          + (tile % 4) + 64 * (tile // 4))
-  kByte = 2 * (lane // 16) + subIterK
+  kByte = (lane // 16) + 4 * subIterK
   return row, kByte
 
 
@@ -748,7 +748,7 @@ def mxsaDirectCanonicalByteFromConsumerQ(q, lane, subIterK):
   lprime = (q & 255) // 4
   pprime = (lane // 4) & 1
   row = 32 * (q // 256) + 16 * pprime + (lprime % 16)
-  kByte = 2 * (lprime // 16) + subIterK
+  kByte = (lprime // 16) + 4 * subIterK
   return row, kByte
 
 
@@ -825,7 +825,7 @@ def emitScaleGroupDirectGlobalRead(writer, kernel, tileInfo, tc, vdst,
     #   L'      = (q & 255) / 4
     #   p'      = (lane / 4) & 1
     #   row     = 32*(q / 256) + 16*p' + (L' % 16)
-    #   kByte   = 2*(L' / 16) + subIterK
+    #   kByte   = (L' / 16) + 4*subIterK
     #
     # q and q+4 are the group's even/odd tiles.  Loading kByte and kByte+1
     # for each row yields MFMA byte order [even k0, odd k0, even k1, odd k1].
@@ -885,11 +885,11 @@ def emitScaleGroupDirectGlobalRead(writer, kernel, tileInfo, tc, vdst,
           dst=vgpr(row), src0=sgpr("StridesMXSA"), src1=vgpr(row),
           comment="scaleMXSA: canonical row * scale stride"))
       module.add(VLShiftRightB32(
-          dst=vgpr(tmp), shiftHex=hex(5), src=vgpr(q),
-          comment="scaleMXSA: 2*(L'/16) plus high bits"))
+          dst=vgpr(tmp), shiftHex=hex(6), src=vgpr(q),
+          comment="scaleMXSA: L'/16 plus high bits"))
       module.add(VAndB32(
-          dst=vgpr(tmp), src0=6, src1=vgpr(tmp),
-          comment="scaleMXSA: canonical K-byte pair"))
+          dst=vgpr(tmp), src0=3, src1=vgpr(tmp),
+          comment="scaleMXSA: canonical K byte within K/128"))
       module.add(VAddU32(
           dst=vgpr(row), src0=vgpr(row), src1=vgpr(tmp),
           comment="scaleMXSA: canonical byte address"))
@@ -899,7 +899,7 @@ def emitScaleGroupDirectGlobalRead(writer, kernel, tileInfo, tc, vdst,
             dst=vgpr(dst), vaddr=vgpr(row),
             saddr=sgpr("SrdMXSA", 4), soffset=0,
             mubuf=MUBUFModifiers(
-                offen=True, offset12=subIterK,
+                offen=True, offset12=4 * subIterK,
                 glc=isGlc, slc=isSlc, nt=isNT),
             comment=("scaleMXSA[group%u]: tile %u K-byte %u"
                      % (scaleGroupIdx, 2 * scaleGroupIdx + tileInGroup,
@@ -1059,7 +1059,7 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
         dst=sgpr("Srd%s+2" % tc), src0=sgpr("Srd%s+2" % tc), src1=1024,
         comment="packed scale: shrink remaining buffer limit"))
     module.add(SCSelectB32(
-        dst=sgpr("Srd%s+2" % tc), src0=sgpr("Srd%s+2" % tc), src1=0,
+        dst=sgpr("Srd%s+2" % tc), src0=0, src1=sgpr("Srd%s+2" % tc),
         comment="packed scale: saturate limit at zero"))
     return module
   return emitScaleGRPtrUpdate(ti_, writer, kernel)

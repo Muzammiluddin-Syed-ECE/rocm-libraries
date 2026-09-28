@@ -17574,6 +17574,48 @@ class KernelWriterAssembly(KernelWriter):
         tmpVgprNum = tmpVgprNum + 1
     return totalReg + tmpVgprNum
 
+  def emitSubtileStoreVectorLdsInit(self, kernel):
+    """Populate the canonical bias/scale-alpha LDS workspace for folded stores."""
+    module = Module("SubtileStoreVectorLdsInit")
+    assert self.states.useBias == DataDirection.READ
+    assert kernel["ProblemType"]["UseScaleAlphaVec"]
+
+    scaleLabel = self.labels.getNameInc("SubtileStoreScaleAlphaVec")
+    module.add(self.allocPostLoopSrdSuppress(
+      "ScaleAlphaVec", scaleLabel, sgprLength=sgpr("SizeI")))
+    module.add(SMulI32(
+      dst=sgpr("SrdScaleAlphaVec+2"),
+      src0=hex(self.states.bpeCinternal),
+      src1=sgpr("SrdScaleAlphaVec+2"),
+      comment="ScaleAlphaVec scaled by BPE"))
+
+    biasLabel = self.labels.getNameInc("SubtileStoreBias")
+    module.add(self.allocPostLoopSrdSuppress(
+      "Bias", biasLabel, sgprLength=sgpr("SizeI")))
+
+    vectorDataTypes = VectorDataTypes()
+    vectorDataTypes.bias(0).dataType = \
+      kernel["ProblemType"]["BiasDataTypeList"][0]
+    vectorDataTypes.scaleAlpha(0).dataType = \
+      kernel["ProblemType"]["ComputeDataType"]
+    totalTmpVgpr = self.getNumOfTempVgprs(
+      vectorDataTypes, kernel, 1, 0)
+    tmpVgpr = self.vgprPool.checkOutAligned(
+      totalTmpVgpr, 2, "subtile store vector LDS init")
+    offsetVgpr = self.vgprPool.checkOut(
+      1, tag="subtile store vector LDS offset")
+    module.add(self.readVectorToLDS(
+      vectorDataTypes, kernel, 1, offsetVgpr,
+      ContinuousRegister(idx=tmpVgpr, size=4), 0))
+    module.add(SWaitCnt(
+      dscnt=0, vlcnt=-1, vscnt=-1,
+      comment="wait for folded-store vector LDS writes"))
+    module.add(SBarrier(
+      comment="folded-store vector LDS write barrier"))
+    self.vgprPool.checkIn(offsetVgpr)
+    self.vgprPool.checkIn(tmpVgpr)
+    return module
+
   def readVectorToLDS(self, vectorDataTypes: VectorDataTypes, kernel, gwvw, offsetVgpr, tmpVgpr1Res: ContinuousRegister, dim, tmpSgpr = None):
     assert gwvw == 1
     # Params

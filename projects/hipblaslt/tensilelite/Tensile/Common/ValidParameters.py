@@ -503,6 +503,11 @@ validParameters = { # we need to make sure this matches develop
     # FlyDSL-style transposed-problem ownership: four-column A interleave,
     # split accumulator halves, and direct ji-adjacent dwordx2 stores.
     "SubtileFlyNMajor": [0, 1],
+    # Defer path-specific final N-major macros until vector epilogue setup,
+    # then overlap staged conversion/store packets with later N tiles.
+    "SubtileDeferredStoreInterleave": [0, 1],
+    # Runtime alpha-one/null-vector fast path for the N-major drain.
+    "SubtileIdentityStoreFastPath": [0, 1],
     # FlyDSL-style A4 parity-split/swizzled LDS address map.
     "SubtileFlyAParityLds": [0, 1],
     # FlyDSL accumulator packets with a 256-byte second output half.

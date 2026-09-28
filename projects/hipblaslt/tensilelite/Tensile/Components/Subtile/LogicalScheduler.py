@@ -4023,6 +4023,7 @@ class LogicalScheduler:
         """
         from Tensile.Components.Subtile.InstructionScheduler import (
             instructionSchedule,
+            PackedScaleRefillCarry,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250,
         )
@@ -4081,6 +4082,14 @@ class LogicalScheduler:
                 minGapDsReadToWait=minGapDsReadToWait))
 
         for pi, partition_emitted in enumerate(emitted_3d):
+            packedRefillCarry = (
+                PackedScaleRefillCarry()
+                if (schedule
+                    and not unifiedK
+                    and kernel.get("MXScaleFormat")
+                    == "LaneContiguousGFX950")
+                else None
+            )
             for k, em_list in enumerate(partition_emitted):
                 if unifiedK:
                     continue
@@ -4091,7 +4100,9 @@ class LogicalScheduler:
                     scheduled = instructionSchedule(
                         em_list,
                         multiDU=self._is_multi_du(),
-                        minGapDsReadToWait=minGapDsReadToWait)
+                        minGapDsReadToWait=minGapDsReadToWait,
+                        packedRefillCarry=packedRefillCarry,
+                        flushPackedRefill=bool(k & 1))
                     module.add(scheduled)
                 else:
                     for em in em_list:
@@ -4110,6 +4121,10 @@ class LogicalScheduler:
                                 first_gr_group_done = True
                         for inst in em.instructions:
                             module.add(inst)
+            if packedRefillCarry is not None:
+                assert not packedRefillCarry.instructions, (
+                    "packed scale refill carry must end on a complete "
+                    "two-subIterK record")
         if use_pap_preloop_skip and skipping_first_gr_group and not first_gr_group_done:
             module.add(pap_merge_label)
             module.add(SMovB32(dst=sgpr("SkPrefetchPrimed"), src=0,
@@ -4135,7 +4150,9 @@ class LogicalScheduler:
         if (kernel.get("SubtileFlyPhaseWait", 0)
                 and phaseTransformLoop):
             module = _replaceLastMainloopPhaseWait(module)
-        if label.startswith("NLL_C") and kernel.get("SubtileStoreInNLL", 0):
+        if (label.startswith("NLL_C")
+                and kernel.get("SubtileStoreInNLL", 0)
+                and not kernel.get("SubtileFlyNMajor", 0)):
             from Tensile.Components.Subtile.StoreInNLL import interleaveSubtileStoreInNLL
             module = interleaveSubtileStoreInNLL(
                 module, writer, kernel, writer.states.d.tileInfo)
@@ -4174,6 +4191,7 @@ class LogicalScheduler:
         return bool(
             kernel.get("SubtileFirstMfmaAccZero", 0)
             and self._use_rolling_peeled_exit(kernel)
+            and not kernel.get("SubtileFlyNMajor", 0)
             and self.config.pgr == 2
             and self.unroll_factor == 2
         )
@@ -4196,17 +4214,29 @@ class LogicalScheduler:
     def _emit_rolling_peeled_exit(self, writer, kernel, label,
                                   ngll_ui, nll_ui):
         """Emit a two-macro exit with last-use in-place operand refills."""
-        from rocisa.code import Module
+        from rocisa.code import Label, Module
         from rocisa.instruction import (
             LocalReadInstruction,
             MFMAInstruction,
             MXMFMAInstruction,
+            SBranch,
             SBarrier,
+            SCBranchSCC0,
+            SCmpEQU32,
+            SCmpEQU64,
+            SEndpgm,
+            SMovB32,
+            SNop,
             SWaitCnt,
             VPermB32,
             VXorB32,
         )
+        from rocisa.container import sgpr
         from Tensile.Components.Subtile.StoreInNLL import (
+            emitFlyNMajorTileConsume,
+            emitFlyNMajorIdentityCellRetire,
+            emitFlyNMajorTileStage,
+            emitFlyNMajorVectorPreload,
             interleaveSubtileStoreInNLL,
         )
         from Tensile.Components.Subtile.SubtileLREmit import (
@@ -4373,7 +4403,8 @@ class LogicalScheduler:
 
             second_macro = sorted(
                 order[128:], key=lambda cell: (cell[2], cell[1], cell[0]))
-            for phase, row, column in second_macro:
+
+            def emit_second_macro_cell(target, phase, row, column):
                 operand_tiles = {
                     tensor: tiles[tile_id(phase, tensor, tile)]
                     for tensor, tiles, tile in (
@@ -4383,10 +4414,118 @@ class LogicalScheduler:
                         ("SB", emitter.vgprTilesSB, column),
                     )
                 }
-                module.addItems(emitter.emit_mfma_cell(
+                target.addItems(emitter.emit_mfma_cell(
                     phases[phase], row, column,
                     unroll_iter=phase_uis[phase],
                     operand_tiles=operand_tiles))
+
+            if getattr(
+                    writer.states, "subtileDeferFlyNMajorSecondMacro", False):
+                deferred = Module("DeferredFlyNMajorSecondMacro")
+                deferred.add(emitFlyNMajorVectorPreload(writer))
+                stage = writer.vgprPool.checkOutAligned(
+                    32, 2, "subtileStoreInNLLInterleavedStage")
+                try:
+                    for tile_n in range(8):
+                        cells = [
+                            cell for cell in second_macro
+                            if cell[2] == tile_n
+                        ]
+                        if len(cells) != 16:
+                            raise RuntimeError(
+                                "deferred Fly N-major macro expected "
+                                f"16 producers for tile {tile_n}, "
+                                f"found {len(cells)}")
+                        consume = (
+                            list(emitFlyNMajorTileConsume(
+                                writer, kernel, tile_n - 1, stage
+                            ).flatitems())
+                            if tile_n else []
+                        )
+                        for cell_idx, (phase, row, column) in enumerate(cells):
+                            emit_second_macro_cell(
+                                deferred, phase, row, column)
+                            begin = cell_idx * len(consume) // len(cells)
+                            end = (cell_idx + 1) * len(consume) // len(cells)
+                            deferred.addItems(consume[begin:end])
+                        deferred.add(emitFlyNMajorTileStage(
+                            writer, writer.states.d.tileInfo, tile_n,
+                            stage))
+                    deferred.add(emitFlyNMajorTileConsume(
+                        writer, kernel, 7, stage))
+                finally:
+                    writer.vgprPool.checkIn(stage)
+                path_id = len(
+                    writer.states.subtileDeferredFlyNMajorSecondMacros)
+                writer.states.subtileDeferredFlyNMajorSecondMacros.append(
+                    deferred)
+                module.add(SMovB32(
+                    dst=sgpr(writer.states.subtileDeferredPathSgpr),
+                    src=path_id,
+                    comment=(
+                        "select path-specific deferred Fly N-major macro")))
+            else:
+                if getattr(
+                        writer.states,
+                        "subtileIdentityStoreInterleave", False):
+                    general = Label(writer.labels.getNameInc(
+                        "SubtileIdentityStoreGeneral"), "")
+                    for register, comment in (
+                            ("Alpha", "alpha must be one"),
+                            ("SubtileIdentityBias", "bias must be absent"),
+                            ("SubtileIdentityScaleAlpha",
+                             "scale-alpha must be absent")):
+                        if register == "Alpha":
+                            module.add(SCmpEQU32(
+                                src0=sgpr(register), src1=1.0,
+                                comment=comment))
+                        else:
+                            module.add(SCmpEQU64(
+                                src0=sgpr(register, 2), src1=0,
+                                comment=comment))
+                        module.add(SCBranchSCC0(
+                            labelName=general.getLabelName(),
+                            comment="use general final MFMA schedule"))
+
+                    stage = writer.vgprPool.checkOutAligned(
+                        32, 2, "subtileIdentityStoreInterleaveStage")
+                    try:
+                        pending_retirements = []
+                        for phase, row, column in second_macro:
+                            emit_second_macro_cell(
+                                module, phase, row, column)
+                            if phase == 3:
+                                pending_retirements.append((row, column))
+                            if len(pending_retirements) > 4:
+                                retire_row, retire_column = \
+                                    pending_retirements.pop(0)
+                                module.add(emitFlyNMajorIdentityCellRetire(
+                                    writer, kernel,
+                                    writer.states.d.tileInfo,
+                                    retire_column, retire_row, stage))
+                        module.add(SNop(
+                            waitState=15,
+                            comment="drain final producer-to-AGPR-read latency"))
+                        module.add(SNop(
+                            waitState=15,
+                            comment="drain final producer-to-AGPR-read latency"))
+                        for retire_row, retire_column in pending_retirements:
+                            module.add(emitFlyNMajorIdentityCellRetire(
+                                writer, kernel,
+                                writer.states.d.tileInfo,
+                                retire_column, retire_row, stage))
+                    finally:
+                        writer.vgprPool.checkIn(stage)
+                    module.add(SEndpgm(
+                        comment="identity peeled path completed all D stores"))
+                    module.add(general)
+                    for phase, row, column in second_macro:
+                        emit_second_macro_cell(
+                            module, phase, row, column)
+                else:
+                    for phase, row, column in second_macro:
+                        emit_second_macro_cell(
+                            module, phase, row, column)
         else:
             assert self.native_whole_loop_schedule is not None
 
@@ -4449,9 +4588,12 @@ class LogicalScheduler:
                         event.phase, event.tile_m, event.tile_n)
 
         module.addComment0(f"{label} faithful full-K peel end")
+        if (kernel.get("SubtileStoreInNLL", 0)
+                and kernel.get("SubtileFlyNMajor", 0)):
+            return module
         return interleaveSubtileStoreInNLL(
             module, writer, kernel, writer.states.d.tileInfo,
-            minMfmaGap=0, issueRate=6, fourRowPackets=True)
+            minMfmaGap=0, issueRate=0, fourRowPackets=True)
 
     def _emit_pgr2_tail_lw_align(self, kernel):
         """Re-align LW_base parity with the LR vgpr at the tail entry.

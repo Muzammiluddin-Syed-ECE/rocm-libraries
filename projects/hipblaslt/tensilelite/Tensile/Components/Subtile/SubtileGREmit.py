@@ -766,6 +766,20 @@ def _grComputeSubtileOffsets_legacy(writer, module, tileInfo):
   for regId in range(len(tileInfo.localSubtilesRegister)):
     rl = tileInfo.localSubtilesRegister[regId]
     for i, reg in enumerate(rl):
+      if getattr(tileInfo, "flyAParityLds", False):
+        stmp = writer.sgprPool.checkOut(1, tag="_grComputeSubtileOffsets_legacy_flyA")
+        logicalRow = flyAParitySubtileLogicalOffset(regId)
+        module.add(SMulI32(dst=sgpr(stmp), src0=logicalRow, src1=sgpr(strideRef),
+                           comment="Fly A parity: subtile logical-row offset"))
+        module.add(SLShiftRightB32(dst=sgpr(stmp), src=sgpr(stmp), shiftHex=hex(1),
+                                   comment="Fly A parity: fp4 elements to bytes"))
+        if rl.is_sgpr:
+          module.add(SMovB32(dst=sgpr(reg), src=sgpr(stmp)))
+        else:
+          module.add(VAddU32(dst=vgpr(reg), src0=vgpr(tileInfo.sharedVgprGROffset[i]),
+                             src1=sgpr(stmp)))
+        writer.sgprPool.checkIn(stmp)
+        continue
       if rl.is_sgpr:
         module.add(SMulI32(dst=sgpr(reg), src0=hex(s_stride * regId), src1=sgpr(strideRef), comment="%s: %u rows offset, stride %u, %u"%(tc, rowOffset, s_stride, regId)))
       else:

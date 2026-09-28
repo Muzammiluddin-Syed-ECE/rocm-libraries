@@ -12,6 +12,7 @@ from Tensile.Components.Subtile.SubtileGeometry import (
     flyAParityLdsEnabled,
     flyAParityReadAddress,
     flyAParityReadBanks,
+    flyAParitySubtileLogicalOffset,
     flyAParityWriteMapping,
     subtileInterleaveVW,
     subtileLdsBlockPadBytes,
@@ -25,6 +26,7 @@ from Tensile.Components.Subtile.SubtileScaleEmit import (
 )
 from Tensile.Components.Subtile.StoreInNLL import (
     NLLStoreEvent,
+    flyNMajorProducerQ,
     flyStorePacketGeometryEnabled,
     flyStorePacketCoordinates,
     nonTemporalDFlags,
@@ -49,27 +51,94 @@ def test_fly_map_keeps_exact_block_padding_for_sub_block_lane_strides(monkeypatc
 
 
 def test_fly_a_parity_write_read_mapping_and_bank_spread():
-    seen = set()
+    legacy_by_address = {}
+    parity_by_address = {}
     for wave_id in range(4):
-        for tile in range(8):
-            for lane_row in range(8):
+        wave_m, producer_half = divmod(wave_id, 2)
+        for subtile in range(8):
+            for lane in range(64):
+                lane_row, physical_chunk = divmod(lane, 8)
+                legacy_row = (
+                    wave_m * 128 + producer_half * 8
+                    + lane_row + 16 * subtile
+                )
+                legacy_key = (legacy_row, physical_chunk)
+                legacy_unpadded = legacy_row * 128 + physical_chunk * 16
+                legacy_address = (
+                    legacy_unpadded + 32 * (legacy_unpadded // 1024)
+                )
+                assert legacy_address not in legacy_by_address
+                legacy_by_address[legacy_address] = legacy_key
+
                 logical_row, block_base = flyAParityWriteMapping(
-                    wave_id, tile, lane_row)
-                lane16 = (wave_id & 1) * 8 + lane_row
-                for physical_chunk in range(8):
-                    logical_chunk = (physical_chunk - lane16) & 7
-                    write_address = (
-                        block_base + lane_row * 128
-                        + physical_chunk * 16
+                    wave_id, subtile, lane_row)
+                logical_chunk = (physical_chunk - lane_row) & 7
+                parity_address = (
+                    block_base + lane_row * 128
+                    + physical_chunk * 16
+                )
+                key = (logical_row, logical_chunk)
+                assert parity_address not in parity_by_address
+                parity_by_address[parity_address] = key
+
+    logical_tile = {
+        (row, chunk) for row in range(256) for chunk in range(8)
+    }
+    # Both layouts source every legacy logical A value exactly once.  The
+    # transformed subtile soffsets are the permutation [0,1,2,3,64,65,66,67],
+    # not the legacy linear [0,16,...,112].
+    assert set(legacy_by_address.values()) == logical_tile
+    assert set(parity_by_address.values()) == logical_tile
+    assert [
+        flyAParitySubtileLogicalOffset(subtile) for subtile in range(8)
+    ] == [0, 1, 2, 3, 64, 65, 66, 67]
+    assert set(parity_by_address) == set(range(0, 32768, 16))
+
+    # Exhaust every consumer wave/tile/lane/K chunk in both buffer phases.
+    # Legacy A ownership is waveId%2; producer waves (0,1) cooperatively fill
+    # partition 0 and (2,3) partition 1.  Each transformed read must recover
+    # the same logical value as the legacy read.
+    buffer_span = 0x10000
+    for buffer_phase in range(2):
+        buffer_base = buffer_phase * buffer_span
+        legacy_buffer = {
+            buffer_base + address: key
+            for address, key in legacy_by_address.items()
+        }
+        parity_buffer = {
+            buffer_base + address: key
+            for address, key in parity_by_address.items()
+        }
+        for wave_id in range(4):
+            consumed = set()
+            consumer_partition = wave_id & 1
+            for tile in range(8):
+                for lane in range(64):
+                    lane16 = lane & 15
+                    lane_group = lane >> 4
+                    logical_row = (
+                        consumer_partition * 128 + 4 * lane16
+                        + tile % 4 + 64 * (tile // 4)
                     )
-                    read_address = (
-                        (wave_id >> 1) * 16384
-                        + flyAParityReadAddress(
-                            lane16, tile, logical_chunk)
-                    )
-                    assert write_address == read_address
-                    seen.add((logical_row, logical_chunk))
-    assert len(seen) == 256 * 8
+                    for sub_iter_k in range(2):
+                        logical_chunk = lane_group + 4 * sub_iter_k
+                        key = (logical_row, logical_chunk)
+                        legacy_unpadded = (
+                            logical_row * 128 + logical_chunk * 16
+                        )
+                        legacy_read = (
+                            buffer_base + legacy_unpadded
+                            + 32 * (legacy_unpadded // 1024)
+                        )
+                        parity_read = (
+                            buffer_base + consumer_partition * 16384
+                            + flyAParityReadAddress(
+                                lane16, tile, logical_chunk)
+                        )
+                        assert legacy_buffer[legacy_read] == key
+                        assert parity_buffer[parity_read] == key
+                        consumed.add(key)
+            assert len(consumed) == 128 * 8
 
     # A4's unswizzled 512-byte lane stride aliases every lane on one
     # start bank. The parity map rotates by region-row and reaches 8.
@@ -135,6 +204,12 @@ def test_parameter_is_explicit_serialized_and_disabled_by_default():
     assert validParameters["SubtileFlyNMajor"] == [0, 1]
     assert defaultSolution["SubtileFlyNMajor"] == 0
     assert "SubtileFlyNMajor" in getRequiredParametersMin()
+    assert validParameters["SubtileDeferredStoreInterleave"] == [0, 1]
+    assert defaultSolution["SubtileDeferredStoreInterleave"] == 0
+    assert "SubtileDeferredStoreInterleave" in getRequiredParametersMin()
+    assert validParameters["SubtileIdentityStoreFastPath"] == [0, 1]
+    assert defaultSolution["SubtileIdentityStoreFastPath"] == 0
+    assert "SubtileIdentityStoreFastPath" in getRequiredParametersMin()
     assert validParameters["SubtileFlyAParityLds"] == [0, 1]
     assert defaultSolution["SubtileFlyAParityLds"] == 0
     assert "SubtileFlyAParityLds" in getRequiredParametersMin()
@@ -209,7 +284,7 @@ def test_mxsa_direct_canonical_bytes_match_interleaved_lane_map():
     for wave_m in range(2):
         for lane in range(64):
             lane_row = lane % 16
-            lane_k_pair = 2 * (lane // 16)
+            lane_k_block = lane // 16
             for tile in range(8):
                 expected_row = (
                     128 * wave_m + 4 * lane_row
@@ -228,7 +303,7 @@ def test_mxsa_direct_canonical_bytes_match_interleaved_lane_map():
                         lane, wave_m, tile, sub_iter_k
                     )
                     assert expected == (
-                        expected_row, lane_k_pair + sub_iter_k
+                        expected_row, lane_k_block + 4 * sub_iter_k
                     )
                     assert mxsaDirectCanonicalByteFromConsumerQ(
                         q, lane, sub_iter_k
@@ -322,11 +397,49 @@ def test_fly_store_packets_cover_c_tile_once_without_overlap():
     assert set(owners) == {
         (m, n) for m in range(256) for n in range(256)
     }
-    # Regression for the traced defect: M-wave 1 starts at row 64, while
-    # sl=1 starts at row 128. They must neither overlap nor exceed row 255.
-    assert flyStorePacketCoordinates(1, 0, 0, 0, 0)[0] == (64, 0)
-    assert flyStorePacketCoordinates(0, 0, 0, 1, 0)[0] == (128, 0)
+    # M-wave 1 starts at row 128, while sl=1 selects row 64 within a wave.
+    # The four quarters must neither overlap nor exceed row 255.
+    assert flyStorePacketCoordinates(1, 0, 0, 0, 0)[0] == (128, 0)
+    assert flyStorePacketCoordinates(0, 0, 0, 1, 0)[0] == (64, 0)
     assert flyStorePacketCoordinates(1, 15, 0, 1, 0)[-1] == (255, 0)
+
+
+def test_fly_nmajor_producer_q_uses_half_tile_column_order():
+    assert [
+        flyNMajorProducerQ(tile_n, sl, ji)
+        for sl in range(2)
+        for tile_n in range(8)
+        for ji in range(4)
+    ] == list(range(64))
+    assert flyNMajorProducerQ(1, 0, 0) == 4
+    assert flyNMajorProducerQ(0, 1, 0) == 32
+
+
+@pytest.mark.parametrize("workgroups,shape", [
+    ([(0, 0), (1, 0)], (512, 256)),
+    ([(0, 0), (0, 1)], (256, 512)),
+])
+def test_fly_store_packets_cover_two_workgroups_once(workgroups, shape):
+    owners = set()
+    for workgroup_m, workgroup_n in workgroups:
+        for wave_id in range(4):
+            for lane in range(64):
+                for tile_n in range(8):
+                    for sl in range(2):
+                        for component in range(4):
+                            for local_m, local_n in flyStorePacketCoordinates(
+                                    wave_id, lane, tile_n, sl, component):
+                                coord = (
+                                    workgroup_m * 256 + local_m,
+                                    workgroup_n * 256 + local_n,
+                                )
+                                assert coord not in owners
+                                owners.add(coord)
+
+    size_m, size_n = shape
+    assert owners == {
+        (m, n) for m in range(size_m) for n in range(size_n)
+    }
 
 
 def test_universal_problem_type_is_allowed_under_explicit_runtime_contract():

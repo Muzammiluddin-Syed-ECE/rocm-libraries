@@ -251,7 +251,7 @@ INSTANTIATE_TEST_SUITE_P(
     )
 );
 
-TEST(MXPackedScaleGFX950, LaneContiguousRecordsMatchSS1Selectors)
+TEST(MXPackedScaleGFX950, LaneContiguousRecordsMatchLegacySS1Consumers)
 {
     constexpr size_t freeDim = 128;
     constexpr size_t kBlocks = 8;
@@ -276,7 +276,10 @@ TEST(MXPackedScaleGFX950, LaneContiguousRecordsMatchSS1Selectors)
                     size_t const laneRow   = lane % 16;
                     size_t const parity    = byte & 1;
                     size_t const subIterK  = byte >> 1;
-                    size_t const kBlock    = 2 * laneGroup + subIterK;
+                    // One MFMA consumes K/128: lane groups 0..3 own its
+                    // consecutive K/32 scales.  subIterK selects the next
+                    // K/128 phase, so ownership is c, then 4+c.
+                    size_t const kBlock    = laneGroup + 4 * subIterK;
                     size_t const tile      = 2 * group + parity;
                     size_t const row
                         = isMatrixA
@@ -290,6 +293,48 @@ TEST(MXPackedScaleGFX950, LaneContiguousRecordsMatchSS1Selectors)
         EXPECT_TRUE(std::all_of(
             visits.begin(), visits.end(), [](size_t count) { return count == 1; }));
     }
+}
+
+TEST(MXPackedScaleGFX950, EveryMfmaSelectorConsumesCanonicalScale)
+{
+    constexpr size_t freeDim = 128;
+    constexpr size_t kBlocks = 8;
+    std::vector<uint8_t> canonical(freeDim * kBlocks);
+    for(size_t row = 0; row < freeDim; ++row)
+        for(size_t k = 0; k < kBlocks; ++k)
+            canonical[row * kBlocks + k]
+                = static_cast<uint8_t>((row * kBlocks + k) % 251 + 1);
+
+    auto packedA
+        = packMXScaleLaneContiguousGFX950(canonical, freeDim, kBlocks, true);
+    auto packedB
+        = packMXScaleLaneContiguousGFX950(canonical, freeDim, kBlocks, false);
+
+    // Trace order is K/128 phase, A tile, B tile.  v_mfma_ld_scale selects
+    // byte (tile % 2) + 2*kPhase from packed group tile/2.
+    for(size_t kPhase = 0; kPhase < 2; ++kPhase)
+        for(size_t aTile = 0; aTile < 8; ++aTile)
+            for(size_t bTile = 0; bTile < 8; ++bTile)
+                for(size_t lane = 0; lane < 64; ++lane)
+                {
+                    size_t const laneGroup = lane / 16;
+                    size_t const laneRow   = lane % 16;
+                    size_t const kBlock    = laneGroup + 4 * kPhase;
+                    size_t const aRow
+                        = 4 * laneRow + (aTile % 4) + 64 * (aTile / 4);
+                    size_t const bRow      = 16 * bTile + laneRow;
+                    size_t const aSelector = (aTile % 2) + 2 * kPhase;
+                    size_t const bSelector = (bTile % 2) + 2 * kPhase;
+                    size_t const aOffset
+                        = ((lane * 4 + aTile / 2) * 4 + aSelector);
+                    size_t const bOffset
+                        = ((lane * 4 + bTile / 2) * 4 + bSelector);
+
+                    EXPECT_EQ(packedA[aOffset],
+                              canonical[aRow * kBlocks + kBlock]);
+                    EXPECT_EQ(packedB[bOffset],
+                              canonical[bRow * kBlocks + kBlock]);
+                }
 }
 
 TEST(MXPackedScaleGFX950, PadsFreeAndKDimensionsWithZero)

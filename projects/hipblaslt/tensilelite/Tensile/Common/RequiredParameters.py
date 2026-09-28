@@ -49,6 +49,8 @@ def getRequiredParametersMin() -> set:
         'SubtileStoreInNLL',
         'SubtileRollingPeel',
         'SubtileFlyNMajor',
+        'SubtileDeferredStoreInterleave',
+        'SubtileIdentityStoreFastPath',
         'SubtileFlyAParityLds',
         'SubtileFlyStorePacketGeometry',
         'SubtileFirstMfmaAccZero',

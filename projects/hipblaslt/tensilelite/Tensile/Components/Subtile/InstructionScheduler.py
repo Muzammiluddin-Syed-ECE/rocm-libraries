@@ -7,10 +7,17 @@ Interleaves non-MFMA instructions between MFMAs using a slot-based placer
 with pluggable scheduling rules.
 """
 
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 from rocisa.code import Module
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
     LocalReadInstruction, GlobalReadInstruction, CommonInstruction
+
+
+@dataclass
+class PackedScaleRefillCarry:
+    """Packed scale refill suffixes delayed across a two-phase K record."""
+    instructions: List[object] = field(default_factory=list)
 
 
 class _SlotPlacer:
@@ -371,19 +378,44 @@ def _flattenPath(order, emittedModules, reverse=False):
 
 
 def _splitPackedScaleRefillPaths(pathOrders, emittedModules):
-    """Keep packed dwordx4 refills after all old-record MFMA consumers.
+    """Keep only packed-scale refill suffixes after old-record consumers.
 
     Scale liveness is tracked per logical group, but one packed load aliases
     all four group VGPRs. Scheduling that load after group 0 dies can overwrite
     groups 1..3 while the current K phase still consumes them.
+
+    A dependency path can begin with ordinary A/B global reads before reaching
+    the packed-scale pointer advance and refill.  Moving that whole path after
+    the MFMAs delays data refills and changes the executable synchronization
+    schedule, so preserve the non-scale prefix as a regular path.
     """
     regular, postMfma = [], []
     for order in pathOrders:
-        isPackedRefill = any(
-            isinstance(inst, GlobalReadInstruction)
-            and "packed-record-refill" in getattr(inst, "comment", "")
-            for mid in order for inst in emittedModules[mid].instructions)
-        (postMfma if isPackedRefill else regular).append(order)
+        refillPositions = [
+            pos for pos, mid in enumerate(order)
+            if any(
+                isinstance(inst, GlobalReadInstruction)
+                and "packed-record-refill" in getattr(inst, "comment", "")
+                for inst in emittedModules[mid].instructions)
+        ]
+        if not refillPositions:
+            regular.append(order)
+            continue
+
+        split = min(refillPositions)
+        # The packed SRD advance immediately preceding the first refill belongs
+        # to the deferred suffix as well.  Its instructions are tagged by the
+        # packed-limit update emitted with the pointer advance.
+        if split:
+            prior = emittedModules[order[split - 1]]
+            if any(
+                "packed scale:" in getattr(inst, "comment", "")
+                for inst in prior.instructions
+            ):
+                split -= 1
+        if split:
+            regular.append(order[:split])
+        postMfma.append(order[split:])
     return regular, postMfma
 
 
@@ -495,8 +527,11 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
     return mfmaIdxs[0], paths, preMfmaPaths
 
 
-def instructionSchedule(emittedModules, multiDU: bool = False,
-                      minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT):
+def instructionSchedule(
+        emittedModules, multiDU: bool = False,
+        minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
+        packedRefillCarry: Optional[PackedScaleRefillCarry] = None,
+        flushPackedRefill: bool = False):
     """Interleave non-MFMA instructions between MFMAs using 2 slots/interval.
 
     Rules (shared):
@@ -582,10 +617,19 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     scheduled = Module()
     _emitPreMfma(scheduled)
     scheduled.add(placer.assemble(mfmas))
-    for order in postMfmaOrders:
-        for mid in order:
-            for inst in emittedModules[mid].instructions:
-                scheduled.add(inst)
+    if packedRefillCarry is None:
+        for order in postMfmaOrders:
+            for mid in order:
+                for inst in emittedModules[mid].instructions:
+                    scheduled.add(inst)
+    else:
+        for order in postMfmaOrders:
+            for mid in order:
+                packedRefillCarry.instructions.extend(
+                    emittedModules[mid].instructions)
+        if flushPackedRefill:
+            scheduled.addItems(packedRefillCarry.instructions)
+            packedRefillCarry.instructions.clear()
 
     # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
     # that the scheduler placed before it within this subIterK.

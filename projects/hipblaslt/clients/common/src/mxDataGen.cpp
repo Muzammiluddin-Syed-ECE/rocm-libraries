@@ -654,7 +654,11 @@ std::vector<uint8_t>
                         size_t const laneRow   = lane % 16;
                         size_t const parity    = byte & 1;
                         size_t const subIterK  = byte >> 1;
-                        size_t const kBlock    = 8 * kTile + 2 * laneGroup + subIterK;
+                        // One v_mfma_scale covers K/128.  Its four 16-lane
+                        // groups own the four consecutive K/32 scales in that
+                        // phase; subIterK selects the lower/upper K/128 phase.
+                        size_t const kBlock
+                            = 8 * kTile + laneGroup + 4 * subIterK;
 
                         size_t row;
                         if(isMatrixA)

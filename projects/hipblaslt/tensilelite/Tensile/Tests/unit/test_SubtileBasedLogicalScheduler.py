@@ -1009,7 +1009,8 @@ class TestNativeWholeLoopSchedule:
         from rocisa.instruction import (
             MFMAInstruction, MXMFMAInstruction, VAccvgprReadB32)
         from Tensile.Components.Subtile.StoreInNLL import (
-            emitSubtileStoreInNLLAddressInit)
+            emitSubtileStoreInNLLAddressInit,
+            emitSubtileStoreInNLLGroupedDrain)
 
         kernel = create_kernel(256, 256, fp4=True, sourceSwap=True)
         kernel.update({
@@ -1063,15 +1064,13 @@ class TestNativeWholeLoopSchedule:
             c1 = mfmas[128:]
             assert [tile_n for _, _, tile_n in c1] == sorted(
                 tile_n for _, _, tile_n in c1)
-            for tile_n in range(7):
-                final_idx = max(idx for idx, _, n in c1 if n == tile_n)
-                next_final_idx = max(
-                    idx for idx, _, n in c1 if n == tile_n + 1)
-                first_store_read = next(
-                    idx for idx, inst in enumerate(items)
-                    if idx > final_idx
-                    and isinstance(inst, VAccvgprReadB32))
-                assert final_idx < first_store_read < next_final_idx
+            assert not any(isinstance(inst, VAccvgprReadB32)
+                           for inst in items)
+            drain = emitSubtileStoreInNLLGroupedDrain(
+                writer, kernel, dTileInfo)
+            drain_items = list(drain.flatitems())
+            assert sum(isinstance(inst, VAccvgprReadB32)
+                       for inst in drain_items) == 256
         finally:
             sched.deallocVgprTiles(writer)
 
@@ -2711,6 +2710,7 @@ class TestInstructionEmitterPerUidK:
         )
         from Tensile.Components.Subtile.SubtileScaleEmit import (
             emitScaleLaneContiguousGlobalRead,
+            globalReadScalePtrUpdates,
         )
         from Tensile.Components.Subtile.InstructionScheduler import (
             _splitPackedScaleRefillPaths,
@@ -2730,6 +2730,87 @@ class TestInstructionEmitterPerUidK:
             regular, post = _splitPackedScaleRefillPaths([[0]], emitted)
             assert regular == []
             assert post == [[0]]
+
+            # Real scheduling chains ordinary data GR into the packed-scale
+            # pointer advance/refill.  Only the packed suffix may move past
+            # current-record MFMAs; delaying the data prefix changes operands.
+            emitted = [
+                SimpleNamespace(instructions=[]),
+                SimpleNamespace(instructions=[
+                    SimpleNamespace(
+                        comment="packed scale: shrink remaining buffer limit")
+                ]),
+                SimpleNamespace(instructions=list(module.flatitems())),
+            ]
+            regular, post = _splitPackedScaleRefillPaths(
+                [[0, 1, 2]], emitted)
+            assert regular == [[0]]
+            assert post == [[1, 2]]
+
+        writer = MagicMock()
+        update = str(globalReadScalePtrUpdates("MXSA", writer, kernel))
+        assert (
+            "s_cselect_b32 s[sgprSrdMXSA+2], 0, "
+            "s[sgprSrdMXSA+2]" in update
+        )
+
+    def test_packed_refill_carry_spans_both_k_phases(self):
+        from types import SimpleNamespace
+        from rocisa.container import vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import MFMAInstruction, VMovB32
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            PackedScaleRefillCarry,
+            instructionSchedule,
+        )
+        from Tensile.Components.Subtile.SubtileScaleEmit import (
+            emitScaleLaneContiguousGlobalRead,
+        )
+
+        kernel = {
+            "MXScaleFormat": "LaneContiguousGFX950",
+            "SubtileDirectToVgprScale": 3,
+            "DirectToVgprMXSA": True,
+            "NonTemporalMXSA": 0,
+        }
+        refill = list(emitScaleLaneContiguousGlobalRead(
+            MagicMock(), kernel,
+            MagicMock(sharedVgprGROffset=[7]), "MXSA", 40).flatitems())
+        mfmas = [
+            MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=f"phase mfma {i}")
+            for i in range(2)
+        ]
+        emitted = [
+            SimpleNamespace(
+                moduleId=0, opType="gr", before=None,
+                instructions=[VMovB32(
+                    dst=vgpr(20), src=vgpr(21),
+                    comment="ordinary data GR prefix")]),
+            SimpleNamespace(
+                moduleId=1, opType="gr", before=0,
+                instructions=refill),
+            SimpleNamespace(
+                moduleId=2, opType="mfma", before=None,
+                instructions=mfmas),
+        ]
+
+        carry = PackedScaleRefillCarry()
+        even = str(instructionSchedule(
+            emitted, packedRefillCarry=carry,
+            flushPackedRefill=False))
+        assert "ordinary data GR prefix" in even
+        assert "packed-record-refill" not in even
+        assert len(carry.instructions) == 1
+
+        odd = str(instructionSchedule(
+            emitted, packedRefillCarry=carry,
+            flushPackedRefill=True))
+        assert odd.count("packed-record-refill") == 2
+        assert odd.rfind("phase mfma 1") < odd.find("packed-record-refill")
+        assert carry.instructions == []
 
     def test_single_du_per_uid_k_spans_full_numSubIterK(self):
         """Single-DU MX (numUnroll=1): per_uid_k must be numSubIterK, not grGran.k."""
@@ -3372,6 +3453,20 @@ class TestUnifiedKSchedule:
 
 class TestIntegration:
 
+    def test_fly_nmajor_keeps_canonical_accumulator_initialization(self):
+        cfg = make_cfg_256x256_fp4()
+        cfg.rollingPeel = True
+        sched = LogicalScheduler(cfg)
+        sched.unroll_factor = 2
+        kernel = {
+            "SubtileFirstMfmaAccZero": 1,
+            "SubtileRollingPeel": 1,
+            "SubtileStoreInNLL": 1,
+            "SubtileFlyNMajor": 1,
+        }
+
+        assert not sched._use_first_mfma_acc_zero(kernel)
+
     def test_fly_store_gate_zero_emits_byte_identical_legacy_assembly(self):
         from Tensile.Components.Subtile.StoreInNLL import (
             emitSubtileStoreInNLLAddressInit)
@@ -3415,8 +3510,7 @@ class TestIntegration:
                     scaleTileInfoB=scaleTiB)
                 writer.states.indexChars = ["I", "J", "K"]
                 address = emitSubtileStoreInNLLAddressInit(writer, kernel)
-                assert not hasattr(
-                    writer.states, "subtileStoreInNLLSecondHalfOffset")
+                assert writer.states.subtileStoreInNLLSecondHalfOffset == 128
                 peeled = sched._emit_rolling_peeled_exit(
                     writer, kernel, "GATE_OFF_IDENTITY", 1, 0)
                 return str(address) + str(peeled)
@@ -3426,17 +3520,76 @@ class TestIntegration:
         legacy = emit(explicit_zero=False)
         gate_off = emit(explicit_zero=True)
         assert gate_off == legacy
-        assert "Fly M-wave 128-row offset" in legacy
-        assert not any(
-            "offset:256" in line
-            for line in legacy.splitlines()
-            if "buffer_store_dwordx2" in line)
+        assert "faithful full-K peel end" in legacy
+        assert "v_accvgpr_read_b32" not in legacy
+        assert "buffer_store" not in legacy
 
-    def test_fly_store_packets_use_nmajor_accumulators_and_256_byte_half(self):
+    def test_deferred_store_interleave_builds_path_specific_final_macro(self):
+        from Tensile.Components.Subtile.StoreInNLL import (
+            emitSubtileStoreInNLLAddressInit)
+
+        kernel = create_kernel(256, 256, fp4=True, sourceSwap=True)
+        kernel.update({
+            "ISA": (9, 5, 0),
+            "UseSubtileImpl": True,
+            "MIWaveTile": [8, 8],
+            "PrefetchGlobalRead": 2,
+            "SubtileStoreInNLL": 1,
+            "SubtileRollingPeel": 1,
+            "SubtileFlyNMajor": 1,
+            "SubtileDeferredStoreInterleave": 1,
+            "SubtileNativeWholeLoopScheduler": 0,
+            "SubtileUnifiedKSchedule": 0,
+            "VectorWidthA": 8,
+            "VectorWidthB": 8,
+            "PackedC1IndicesX": [1],
+            "NonTemporalD": 4,
+            "StreamK": 0,
+        })
+        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = \
+            make_writer_and_tileinfos(kernel, fp4=True)
+        writer.states.subtileLdsSwizzle = False
+        writer.states.indexChars = ["I", "J", "K"]
+        writer.states.subtileDeferFlyNMajorSecondMacro = True
+        writer.states.subtileDeferredPathSgpr = \
+            writer.sgprPool.checkOut(1, "subtile deferred path test")
+        writer.states.subtileDeferredFlyNMajorSecondMacros = []
+
+        cfg = make_cfg_256x256_fp4()
+        cfg.rollingPeel = True
+        cfg.nativeWholeLoop = False
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.allocVgprTiles(
+            writer, tiA, tiB, scaleTileInfoA=scaleTiA,
+            scaleTileInfoB=scaleTiB, kernel=kernel)
+        try:
+            sched.populate_instructions(
+                writer, kernel, tileInfoA=tiA, tileInfoB=tiB,
+                dtileInfo=dTileInfo, scaleTileInfoA=scaleTiA,
+                scaleTileInfoB=scaleTiB)
+            emitSubtileStoreInNLLAddressInit(writer, kernel)
+            first = str(sched._emit_rolling_peeled_exit(
+                writer, kernel, "DEFERRED_STORE_INTERLEAVE", 1, 0))
+            assert len(
+                writer.states.subtileDeferredFlyNMajorSecondMacros) == 1
+            deferred = str(
+                writer.states.subtileDeferredFlyNMajorSecondMacros[0])
+            assert first.count("v_mfma") == 128
+            assert deferred.count("v_mfma") == 128
+            assert deferred.count("v_accvgpr_read_b32") == 256
+            assert deferred.count("buffer_store_dwordx2") == 64
+            assert deferred.count("preload Fly bias rows") == 2
+            assert "select path-specific deferred Fly N-major macro" in first
+        finally:
+            sched.deallocVgprTiles(writer)
+
+    def test_fly_store_packets_use_nmajor_accumulators_and_128_byte_quarter(self):
         from Tensile.Components.Subtile.InstructionEmitter import (
             flyStoreAccumulatorIndex)
         from Tensile.Components.Subtile.StoreInNLL import (
-            _store_fly_nmajor_group, emitSubtileStoreInNLLAddressInit)
+            emitSubtileStoreInNLLAddressInit,
+            emitSubtileStoreInNLLGroupedDrain)
 
         assert [
             flyStoreAccumulatorIndex(a, b)
@@ -3464,19 +3617,30 @@ class TestIntegration:
             make_writer_and_tileinfos(kernel, fp4=True)
         writer.states.indexChars = ["I", "J", "K"]
         address_init = str(emitSubtileStoreInNLLAddressInit(writer, kernel))
-        stores_module = Module("FlyStorePacketTest")
-        stores_module.addItems(_store_fly_nmajor_group(
-            writer, kernel, dTileInfo, tile_n=0))
-        stores = str(stores_module)
+        stores = str(emitSubtileStoreInNLLGroupedDrain(
+            writer, kernel, dTileInfo))
 
-        assert "second accumulator half is +256 bytes" in address_init
-        assert "Fly M-wave 64-row quarter offset" in address_init
+        assert "second accumulator quarter is +128 bytes" in address_init
+        assert "Fly lane16 four-row M base" in address_init
+        assert "Fly M-wave 128-row offset" in address_init
+        assert "Fly lane-group four-column N base" in address_init
+        assert "Fly N-wave 128-column offset" in address_init
+        assert "copy workgroup N coordinate" not in address_init
         assert "0x6" in address_init
-        assert writer.states.subtileStoreInNLLSecondHalfOffset == 256
-        assert stores.count("buffer_store_dwordx2") == 8
-        assert stores.count("offset:256") == 4
-        assert "sl=0 e=0 ji=0" in stores
-        assert "sl=1 e=0 ji=0" in stores
+        assert writer.states.subtileStoreInNLLSecondHalfOffset == 128
+        assert stores.count("v_accvgpr_read_b32") == 256
+        assert stores.count("buffer_store_dwordx2") == 64
+        assert sum(
+            "offset:128" in line
+            for line in stores.splitlines()
+            if "buffer_store_dwordx2" in line
+        ) == 32
+        assert "offset:256" in stores
+        assert "offset:1280" in stores
+        assert "offset:8" not in stores
+        assert "stage Fly component=0 q=0" in stores
+        assert "staged Fly dwordx2 tile=0 sl=0 e=0" in stores
+        assert "staged Fly dwordx2 tile=7 sl=1 e=3" in stores
 
     def test_fly_a_parity_codegen_uses_inverse_write_and_read_maps(self):
         from Tensile.Components.Subtile.SubtileGREmit import (
@@ -3511,21 +3675,46 @@ class TestIntegration:
         lr_offsets = str(lraTileAssignment(writer, kernel))
         assert "logical chunk = physical chunk - region row" in gr_offsets
         assert "lane row stride four" in gr_offsets
+        # Subtile 0 has an implicit zero soffset; the other seven must use the
+        # transformed logical-row permutation in the active legacy emitter.
+        assert gr_offsets.count(
+            "Fly A parity: subtile logical-row offset") == 7
+        assert gr_offsets.count(
+            "Fly A parity: fp4 elements to bytes") == 7
         assert "swizzle chunk by region row" in lr_offsets
+        assert "A: waveId % 2" in lr_offsets
 
-        even = str(emitSingleBufferLoad(tiA, kernel, 0, 0))
-        odd = str(emitSingleBufferLoad(tiA, kernel, 1, 0))
-        pair1 = str(emitSingleBufferLoad(tiA, kernel, 2, 0))
+        writes = [
+            str(emitSingleBufferLoad(tiA, kernel, tile, 0))
+            for tile in range(8)
+        ]
+        even, odd, pair1 = writes[:3]
         assert "8192" in odd
         assert "2048" in pair1
         assert even != odd != pair1
 
-        read_even = str(emitSingleDsRead(
-            tiA, 0, 0, 0, tiA.vgprTiles[0], swizzled=False))
-        read_odd = str(emitSingleDsRead(
-            tiA, 1, 0, 0, tiA.vgprTiles[2], swizzled=False))
+        reads = [
+            str(emitSingleDsRead(
+                tiA, tile, 0, 0, tiA.vgprTiles[2 * tile],
+                swizzled=False))
+            for tile in range(8)
+        ]
+        read_even, read_odd = reads[:2]
         assert "offset:8192" in read_odd.replace(" ", "")
         assert read_even != read_odd
+
+        # The compile-time DTL m0 and ds_read immediates are the same parity /
+        # tile-pair map for every tile. Dynamic producer lane-half bases,
+        # transformed source rows, and waveId%2 consumer ownership are covered
+        # by the exhaustive CPU legacy-equivalence test.
+        expected = [
+            (tile & 1) * 8192 + (tile >> 1) * 2048
+            for tile in range(8)
+        ]
+        for tile, offset in enumerate(expected):
+            if offset:
+                assert str(offset) in writes[tile]
+            assert ("offset:%d" % offset) in reads[tile].replace(" ", "")
 
     def test_populate_instructions_256x256_fp4(self):
         """Full pipeline: emit → populate_instructions → instructionSchedule."""

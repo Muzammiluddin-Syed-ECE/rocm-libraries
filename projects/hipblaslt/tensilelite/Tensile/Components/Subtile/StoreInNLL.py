@@ -9,14 +9,27 @@ import re
 from typing import Any, Iterable, List, Optional
 
 from rocisa.code import Label, Module
-from rocisa.container import MUBUFModifiers, VCC, VOP3PModifiers, accvgpr, sgpr, vgpr
+from rocisa.container import (
+    DSModifiers,
+    MUBUFModifiers,
+    VCC,
+    VOP3PModifiers,
+    accvgpr,
+    sgpr,
+    vgpr,
+)
 from rocisa.instruction import (
     BufferStoreB128,
     BufferStoreB64,
+    DSLoadB128,
     SBranch,
     SCBranchSCC0,
     SCmpEQU32,
+    SCmpEQU64,
+    SNop,
+    SWaitCnt,
     VAccvgprReadB32,
+    VAddPKF32,
     VAndB32,
     VCmpEQU32,
     VCndMaskB32,
@@ -83,8 +96,8 @@ def flyStorePacketCoordinates(
         component: int) -> list:
     """Return the four C coordinates carried by one Fly dwordx2 store.
 
-    The two M waves own alternating 64-row quarters.  ``sl`` selects the
-    128-row second half, while the lane's low four bits select a four-row
+    The two M waves own 128-row halves.  ``sl`` selects a 64-row quarter
+    within each wave, while the lane's low four bits select a four-row
     packet.  The N wave owns one 128-column half; ``tile_n`` and the lane
     group select its 16- and four-column subdivisions.
     """
@@ -96,9 +109,17 @@ def flyStorePacketCoordinates(
     lane_group = lane >> 4
     wave_m = wave_id & 1
     wave_n = wave_id >> 1
-    m_base = wave_m * 64 + sl * 128 + lane16 * 4
+    m_base = wave_m * 128 + sl * 64 + lane16 * 4
     n = wave_n * 128 + tile_n * 16 + lane_group * 4 + component
     return [(m_base + ji, n) for ji in range(4)]
+
+
+def flyNMajorProducerQ(tile_n: int, sl: int, ji: int) -> int:
+    """Map a Fly N-major store packet row to its producer tile index."""
+    assert 0 <= tile_n < 8
+    assert 0 <= sl < 2
+    assert 0 <= ji < 4
+    return sl * 32 + tile_n * 4 + ji
 
 
 def subtileStoreInNLLRejectionReason(state: dict) -> Optional[str]:
@@ -213,7 +234,7 @@ def emitSubtileStoreInNLLAddressInit(writer, kernel) -> Module:
     # Keep the lane base plus two alternating four-address banks.  Eight
     # packed dwordx2 packets likewise alternate across two four-packet banks.
     vaddr = writer.vgprPool.checkOut(9, "subtileStoreInNLLVaddr")
-    data = writer.vgprPool.checkOutAligned(18, 2, "subtileStoreInNLLData")
+    data = writer.vgprPool.checkOutAligned(32, 2, "subtileStoreInNLLData")
     stride = writer.vgprPool.checkOut(4, "subtileStoreInNLLStride")
     alpha = writer.vgprPool.checkOutAligned(2, 2, "subtileStoreInNLLAlpha")
     writer.states.subtileStoreInNLLVaddr = vaddr
@@ -221,12 +242,14 @@ def emitSubtileStoreInNLLAddressInit(writer, kernel) -> Module:
     writer.states.subtileStoreInNLLStride = stride
     writer.states.subtileStoreInNLLStride8 = stride + 1
     writer.states.subtileStoreInNLLStride32 = stride + 2
+    if kernel.get("SubtileFlyNMajor", 0):
+        writer.states.subtileStoreInNLLStride16 = stride + 2
     writer.states.subtileStoreInNLLLaneGroupOdd = stride + 3
     writer.states.subtileStoreInNLLAlpha = alpha
-    if fly_packets:
-        writer.states.subtileStoreInNLLSecondHalfOffset = 256
+    if fly_packets or kernel.get("SubtileFlyNMajor", 0):
+        writer.states.subtileStoreInNLLSecondHalfOffset = 128
         module.addComment0(
-            "Fly store packets: second accumulator half is +256 bytes")
+            "Fly store packets: second accumulator quarter is +128 bytes")
     strideD1 = "StrideD%s" % writer.states.indexChars[kernel["PackedC1IndicesX"][0]]
     if kernel.get("SubtileFlyNMajor", 0):
         # Form Fly coordinates directly.  Legacy SourceSwap coord0/coord1 shift
@@ -248,16 +271,16 @@ def emitSubtileStoreInNLLAddressInit(writer, kernel) -> Module:
         module.add(VAndB32(
             dst=vgpr(tmp), src0=1, src1=vgpr(wave),
             comment="Fly M-wave id"))
-        if fly_packets:
-            module.add(VLShiftLeftB32(
-                dst=vgpr(tmp), shiftHex=hex(6), src=vgpr(tmp),
-                comment="Fly M-wave 64-row quarter offset"))
-        else:
-            module.add(VLShiftLeftB32(
-                dst=vgpr(tmp), shiftHex=hex(7), src=vgpr(tmp),
-                comment="Fly M-wave 128-row offset"))
+        module.add(VLShiftLeftB32(
+            dst=vgpr(tmp), shiftHex=hex(7), src=vgpr(tmp),
+            comment="Fly M-wave 128-row offset"))
         module.add(VAddU32(
             dst=vgpr(mbase), src0=vgpr(mbase), src1=vgpr(tmp)))
+        writer.states.subtileStoreInNLLLocalM = vaddr + 5
+        module.add(VMovB32(
+            dst=vgpr(writer.states.subtileStoreInNLLLocalM),
+            src=vgpr(mbase),
+            comment="preserve Fly local M base for vector LDS reads"))
         module.add(VMovB32(
             dst=vgpr(tmp), src=sgpr("WorkGroup0"),
             comment="copy workgroup M coordinate"))
@@ -282,17 +305,9 @@ def emitSubtileStoreInNLLAddressInit(writer, kernel) -> Module:
             comment="Fly N-wave 128-column offset"))
         module.add(VAddU32(
             dst=vgpr(nbase), src0=vgpr(nbase), src1=vgpr(wave)))
-        module.add(VMovB32(
-            dst=vgpr(tmp), src=sgpr("WorkGroup1"),
-            comment="copy workgroup N coordinate"))
-        module.add(VLShiftLeftB32(
-            dst=vgpr(tmp), shiftHex=hex(8), src=vgpr(tmp),
-            comment="Fly workgroup N base"))
-        module.add(VAddU32(
-            dst=vgpr(nbase), src0=vgpr(nbase), src1=vgpr(tmp)))
         module.add(VMulLOU32(
             dst=vgpr(vaddr), src0=vgpr(nbase), src1=sgpr(strideD1),
-            comment="Fly N-major global D column offset"))
+            comment="Fly N-major tile-local D column offset"))
         module.add(VAddLShiftLeftU32(
             dst=vgpr(vaddr), src0=vgpr(vaddr), src1=vgpr(mbase),
             shiftHex=1,
@@ -323,9 +338,12 @@ def emitSubtileStoreInNLLAddressInit(writer, kernel) -> Module:
         comment="peeled packet-group eight-column byte stride"))
     module.add(VLShiftLeftB32(
         dst=vgpr(stride + 2),
-        shiftHex=hex(5),
+        shiftHex=hex(4 if kernel.get("SubtileFlyNMajor", 0) else 5),
         src=vgpr(stride),
-        comment="peeled packet-group 32-column byte stride"))
+        comment=(
+            "Fly packet-group 16-column byte stride"
+            if kernel.get("SubtileFlyNMajor", 0)
+            else "peeled packet-group 32-column byte stride")))
     if not kernel.get("SubtileFlyNMajor", 0):
         module.add(VLShiftRightB32(
             dst=vgpr(stride + 3),
@@ -359,12 +377,16 @@ def cleanupSubtileStoreInNLL(writer) -> None:
         del writer.states.subtileStoreInNLLStride
         del writer.states.subtileStoreInNLLStride8
         del writer.states.subtileStoreInNLLStride32
+        if hasattr(writer.states, "subtileStoreInNLLStride16"):
+            del writer.states.subtileStoreInNLLStride16
         del writer.states.subtileStoreInNLLLaneGroupOdd
     if hasattr(writer.states, "subtileStoreInNLLAlpha"):
         writer.vgprPool.checkIn(writer.states.subtileStoreInNLLAlpha)
         del writer.states.subtileStoreInNLLAlpha
     if hasattr(writer.states, "subtileStoreInNLLSecondHalfOffset"):
         del writer.states.subtileStoreInNLLSecondHalfOffset
+    if hasattr(writer.states, "subtileStoreInNLLLocalM"):
+        del writer.states.subtileStoreInNLLLocalM
 
 
 def _column_accumulators(writer, dtileInfo, column: int) -> list:
@@ -752,14 +774,15 @@ def _store_fly_nmajor_group(writer, kernel, dtileInfo, tile_n: int) -> list:
     base_vaddr = writer.states.subtileStoreInNLLVaddr
     addresses = base_vaddr + 1
     data = writer.states.subtileStoreInNLLData
-    scratch = data + 16
+    lds_addr = base_vaddr + 6
+    alpha = writer.states.subtileStoreInNLLAlpha
     stride = writer.states.subtileStoreInNLLStride
-    stride8 = writer.states.subtileStoreInNLLStride8
+    stride16 = writer.states.subtileStoreInNLLStride16
     flags = nonTemporalDFlags(kernel["NonTemporalD"])
     insts = [VMulLOU32(
         dst=vgpr(addresses),
-        src0=tile_n * 2,
-        src1=vgpr(stride8),
+        src0=tile_n,
+        src1=vgpr(stride16),
         comment=f"Fly N-major tile {tile_n} column-byte offset"),
         VAddU32(
             dst=vgpr(addresses),
@@ -770,46 +793,86 @@ def _store_fly_nmajor_group(writer, kernel, dtileInfo, tile_n: int) -> list:
         insts.append(VAddU32(
             dst=vgpr(addresses + component),
             src0=vgpr(addresses + component - 1),
-            src1=vgpr(stride),
-            comment="advance Fly N-major address by one D column"))
+                src1=vgpr(stride),
+                comment="advance Fly N-major address by one D column"))
+    insts.append(SNop(
+        waitState=7,
+        comment="wait for final MFMA accumulator writes before folded stores"))
 
     for sl in range(2):
+        insts.extend([
+            VLShiftLeftB32(
+                dst=vgpr(lds_addr),
+                shiftHex=hex(2),
+                src=vgpr(writer.states.subtileStoreInNLLLocalM),
+                comment="Fly bias/scale-alpha LDS byte address"),
+            DSLoadB128(
+                dst=vgpr(bias, 4),
+                src=vgpr(lds_addr),
+                ds=DSModifiers(offset=sl * 256),
+                comment=f"Fly bias rows sl={sl}"),
+            DSLoadB128(
+                dst=vgpr(scale_alpha, 4),
+                src=vgpr(lds_addr),
+                ds=DSModifiers(offset=1024 + sl * 256),
+                comment=f"Fly scale-alpha rows sl={sl}"),
+        ])
+        raw_regs = []
         for component in range(4):
-            packed = data + component * 2
             regs = []
             for ji in range(4):
-                q = sl * 32 + tile_n * 4 + ji
+                q = flyNMajorProducerQ(tile_n, sl, ji)
                 tile = dtileInfo.vgprTiles[q]
                 if tile.regList.pool == writer.vgprPool:
                     raise RuntimeError(
                         "Fly N-major stores do not support accumulator spill to VGPR")
                 regs.append(tile.regList.indices[component])
+            raw = data + component * 4
+            raw_regs.append(raw)
+            for ji, reg in enumerate(regs):
+                insts.append(VAccvgprReadB32(
+                    dst=vgpr(raw + ji), src=accvgpr(reg),
+                    comment=(
+                        f"Fly N-major sl={sl} e={component} ji={ji}")))
+        insts.append(SWaitCnt(
+            dscnt=0, vlcnt=-1, vscnt=-1,
+            comment="wait for Fly bias/scale-alpha rows"))
+        for component, raw in enumerate(raw_regs):
+            packed = data + component * 2
+            for pair in range(2):
+                row_pair = raw + pair * 2
+                insts.extend([
+                    VMulPKF32(
+                        dst=vgpr(row_pair, 2),
+                        src0=vgpr(alpha, 2),
+                        src1=vgpr(row_pair, 2),
+                        vop3=VOP3PModifiers(op_sel_hi=[0, 1, 1]),
+                        comment="apply alpha to Fly rows"),
+                    VMulPKF32(
+                        dst=vgpr(row_pair, 2),
+                        src0=vgpr(scale_alpha + pair * 2, 2),
+                        src1=vgpr(row_pair, 2),
+                        comment="apply scale-alpha to Fly rows"),
+                    VAddPKF32(
+                        dst=vgpr(row_pair, 2),
+                        src0=vgpr(bias + pair * 2, 2),
+                        src1=vgpr(row_pair, 2),
+                        comment="add bias to Fly rows"),
+                ])
             insts.extend([
-                VAccvgprReadB32(
-                    dst=vgpr(packed), src=accvgpr(regs[0]),
-                    comment=f"Fly N-major sl={sl} e={component} ji=0"),
-                VAccvgprReadB32(
-                    dst=vgpr(scratch), src=accvgpr(regs[1]),
-                    comment=f"Fly N-major sl={sl} e={component} ji=1"),
                 VCvtPkF32toBF16(
-                    dst=vgpr(packed), src0=vgpr(packed), src1=vgpr(scratch),
+                    dst=vgpr(packed),
+                    src0=vgpr(raw),
+                    src1=vgpr(raw + 1),
                     comment="pack Fly N-major ji 0:2"),
-                VAccvgprReadB32(
-                    dst=vgpr(packed + 1), src=accvgpr(regs[2]),
-                    comment=f"Fly N-major sl={sl} e={component} ji=2"),
-                VAccvgprReadB32(
-                    dst=vgpr(scratch + 1), src=accvgpr(regs[3]),
-                    comment=f"Fly N-major sl={sl} e={component} ji=3"),
                 VCvtPkF32toBF16(
-                    dst=vgpr(packed + 1), src0=vgpr(packed + 1),
-                    src1=vgpr(scratch + 1),
+                    dst=vgpr(packed + 1),
+                    src0=vgpr(raw + 2),
+                    src1=vgpr(raw + 3),
                     comment="pack Fly N-major ji 2:4"),
             ])
         for component in range(4):
-            offset = (
-                sl * writer.states.subtileStoreInNLLSecondHalfOffset
-                if kernel.get("SubtileFlyStorePacketGeometry", 0)
-                else sl * 128)
+            offset = sl * writer.states.subtileStoreInNLLSecondHalfOffset
             mubuf = MUBUFModifiers(
                 offen=True, offset12=offset, glc=flags["glc"],
                 slc=flags["slc"], nt=flags["nt"])
@@ -823,6 +886,388 @@ def _store_fly_nmajor_group(writer, kernel, dtileInfo, tile_n: int) -> list:
                     f"Fly N-major dwordx2 tile={tile_n} "
                     f"sl={sl} e={component}")))
     return insts
+
+
+def _store_fly_nmajor_staged_drain(
+        writer, kernel, dtileInfo, stage: int) -> list:
+    """Stage a canonical 64-read component pass before N-major stores."""
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    address = base_vaddr + 1
+    data = writer.states.subtileStoreInNLLData
+    bias = data + 16
+    scale_alpha = data + 20
+    lds_addr = base_vaddr + 6
+    alpha = writer.states.subtileStoreInNLLAlpha
+    stride = writer.states.subtileStoreInNLLStride
+    stride16 = writer.states.subtileStoreInNLLStride16
+    flags = nonTemporalDFlags(kernel["NonTemporalD"])
+    insts = [VLShiftLeftB32(
+        dst=vgpr(lds_addr),
+        shiftHex=hex(2),
+        src=vgpr(writer.states.subtileStoreInNLLLocalM),
+        comment="Fly bias/scale-alpha LDS byte address")]
+    for sl in range(2):
+        bias = data + 16 + sl * 8
+        scale_alpha = bias + 4
+        insts.extend([
+            DSLoadB128(
+                dst=vgpr(bias, 4),
+                src=vgpr(lds_addr),
+                ds=DSModifiers(offset=sl * 256),
+                comment=f"preload Fly bias rows sl={sl}"),
+            DSLoadB128(
+                dst=vgpr(scale_alpha, 4),
+                src=vgpr(lds_addr),
+                ds=DSModifiers(offset=1024 + sl * 256),
+                comment=f"preload Fly scale-alpha rows sl={sl}"),
+        ])
+    insts.append(SWaitCnt(
+        dscnt=0, vlcnt=-1, vscnt=-1,
+        comment="wait for all Fly bias/scale-alpha rows"))
+
+    for component in range(4):
+        for q, tile in enumerate(dtileInfo.vgprTiles):
+            if tile.regList.pool == writer.vgprPool:
+                raise RuntimeError(
+                    "Fly N-major stores do not support accumulator spill to VGPR")
+            insts.append(VAccvgprReadB32(
+                dst=vgpr(stage + q),
+                src=accvgpr(tile.regList.indices[component]),
+                comment=f"stage Fly component={component} q={q}"))
+
+        for sl in range(2):
+            bias = data + 16 + sl * 8
+            scale_alpha = bias + 4
+            for tile_n in range(8):
+                q = flyNMajorProducerQ(tile_n, sl, 0)
+                for pair in range(2):
+                    raw = stage + q + pair * 2
+                    insts.extend([
+                        VMulPKF32(
+                            dst=vgpr(raw, 2),
+                            src0=vgpr(alpha, 2),
+                            src1=vgpr(raw, 2),
+                            vop3=VOP3PModifiers(op_sel_hi=[0, 1, 1]),
+                            comment="apply alpha to staged Fly rows"),
+                        VMulPKF32(
+                            dst=vgpr(raw, 2),
+                            src0=vgpr(scale_alpha + pair * 2, 2),
+                            src1=vgpr(raw, 2),
+                            comment="apply scale-alpha to staged Fly rows"),
+                        VAddPKF32(
+                            dst=vgpr(raw, 2),
+                            src0=vgpr(bias + pair * 2, 2),
+                            src1=vgpr(raw, 2),
+                            comment="add bias to staged Fly rows"),
+                        VCvtPkF32toBF16(
+                            dst=vgpr(data + pair),
+                            src0=vgpr(raw),
+                            src1=vgpr(raw + 1),
+                            comment="pack staged Fly BF16 rows"),
+                    ])
+
+                insts.extend([
+                    VMulLOU32(
+                        dst=vgpr(address),
+                        src0=tile_n,
+                        src1=vgpr(stride16),
+                        comment=f"Fly tile {tile_n} column-byte offset"),
+                    VAddU32(
+                        dst=vgpr(address),
+                        src0=vgpr(address),
+                        src1=vgpr(base_vaddr),
+                        comment="add Fly D lane base"),
+                ])
+                for _ in range(component):
+                    insts.append(VAddU32(
+                        dst=vgpr(address),
+                        src0=vgpr(address),
+                        src1=vgpr(stride),
+                        comment="advance Fly address by one D column"))
+                insts.append(BufferStoreB64(
+                    src=vgpr(data, 2),
+                    vaddr=vgpr(address),
+                    saddr=sgpr("SrdD", 4),
+                    soffset=0,
+                    mubuf=MUBUFModifiers(
+                        offen=True,
+                        offset12=(
+                            sl * writer.states.subtileStoreInNLLSecondHalfOffset),
+                        glc=flags["glc"], slc=flags["slc"], nt=flags["nt"]),
+                    comment=(
+                        f"staged Fly dwordx2 tile={tile_n} "
+                        f"sl={sl} e={component}")))
+    return insts
+
+
+def _store_fly_nmajor_identity_staged_drain(
+        writer, kernel, dtileInfo, stage: int) -> list:
+    """Store alpha-one output directly when optional vectors are absent."""
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    address = base_vaddr + 1
+    data = writer.states.subtileStoreInNLLData
+    stride = writer.states.subtileStoreInNLLStride
+    stride16 = writer.states.subtileStoreInNLLStride16
+    flags = nonTemporalDFlags(kernel["NonTemporalD"])
+    insts = []
+
+    for component in range(4):
+        for q, tile in enumerate(dtileInfo.vgprTiles):
+            if tile.regList.pool == writer.vgprPool:
+                raise RuntimeError(
+                    "Fly N-major stores do not support accumulator spill to VGPR")
+            insts.append(VAccvgprReadB32(
+                dst=vgpr(stage + q),
+                src=accvgpr(tile.regList.indices[component]),
+                comment=f"stage identity Fly component={component} q={q}"))
+
+        for sl in range(2):
+            for tile_n in range(8):
+                raw = stage + flyNMajorProducerQ(tile_n, sl, 0)
+                insts.extend([
+                    VCvtPkF32toBF16(
+                        dst=vgpr(data),
+                        src0=vgpr(raw),
+                        src1=vgpr(raw + 1),
+                        comment="pack identity Fly BF16 rows 0:2"),
+                    VCvtPkF32toBF16(
+                        dst=vgpr(data + 1),
+                        src0=vgpr(raw + 2),
+                        src1=vgpr(raw + 3),
+                        comment="pack identity Fly BF16 rows 2:4"),
+                    VMulLOU32(
+                        dst=vgpr(address),
+                        src0=tile_n,
+                        src1=vgpr(stride16),
+                        comment=f"Fly tile {tile_n} column-byte offset"),
+                    VAddU32(
+                        dst=vgpr(address),
+                        src0=vgpr(address),
+                        src1=vgpr(base_vaddr),
+                        comment="add Fly D lane base"),
+                ])
+                for _ in range(component):
+                    insts.append(VAddU32(
+                        dst=vgpr(address),
+                        src0=vgpr(address),
+                        src1=vgpr(stride),
+                        comment="advance Fly address by one D column"))
+                insts.append(BufferStoreB64(
+                    src=vgpr(data, 2),
+                    vaddr=vgpr(address),
+                    saddr=sgpr("SrdD", 4),
+                    soffset=0,
+                    mubuf=MUBUFModifiers(
+                        offen=True,
+                        offset12=(
+                            sl * writer.states.subtileStoreInNLLSecondHalfOffset),
+                        glc=flags["glc"], slc=flags["slc"], nt=flags["nt"]),
+                    comment=(
+                        f"identity Fly dwordx2 tile={tile_n} "
+                        f"sl={sl} e={component}")))
+    return insts
+
+
+def emitFlyNMajorVectorPreload(writer) -> Module:
+    """Load both folded-store vector halves after their LDS initialization."""
+    module = Module("FlyNMajorVectorPreload")
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    data = writer.states.subtileStoreInNLLData
+    lds_addr = base_vaddr + 6
+    module.add(VLShiftLeftB32(
+        dst=vgpr(lds_addr),
+        shiftHex=hex(2),
+        src=vgpr(writer.states.subtileStoreInNLLLocalM),
+        comment="Fly bias/scale-alpha LDS byte address"))
+    for sl in range(2):
+        bias = data + 16 + sl * 8
+        scale_alpha = bias + 4
+        module.add(DSLoadB128(
+            dst=vgpr(bias, 4),
+            src=vgpr(lds_addr),
+            ds=DSModifiers(offset=sl * 256),
+            comment=f"preload Fly bias rows sl={sl}"))
+        module.add(DSLoadB128(
+            dst=vgpr(scale_alpha, 4),
+            src=vgpr(lds_addr),
+            ds=DSModifiers(offset=1024 + sl * 256),
+            comment=f"preload Fly scale-alpha rows sl={sl}"))
+    module.add(SWaitCnt(
+        dscnt=0, vlcnt=-1, vscnt=-1,
+        comment="wait for all Fly bias/scale-alpha rows"))
+    return module
+
+
+def emitFlyNMajorTileStage(
+        writer, dtileInfo, tile_n: int, stage: int) -> Module:
+    """Stage one N-major tile's 32 accumulator values into a VGPR bank."""
+    module = Module(f"FlyNMajorTile{tile_n}Stage")
+    module.add(SNop(
+        waitState=7,
+        comment=f"wait for tile {tile_n} final MFMA accumulator writes"))
+    for component in range(4):
+        for sl in range(2):
+            for ji in range(4):
+                q = flyNMajorProducerQ(tile_n, sl, ji)
+                tile = dtileInfo.vgprTiles[q]
+                if tile.regList.pool == writer.vgprPool:
+                    raise RuntimeError(
+                        "Fly N-major stores do not support accumulator spill to VGPR")
+                dst = stage + component * 8 + sl * 4 + ji
+                module.add(VAccvgprReadB32(
+                    dst=vgpr(dst),
+                    src=accvgpr(tile.regList.indices[component]),
+                    comment=(
+                        f"stage Fly tile={tile_n} sl={sl} "
+                        f"e={component} ji={ji}")))
+    return module
+
+
+def emitFlyNMajorIdentityCellRetire(
+        writer, kernel, dtileInfo, tile_n: int, tile_m: int,
+        stage: int) -> Module:
+    """Retire one final producer and flush its four-cell packet when complete."""
+    module = Module(f"FlyNMajorIdentityCell{tile_m}_{tile_n}")
+    sl, ji = divmod(tile_m, 4)
+    bank = tile_n & 1
+    raw = stage + bank * 16
+    q = flyNMajorProducerQ(tile_n, sl, ji)
+    tile = dtileInfo.vgprTiles[q]
+    if tile.regList.pool == writer.vgprPool:
+        raise RuntimeError(
+            "Fly N-major stores do not support accumulator spill to VGPR")
+    for component in range(4):
+        module.add(VAccvgprReadB32(
+            dst=vgpr(raw + component * 4 + ji),
+            src=accvgpr(tile.regList.indices[component]),
+            comment=(
+                f"retire Fly tile={tile_n} sl={sl} "
+                f"e={component} ji={ji}")))
+    if ji != 3:
+        return module
+
+    data = writer.states.subtileStoreInNLLData
+    for component in range(4):
+        for pair in range(2):
+            module.add(VCvtPkF32toBF16(
+                dst=vgpr(data + component * 2 + pair),
+                src0=vgpr(raw + component * 4 + pair * 2),
+                src1=vgpr(raw + component * 4 + pair * 2 + 1),
+                comment="pack retired Fly BF16 pair"))
+
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    addresses = base_vaddr + 1
+    stride = writer.states.subtileStoreInNLLStride
+    stride16 = writer.states.subtileStoreInNLLStride16
+    if sl == 0:
+        module.add(VMulLOU32(
+            dst=vgpr(addresses),
+            src0=tile_n,
+            src1=vgpr(stride16),
+            comment=f"Fly tile {tile_n} column-byte offset"))
+        module.add(VAddU32(
+            dst=vgpr(addresses),
+            src0=vgpr(addresses),
+            src1=vgpr(base_vaddr),
+            comment=f"Fly tile {tile_n} first D address"))
+        for component in range(1, 4):
+            module.add(VAddU32(
+                dst=vgpr(addresses + component),
+                src0=vgpr(addresses + component - 1),
+                src1=vgpr(stride),
+                comment="advance Fly address by one D column"))
+
+    flags = nonTemporalDFlags(kernel["NonTemporalD"])
+    for component in range(4):
+        module.add(BufferStoreB64(
+            src=vgpr(data + component * 2, 2),
+            vaddr=vgpr(addresses + component),
+            saddr=sgpr("SrdD", 4),
+            soffset=0,
+            mubuf=MUBUFModifiers(
+                offen=True,
+                offset12=(
+                    sl * writer.states.subtileStoreInNLLSecondHalfOffset),
+                glc=flags["glc"], slc=flags["slc"], nt=flags["nt"]),
+            comment=(
+                f"retired Fly dwordx2 tile={tile_n} "
+                f"sl={sl} e={component}")))
+    return module
+
+
+def emitFlyNMajorTileConsume(
+        writer, kernel, tile_n: int, stage: int) -> Module:
+    """Convert and store one staged N-major tile."""
+    module = Module(f"FlyNMajorTile{tile_n}Consume")
+    base_vaddr = writer.states.subtileStoreInNLLVaddr
+    addresses = base_vaddr + 1
+    data = writer.states.subtileStoreInNLLData
+    alpha = writer.states.subtileStoreInNLLAlpha
+    stride = writer.states.subtileStoreInNLLStride
+    stride16 = writer.states.subtileStoreInNLLStride16
+    flags = nonTemporalDFlags(kernel["NonTemporalD"])
+
+    module.add(VMulLOU32(
+        dst=vgpr(addresses),
+        src0=tile_n,
+        src1=vgpr(stride16),
+        comment=f"Fly tile {tile_n} column-byte offset"))
+    module.add(VAddU32(
+        dst=vgpr(addresses),
+        src0=vgpr(addresses),
+        src1=vgpr(base_vaddr),
+        comment=f"Fly tile {tile_n} first D address"))
+    for component in range(1, 4):
+        module.add(VAddU32(
+            dst=vgpr(addresses + component),
+            src0=vgpr(addresses + component - 1),
+            src1=vgpr(stride),
+            comment="advance Fly address by one D column"))
+
+    for sl in range(2):
+        bias = data + 16 + sl * 8
+        scale_alpha = bias + 4
+        for component in range(4):
+            raw = stage + component * 8 + sl * 4
+            packed = data + component * 2
+            for pair in range(2):
+                row_pair = raw + pair * 2
+                module.add(VMulPKF32(
+                    dst=vgpr(row_pair, 2),
+                    src0=vgpr(alpha, 2),
+                    src1=vgpr(row_pair, 2),
+                    vop3=VOP3PModifiers(op_sel_hi=[0, 1, 1]),
+                    comment="apply alpha to staged Fly rows"))
+                module.add(VMulPKF32(
+                    dst=vgpr(row_pair, 2),
+                    src0=vgpr(scale_alpha + pair * 2, 2),
+                    src1=vgpr(row_pair, 2),
+                    comment="apply scale-alpha to staged Fly rows"))
+                module.add(VAddPKF32(
+                    dst=vgpr(row_pair, 2),
+                    src0=vgpr(bias + pair * 2, 2),
+                    src1=vgpr(row_pair, 2),
+                    comment="add bias to staged Fly rows"))
+                module.add(VCvtPkF32toBF16(
+                    dst=vgpr(packed + pair),
+                    src0=vgpr(row_pair),
+                    src1=vgpr(row_pair + 1),
+                    comment="pack staged Fly BF16 rows"))
+        for component in range(4):
+            module.add(BufferStoreB64(
+                src=vgpr(data + component * 2, 2),
+                vaddr=vgpr(addresses + component),
+                saddr=sgpr("SrdD", 4),
+                soffset=0,
+                mubuf=MUBUFModifiers(
+                    offen=True,
+                    offset12=(
+                        sl * writer.states.subtileStoreInNLLSecondHalfOffset),
+                    glc=flags["glc"], slc=flags["slc"], nt=flags["nt"]),
+                comment=(
+                    f"interleaved Fly dwordx2 tile={tile_n} "
+                    f"sl={sl} e={component}")))
+    return module
 
 
 def _alpha_one_store_pairs(writer, kernel, dtileInfo, columns: list) -> list:
@@ -891,6 +1336,53 @@ def _emit_deferred_store_paths(writer, kernel, dtileInfo,
     for column in columns:
         module.addItems(_store_unit(writer, kernel, dtileInfo, column))
     module.add(done)
+    return module
+
+
+def emitSubtileStoreInNLLGroupedDrain(writer, kernel, dtileInfo) -> Module:
+    """Emit a Fly N-major drain outside the scheduled scaled-MFMA block."""
+    module = Module("SubtileStoreInNLLGroupedDrain")
+    if not kernel.get("SubtileStoreInNLL", 0):
+        return module
+    if not kernel.get("SubtileFlyNMajor", 0):
+        raise RuntimeError(
+            "deferred grouped drain requires SubtileFlyNMajor")
+    stage = writer.vgprPool.checkOutAligned(
+        64, 2, "subtileStoreInNLLStage")
+    try:
+        if kernel.get("SubtileIdentityStoreFastPath", 0):
+            general = Label(
+                writer.labels.getNameInc("SubtileStoreGeneralEpilogue"), "")
+            done = Label(
+                writer.labels.getNameInc("SubtileStoreEpilogueDone"), "")
+            for register, comment in (
+                    ("Alpha", "alpha must be one"),
+                    ("AddressBias", "bias must be absent"),
+                    ("AddressScaleAlphaVec", "scale-alpha must be absent")):
+                if register == "Alpha":
+                    module.add(SCmpEQU32(
+                        src0=sgpr(register), src1=1.0, comment=comment))
+                else:
+                    module.add(SCmpEQU64(
+                        src0=sgpr(writer.sgprs[register], 2),
+                        src1=0, comment=comment))
+                module.add(SCBranchSCC0(
+                    labelName=general.getLabelName(),
+                    comment="use general folded-store epilogue"))
+            module.addItems(_store_fly_nmajor_identity_staged_drain(
+                writer, kernel, dtileInfo, stage))
+            module.add(SBranch(
+                labelName=done.getLabelName(),
+                comment="identity folded-store epilogue complete"))
+            module.add(general)
+            module.addItems(_store_fly_nmajor_staged_drain(
+                writer, kernel, dtileInfo, stage))
+            module.add(done)
+        else:
+            module.addItems(_store_fly_nmajor_staged_drain(
+                writer, kernel, dtileInfo, stage))
+    finally:
+        writer.vgprPool.checkIn(stage)
     return module
 
 
