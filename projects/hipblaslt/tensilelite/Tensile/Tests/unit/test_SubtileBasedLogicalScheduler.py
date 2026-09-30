@@ -3609,6 +3609,7 @@ class TestIntegration:
             "SubtileStoreInNLL": 1,
             "SubtileRollingPeel": 1,
             "SubtileFlyNMajor": 1,
+            "SubtileIdentityStoreFastPath": 1,
             "SubtileFlyStorePacketGeometry": 1,
             "PackedC1IndicesX": [1],
             "NonTemporalD": 4,
@@ -3617,6 +3618,7 @@ class TestIntegration:
             make_writer_and_tileinfos(kernel, fp4=True)
         writer.states.indexChars = ["I", "J", "K"]
         address_init = str(emitSubtileStoreInNLLAddressInit(writer, kernel))
+        kernel["SubtileIdentityStoreFastPath"] = 0
         stores = str(emitSubtileStoreInNLLGroupedDrain(
             writer, kernel, dTileInfo))
 
@@ -3626,6 +3628,9 @@ class TestIntegration:
         assert "Fly lane-group four-column N base" in address_init
         assert "Fly N-wave 128-column offset" in address_init
         assert "copy workgroup N coordinate" not in address_init
+        assert "Fly N-major tile-local D column offset" in address_init
+        assert "preserve raw D base low across loop" in address_init
+        assert "preserve raw D base high across loop" in address_init
         assert "0x6" in address_init
         assert writer.states.subtileStoreInNLLSecondHalfOffset == 128
         assert stores.count("v_accvgpr_read_b32") == 256

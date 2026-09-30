@@ -355,12 +355,27 @@ def emitSubtileStoreInNLLAddressInit(writer, kernel) -> Module:
             src0=1,
             src1=vgpr(stride + 3),
             comment="folded-store odd lane-group flag"))
-    module.add(VMovB32(
-        dst=vgpr(alpha), src=sgpr("Alpha"),
-        comment="duplicate folded-store alpha for packed multiply"))
-    module.add(VMovB32(
-        dst=vgpr(alpha + 1), src=sgpr("Alpha"),
-        comment="duplicate folded-store alpha for packed multiply"))
+    identity_store_interleave = bool(
+        kernel.get("SubtileIdentityStoreFastPath", 0)
+        and kernel.get("SubtileStoreInNLL", 0)
+        and kernel.get("SubtileFlyNMajor", 0)
+        and kernel.get("SubtileRollingPeel", 0)
+        and not kernel.get("SubtileDeferredStoreInterleave", 0)
+        and not kernel.get("SubtileNativeWholeLoopScheduler", 0))
+    if identity_store_interleave:
+        module.add(VMovB32(
+            dst=vgpr(alpha), src=sgpr("AddressD"),
+            comment="preserve raw D base low across loop"))
+        module.add(VMovB32(
+            dst=vgpr(alpha + 1), src=sgpr("AddressD+1"),
+            comment="preserve raw D base high across loop"))
+    else:
+        module.add(VMovB32(
+            dst=vgpr(alpha), src=sgpr("Alpha"),
+            comment="duplicate folded-store alpha for packed multiply"))
+        module.add(VMovB32(
+            dst=vgpr(alpha + 1), src=sgpr("Alpha"),
+            comment="duplicate folded-store alpha for packed multiply"))
     return module
 
 

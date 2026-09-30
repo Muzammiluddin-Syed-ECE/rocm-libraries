@@ -4228,10 +4228,15 @@ class LogicalScheduler:
             SMovB32,
             SNop,
             SWaitCnt,
+            VAddU32,
+            VLShiftLeftB32,
+            VMovB32,
+            VMulLOU32,
             VPermB32,
+            VReadfirstlaneB32,
             VXorB32,
         )
-        from rocisa.container import sgpr
+        from rocisa.container import sgpr, vgpr
         from Tensile.Components.Subtile.StoreInNLL import (
             emitFlyNMajorTileConsume,
             emitFlyNMajorIdentityCellRetire,
@@ -4470,6 +4475,27 @@ class LogicalScheduler:
                         "subtileIdentityStoreInterleave", False):
                     general = Label(writer.labels.getNameInc(
                         "SubtileIdentityStoreGeneral"), "")
+                    alpha = writer.states.subtileStoreInNLLAlpha
+                    module.add(VReadfirstlaneB32(
+                        dst=sgpr("SrdD"),
+                        src=vgpr(alpha),
+                        comment="restore raw peeled identity D base low"))
+                    module.add(VReadfirstlaneB32(
+                        dst=sgpr("SrdD+1"),
+                        src=vgpr(alpha + 1),
+                        comment="restore raw peeled identity D base high"))
+                    module.add(SMovB32(
+                        dst=sgpr("SrdD+2"), src="BufferOOB",
+                        comment="refresh peeled identity D SRD limit"))
+                    module.add(SMovB32(
+                        dst=sgpr("SrdD+3"), src="Srd127_96",
+                        comment="refresh peeled identity D SRD format"))
+                    module.add(VMovB32(
+                        dst=vgpr(alpha), src=sgpr("Alpha"),
+                        comment="restore packed alpha for general fallback"))
+                    module.add(VMovB32(
+                        dst=vgpr(alpha + 1), src=sgpr("Alpha"),
+                        comment="restore packed alpha for general fallback"))
                     for register, comment in (
                             ("Alpha", "alpha must be one"),
                             ("SubtileIdentityBias", "bias must be absent"),
@@ -4490,6 +4516,30 @@ class LogicalScheduler:
                     stage = writer.vgprPool.checkOutAligned(
                         32, 2, "subtileIdentityStoreInterleaveStage")
                     try:
+                        stride_d1 = "StrideD%s" % writer.states.indexChars[
+                            kernel["PackedC1IndicesX"][0]]
+                        module.add(VMovB32(
+                            dst=vgpr(stage), src=sgpr("WorkGroup1"),
+                            comment="identity store workgroup N"))
+                        module.add(VLShiftLeftB32(
+                            dst=vgpr(stage), shiftHex=hex(8),
+                            src=vgpr(stage),
+                            comment="identity store workgroup N tile base"))
+                        module.add(VMulLOU32(
+                            dst=vgpr(stage), src0=vgpr(stage),
+                            src1=sgpr(stride_d1),
+                            comment="identity store workgroup N element offset"))
+                        module.add(VLShiftLeftB32(
+                            dst=vgpr(stage), shiftHex=hex(1),
+                            src=vgpr(stage),
+                            comment="identity store workgroup N byte offset"))
+                        module.add(VAddU32(
+                            dst=vgpr(
+                                writer.states.subtileStoreInNLLVaddr),
+                            src0=vgpr(
+                                writer.states.subtileStoreInNLLVaddr),
+                            src1=vgpr(stage),
+                            comment="globalize peeled identity D address"))
                         pending_retirements = []
                         for phase, row, column in second_macro:
                             emit_second_macro_cell(
