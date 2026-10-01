@@ -16946,6 +16946,78 @@ class KernelWriterAssembly(KernelWriter):
       module.add(VMulLOU32(dst=vgpr(vPermAddr), src0=vgpr(vPermAddr), src1=12*bpeDest,
                            comment="(lane_group&1)*12 rows = permlane16 row-byte delta"))
       self.states.subtileHoistedPermAddr = True
+    module.add(self.emitSubtileScalarStoreAddr(kernel, cvtVgprStruct))
+    return module
+
+  def emitSubtileScalarStoreAddr(self, kernel, cvtVgprStruct):
+    """Materialize the unpaired dwordx2 store's per-lane vaddr once per store."""
+    module = Module("SubtileScalarStoreAddr")
+    self.states.subtileHoistedScalarAddr = False
+    if not self.states.subtileFusedWeave:
+      return module
+    vAddr = getattr(cvtVgprStruct, "vgprScalarAddr", -1)
+    vLGDelta = getattr(cvtVgprStruct, "vgprLaneGroupDelta", -1)
+    if vAddr < 0 or vLGDelta < 0 or not self.states.subtileHoistedLaneGroupDelta:
+      return module
+    from .Components.GlobalWriteBatch import plsinScalarStoreActive
+    if not plsinScalarStoreActive(kernel):
+      return module
+
+    bpe       = self.states.bpeCexternalGSU1
+    packedC1  = kernel["PackedC1IndicesX"]
+    strideD1J = "StrideD%s" % self.states.indexChars[packedC1[0]]
+    ws        = kernel["WavefrontSize"]
+    miwg0     = kernel["MIWaveGroup"][0]
+    miwg1     = kernel["MIWaveGroup"][1]
+    if (miwg0 & (miwg0 - 1)) != 0:
+      return module
+    wsLog2 = int(log2(ws))
+    tmpV = cvtVgprStruct.vgprAddrScratch
+    tmpS = self.sgprPool.checkOut(1, "plsinScalarStoreAddr")
+
+    module.addComment1("hoisted unpaired dwordx2 store vaddr (wave-invariant, once per store)")
+    module.add(VAndB32(dst=vgpr(vAddr), src0=15, src1=vgpr("Serial"),
+                       comment="col_in_wave = lane_id & 15  (N-column index)"))
+    module.add(VMulLOU32(dst=vgpr(tmpV), src0=vgpr(vAddr), src1=sgpr(strideD1J),
+                         comment="col_in_wave * StrideD1J"))
+    if bpe == 2:
+      module.add(VLShiftLeftB32(dst=vgpr(vAddr), shiftHex=1, src=vgpr(tmpV),
+                                comment="N_col_off = col_in_wave * StrideD1J * 2"))
+    else:
+      module.add(VMulLOU32(dst=vgpr(vAddr), src0=vgpr(tmpV), src1=bpe,
+                           comment="N_col_off = col_in_wave * StrideD1J * bpe"))
+    module.add(VAddU32(dst=vgpr(vAddr), src0=vgpr(vAddr), src1=vgpr(vLGDelta),
+                       comment="vaddr += LG_M_off (= vgprLaneGroupDelta)"))
+    module.add(SMulI32(dst=sgpr(tmpS), src0=sgpr("WorkGroup0"), src1=kernel["MacroTile0"]*bpe,
+                       comment="wg0_M_off = WorkGroup0 * MT0 * bpe"))
+    module.add(VAddU32(dst=vgpr(vAddr), src0=vgpr(vAddr), src1=sgpr(tmpS),
+                       comment="vaddr += wg0_M_off"))
+    if miwg0 > 1:
+      module.add(VLShiftRightB32(dst=vgpr(tmpV), shiftHex=wsLog2, src=vgpr("Serial"),
+                                 comment=f"waveId = Serial >> {wsLog2}"))
+      module.add(VAndB32(dst=vgpr(tmpV), src0=miwg0-1, src1=vgpr(tmpV),
+                         comment=f"waveId0 = waveId & {miwg0-1}"))
+      module.add(SMovB32(dst=sgpr(tmpS), src=kernel["MIWaveTile"][0]*kernel["MatrixInstM"]*bpe,
+                         comment="waveM_stride_bpe"))
+      module.add(VMulLOU32(dst=vgpr(tmpV), src0=vgpr(tmpV), src1=sgpr(tmpS),
+                           comment="wave_M_off = waveId0 * waveM_stride_bpe"))
+      module.add(VAddU32(dst=vgpr(vAddr), src0=vgpr(vAddr), src1=vgpr(tmpV),
+                         comment="vaddr += wave_M_off"))
+    if miwg1 > 1:
+      module.add(VLShiftRightB32(dst=vgpr(tmpV), shiftHex=wsLog2, src=vgpr("Serial"),
+                                 comment=f"waveId = Serial >> {wsLog2}"))
+      module.add(VLShiftRightB32(dst=vgpr(tmpV), shiftHex=int(log2(miwg0)), src=vgpr(tmpV),
+                                 comment=f"waveId1 = waveId / {miwg0}"))
+      module.add(SMovB32(dst=sgpr(tmpS), src=kernel["MIWaveTile"][1]*kernel["MatrixInstN"]*bpe,
+                         comment="waveN_stride_bpe"))
+      module.add(VMulLOU32(dst=vgpr(tmpV), src0=vgpr(tmpV), src1=sgpr(tmpS),
+                           comment="waveId1 * waveN_stride_bpe"))
+      module.add(VMulLOU32(dst=vgpr(tmpV), src0=vgpr(tmpV), src1=sgpr(strideD1J),
+                           comment="wave_N_off = waveId1 * waveN_stride_bpe * StrideD1J"))
+      module.add(VAddU32(dst=vgpr(vAddr), src0=vgpr(vAddr), src1=vgpr(tmpV),
+                         comment="vaddr += wave_N_off"))
+    self.sgprPool.checkIn(tmpS)
+    self.states.subtileHoistedScalarAddr = True
     return module
 
   def _plsinFusedSkipBias(self, kernel):
@@ -17763,10 +17835,20 @@ class KernelWriterAssembly(KernelWriter):
     vgprPermAddr: int = -1        # per-lane ds_bpermute byte address (partner_lane*4); constant for the whole batch
     vgprLaneGroupDelta: int = -1  # per-lane lane_group*8: M-row byte offset added to addrDVgpr for the dwordx4 store
     vgprAddrScratch: int = -1     # per-store scratch: holds (addrDVgpr scaled + lane_group*8) without modifying addrDVgpr
-    vgprBf16Temp2: int = -1       # second 4-VGPR scratch window (+8..+11, 2-aligned) for DPP store-repack: batchB packed dwords
-    vgprStoreData: int = -1       # 4-VGPR store-src (+12..+15, 2-aligned) for DPP store-repack: blended per-store data
-    vgprVoff: int = -1            # 1-VGPR (+16) for DPP store-repack: per-store voffset (cndmask result)
-    vgprBlendTmp: int = -1        # 1-VGPR (+17) shared scratch: odd-batchB data temp AND store-2 even-addr temp (disjoint use)
+    vgprScalarAddr: int = -1      # hoisted per-lane vaddr for the unpaired dwordx2 store
+    vgprScalarPackRing: int = -1  # base of the unpaired-store pack ring
+    numScalarPackPairs: int = 1
+    vgprPairPackRing: int = -1    # base of the paired-store pack ring
+    numPairPackQuads: int = 1
+    vgprColPackB: int = -1        # second pack quad for the 128B-column merge
+    vgprColMergeTmp: int = -1
+    vgprColAddrQ: int = -1
+    vgprColAddrR: int = -1
+    # DPP store-repack fields. BatchB/store data reuse dead ValuC slots.
+    vgprBf16Temp2: int = -1
+    vgprStoreData: int = -1
+    vgprVoff: int = -1
+    vgprBlendTmp: int = -1
 
   class FP8CVTVgprStruct(NamedTuple):
     vgprFp8NanInf: int = -1
@@ -18417,6 +18499,7 @@ class KernelWriterAssembly(KernelWriter):
 
       cvtVgprStruct  = None
       cvtVgpr        = None
+      pairRing       = -1
       # No hoisted lane math until emitSubtileStoreLaneMath below says otherwise; a
       # stale True would make batches skip a computation that never ran.
       self.states.subtileHoistedLaneGroupDelta = False
@@ -18478,6 +18561,10 @@ class KernelWriterAssembly(KernelWriter):
         # With ValuC-slot reuse the fold's only fresh allocation is the 9-VGPR cvt block
         # (vPack2/vSD live in reserved ValuC, not on top), so the peak grows by just 9 -- no
         # margin for post-cvt store windows is needed.
+        from .Components.GlobalWriteBatch import plsinScalarStoreActive, plsinStoreCol128Active, \
+                                                 plsinStorePermlane16Active
+        scalarStore = plsinScalarStoreActive(kernel)
+        packPairs   = max(1, int(plsinDebugEnv("TENSILE_PLSIN_STORE_PAIRS", "4"))) if scalarStore else 1
         miwt = kernel.get("MIWaveTile", [0, 0])
         maxVgpr = self.states.regCaps["MaxVgpr"]
         foldFits = (self.vgprPool.size() + 9) <= maxVgpr
@@ -18503,17 +18590,7 @@ class KernelWriterAssembly(KernelWriter):
           col128Base = (nxt + 1) & ~1   # 2-align the second pack quad
           nxt = col128Base + 7
         numCvtVgprs = nxt if kernel.get("UseSubtileImpl") else 4
-        # Paired-store pack ring is blk-sched's permlane16 paired-store mechanism, held in
-        # its own allocation rather than appended to the cvt block (growing that block
-        # shifts store batching and drops the unpaired dwordx4 store).  Fold's dead-ValuC
-        # repack never names the ring, so keep it off under the fold.
         pairQuads = 1
-        # plsinBlockSchedTile, not UseSubtileImpl alone: the ring is the only part
-        # of this store that spends registers, and permlane16 reaches every gfx950
-        # MI16 subtile kernel, including bf16-input ones whose accumulators already
-        # fill the VGPR file. Four more registers there push ValuC past the 256 cap
-        # and the kernel fails to assemble.  Fold's dead-ValuC repack never names the
-        # ring either, so keep it off under the fold as well (not isSubtileFold).
         permForRing = plsinStorePermlane16Active(kernel, True if self.states.subtileFusedFullTileStore else None)
         # Fold<->ring composition (TENSILE_PLSIN_FOLD_RING): the ring quad is the store-
         # shadow double-buffer, so the fold pre-packs batchA into it one pair-iteration
@@ -18531,10 +18608,8 @@ class KernelWriterAssembly(KernelWriter):
           pairQuads = max(1, _storeQuads)
         cvtAlign    = 2 if kernel.get("UseSubtileImpl") else 1
         cvtVgpr = self.vgprPool.checkOutAligned(numCvtVgprs, cvtAlign, tag="globalWriteElements_cvtVgpr")
-        # vgprBf16Temp2/vgprStoreData (the batchB pack + store src) are NOT cvt-allocated under
-        # the fold -- the repack places them in batchA's dead ValuC slots.  vgprStoreData is
-        # set to cvtVgpr (>=0) purely so the caller's `vgprStoreData >= 0` fold-enable check
-        # holds; the repack does not read it.
+        pairRing = self.vgprPool.checkOutAligned(4 * (pairQuads - 1), 2, tag="subtilePairPackRing") \
+                   if pairQuads > 1 else -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
@@ -18542,8 +18617,17 @@ class KernelWriterAssembly(KernelWriter):
                                                vgprAddrScratch=(cvtVgpr+6) if kernel.get("UseSubtileImpl") else -1, \
                                                vgprBf16Temp2=-1, \
                                                vgprStoreData=(cvtVgpr) if isSubtileFold else -1, \
-                                               vgprVoff=(cvtVgpr+7)      if isSubtileFold else -1, \
-                                               vgprBlendTmp=(cvtVgpr+8)  if isSubtileFold else -1)
+                                               vgprVoff=(cvtVgpr+foldVoff) if isSubtileFold else -1, \
+                                               vgprBlendTmp=(cvtVgpr+foldBlend) if isSubtileFold else -1, \
+                                               vgprScalarAddr=(cvtVgpr+scalarAddrOff) if scalarStore else -1, \
+                                               vgprScalarPackRing=(cvtVgpr+scalarRingOff) if scalarStore else -1, \
+                                               numScalarPackPairs=packPairs, \
+                                               vgprPairPackRing=pairRing, \
+                                               numPairPackQuads=pairQuads, \
+                                               vgprColPackB=(cvtVgpr+col128Base) if col128Base >= 0 else -1, \
+                                               vgprColMergeTmp=(cvtVgpr+col128Base+4) if col128Base >= 0 else -1, \
+                                               vgprColAddrQ=(cvtVgpr+col128Base+5) if col128Base >= 0 else -1, \
+                                               vgprColAddrR=(cvtVgpr+col128Base+6) if col128Base >= 0 else -1)
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
@@ -18789,6 +18873,8 @@ class KernelWriterAssembly(KernelWriter):
       self.vgprPool.checkIn(tmpVgpr.idx)
       if cvtVgpr is not None:
         self.vgprPool.checkIn(cvtVgpr)
+        if pairRing >= 0:
+          self.vgprPool.checkIn(pairRing)
       # The hoisted values die with the cvtVgpr block.
       self.states.subtileHoistedLaneGroupDelta = False
       self.states.subtileHoistedPermAddr = False

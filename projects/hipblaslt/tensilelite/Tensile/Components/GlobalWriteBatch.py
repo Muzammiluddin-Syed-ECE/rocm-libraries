@@ -3140,6 +3140,28 @@ class GlobalWriteBatchWriter:
 
     return module
 
+  _COL128_ROR8     = 8
+  _COL128_ROW_ALL  = 0xf
+  _COL128_BANK_HI8 = 0xc
+  _COL128_BANK_LO8 = 0x3
+
+  def _emitSubtileColumnMerge(self, vPackA: int, vPackB: int, vTmp: int) -> Module:
+    """Re-split two M-adjacent paired-store payloads into 128B column runs."""
+    module = Module("SubtileColumnMerge")
+    module.addComment1("column merge: 2 x (16 cols x 64B) -> 2 x (8 cols x 128B)")
+    hi8 = DPPModifiers(row_ror=self._COL128_ROR8, row_mask=self._COL128_ROW_ALL,
+                       bank_mask=self._COL128_BANK_HI8)
+    lo8 = DPPModifiers(row_ror=self._COL128_ROR8, row_mask=self._COL128_ROW_ALL,
+                       bank_mask=self._COL128_BANK_LO8)
+    for k in range(4):
+      module.add(VMovB32(dst=vgpr(vTmp), src=vgpr(vPackA+k),
+                         comment=f"save P0 dword {k}"))
+      module.add(VMovB32(dst=vgpr(vPackA+k), src=vgpr(vPackB+k), dpp=hi8,
+                         comment=f"cols 0-7 dword {k}: lanes 8-15 <- P1[m^8]"))
+      module.add(VMovB32(dst=vgpr(vPackB+k), src=vgpr(vTmp), dpp=lo8,
+                         comment=f"cols 8-15 dword {k}: lanes 0-7 <- P0[m^8]"))
+    return module
+
   def _pairedStoreClobbersBf16Consts(self):
     """True when the paired dwordx4 store overwrites the bf16 software-rounding
     constants before anything can read them, so emitting them is pure waste.

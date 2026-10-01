@@ -474,6 +474,7 @@ class StateValues:
   # 16bit-subtile store lane offsets materialized once per store by
   # emitSubtileStoreLaneMath instead of in every write batch's preamble.
   subtileHoistedLaneGroupDelta: bool     = False   # vgprLaneGroupDelta is live from the hoist
+  subtileHoistedScalarAddr: bool         = False   # vgprScalarAddr holds the unpaired dwordx2 store vaddr
   subtileHoistedPermAddr: bool           = False   # vgprPermAddr holds the permlane16 row delta
   subtileWeaveMfmaGroups: Optional[dict] = None    # {pair: [terminal mfma insts]} being woven
   subtileWeaveMfmaGroupsMaster: Optional[dict] = None  # pristine master re-copied per store type
