@@ -3077,10 +3077,11 @@ class TestInstructionSchedulerWrapPrefetch:
         import shutil
         from types import SimpleNamespace
         from rocisa import rocIsa
-        from rocisa.container import DSModifiers, accvgpr, vgpr
+        from rocisa.container import DSModifiers, accvgpr, mgpr, sgpr, vgpr
         from rocisa.enum import InstType
         from rocisa.instruction import (
-            DSLoadB128, MXMFMAInstruction, SBarrier, SWaitCnt)
+            BufferLoadB128, DSLoadB128, MXMFMAInstruction, SAddU32,
+            SBarrier, SWaitCnt)
         from Tensile.Components.Subtile.InstructionEmitter import SWaitCntEx
         from Tensile.Components.Subtile.InstructionScheduler import instructionSchedule
 
@@ -3122,6 +3123,19 @@ class TestInstructionSchedulerWrapPrefetch:
                 for index in range(begin, end)
             ]
 
+        def global_reads(count):
+            instructions = []
+            for index in range(count):
+                instructions.extend([
+                    SAddU32(
+                        dst=mgpr(0), src0=sgpr(20), src1=index,
+                        comment=f"m0-{index}"),
+                    BufferLoadB128(
+                        dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                        soffset=0, comment=f"gr-{index}"),
+                ])
+            return instructions
+
         modules = [
             emitted(0, 'mfma', [mfma(i) for i in range(16)], before=6),
             emitted(1, 'lr', reads(0, 8), before=8, tensor='B',
@@ -3136,6 +3150,7 @@ class TestInstructionSchedulerWrapPrefetch:
                 SWaitCntEx(vlcnt=13, dscnt=-1, comment="wait_gr")]),
             emitted(8, 'sync', [
                 SBarrier(comment="barrier")], before=7),
+            emitted(9, 'gr', global_reads(4)),
         ]
 
         items = list(instructionSchedule(modules).flatitems())
@@ -3157,8 +3172,14 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # All 16 younger reads preserve order while using four 4-cycle
-        # slots to spread across nearly the whole MXFP8 MFMA stream.
+        # The regular SALU/global path claims its preferred slots first.
+        # The 16 younger reads preserve order and pack into the remaining
+        # two-slot issue pairs instead of forcing a full-range spread.
+        assert items[mfma_positions[0] + 1].comment == "m0-0"
+        assert [
+            inst.comment for inst in items
+            if isinstance(inst, BufferLoadB128)
+        ] == [f"gr-{i}" for i in range(4)]
         assert [
             inst.comment for inst in items
             if isinstance(inst, DSLoadB128)
@@ -3168,7 +3189,7 @@ class TestInstructionSchedulerWrapPrefetch:
                 for inst in items[begin + 1:end])
             for begin, end in zip(mfma_positions, mfma_positions[1:])
         ]
-        assert sum(count > 0 for count in reads_per_interval) >= 14
+        assert sum(count > 0 for count in reads_per_interval) >= 8
         assert max(reads_per_interval) <= 2
         assert next(
             i for i, inst in reversed(list(enumerate(items)))

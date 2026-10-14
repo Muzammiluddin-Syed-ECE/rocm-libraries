@@ -735,11 +735,6 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         onPlace=rules.trackPlacement,
         slotsPerInterval=slotsPerInterval)
 
-    if p0Split is not None:
-        rules.resetPath()
-        rules.setupLocalReadSpreading(p0Split[3])
-        placer.placePath(p0Split[3])
-
     for order, hasWaitGR in paths:
         if not order:
             continue
@@ -775,6 +770,13 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
         if multiDU and hasWaitGR:
             rules.setPostWaitGrDsReadFence(placer)
+
+    if p0Split is not None:
+        # Let SALU and global loads claim their preferred MFMA slots first,
+        # then pack the independent p0 prefetch reads into the remaining
+        # positions without forcing them back across the full slot range.
+        rules.resetPath()
+        placer.placePath(p0Split[3])
 
     scheduled = Module()
     _emitPreMfma(scheduled)
