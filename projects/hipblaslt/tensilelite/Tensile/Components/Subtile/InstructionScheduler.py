@@ -526,6 +526,34 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     return order, prefixInsts, payloadOrder, payloadInsts
 
 
+def _splitItemsAfterHalf(pathInsts, predicate):
+    """Split an instruction path after half its matching instructions."""
+    if not pathInsts:
+        return [], []
+
+    total = sum(predicate(inst) for _, inst in pathInsts)
+    if total == 0:
+        split = (len(pathInsts) + 1) // 2
+        return pathInsts[:split], pathInsts[split:]
+
+    target = (total + 1) // 2
+    count = 0
+    for index, (_, inst) in enumerate(pathInsts):
+        count += predicate(inst)
+        if count >= target:
+            split = index + 1
+            return pathInsts[:split], pathInsts[split:]
+    return pathInsts, []
+
+
+def _nextPlacementSlot(placer):
+    """Return the first slot after all instructions placed so far."""
+    for pos in range(placer.totalSlots - 1, -1, -1):
+        if placer._placed[pos]:
+            return pos + 1
+    return 0
+
+
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
     """Extract non-MFMA dependency paths using only EmittedModule.before links.
 
@@ -735,48 +763,72 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         onPlace=rules.trackPlacement,
         slotsPerInterval=slotsPerInterval)
 
-    for order, hasWaitGR in paths:
-        if not order:
-            continue
-        wrapPrefetch = (not multiDU) and hasWaitGR \
-            and _isWrapPrefetchPath(order, emittedModules)
-        if wrapPrefetch:
-            # The final partition wraps its local-read prefetch to partition 0
-            # of the next MT. Legacy reverse packing runs out of valid slots and
-            # force-stacks wait+barrier, LR swaps, and several ds_reads before
-            # MFMA #1. Keep only the synchronization in the first interval;
-            # current-partition MFMAs do not consume the wrapped LR payload.
-            pathInsts = _flattenPath(order, emittedModules)
-            syncEnd = next(
-                (idx + 1 for idx, (_, inst) in enumerate(pathInsts)
-                 if _isBarrier(inst)),
-                0)
-            if syncEnd:
-                rules.resetPath()
-                placer.placePath(
-                    pathInsts[:syncEnd],
-                    multiDU=True)
-                placer.placePath(
-                    pathInsts[syncEnd:],
-                    startLimit=2,
-                    overflowToTail=True)
+    def _placeRegularPaths():
+        for order, hasWaitGR in paths:
+            if not order:
                 continue
+            wrapPrefetch = (not multiDU) and hasWaitGR \
+                and _isWrapPrefetchPath(order, emittedModules)
+            if wrapPrefetch:
+                # The final partition wraps its local-read prefetch to partition 0
+                # of the next MT. Legacy reverse packing runs out of valid slots and
+                # force-stacks wait+barrier, LR swaps, and several ds_reads before
+                # MFMA #1. Keep only the synchronization in the first interval;
+                # current-partition MFMAs do not consume the wrapped LR payload.
+                pathInsts = _flattenPath(order, emittedModules)
+                syncEnd = next(
+                    (idx + 1 for idx, (_, inst) in enumerate(pathInsts)
+                     if _isBarrier(inst)),
+                    0)
+                if syncEnd:
+                    rules.resetPath()
+                    placer.placePath(
+                        pathInsts[:syncEnd],
+                        multiDU=True)
+                    placer.placePath(
+                        pathInsts[syncEnd:],
+                        startLimit=2,
+                        overflowToTail=True)
+                    continue
 
-        reverse = (not multiDU) and hasWaitGR
-        pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
-        rules.resetPath()
-        if not hasWaitGR:
-            rules.setupBufLoadSpreading(placer, pathInsts, order)
-        placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
-        if multiDU and hasWaitGR:
-            rules.setPostWaitGrDsReadFence(placer)
+            reverse = (not multiDU) and hasWaitGR
+            pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
+            rules.resetPath()
+            if not hasWaitGR:
+                rules.setupBufLoadSpreading(placer, pathInsts, order)
+            placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
+            if multiDU and hasWaitGR:
+                rules.setPostWaitGrDsReadFence(placer)
 
-    if p0Split is not None:
-        # Let SALU and global loads claim their preferred MFMA slots first,
-        # then pack the independent p0 prefetch reads into the remaining
-        # positions without forcing them back across the full slot range.
-        rules.resetPath()
-        placer.placePath(p0Split[3])
+    if p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
+        regularHalves = [
+            _splitItemsAfterHalf(
+                _flattenPath(order, emittedModules), _isBufferLoad)
+            for order, _ in paths
+        ]
+        p0Halves = _splitItemsAfterHalf(p0Split[3], _isDsRead)
+
+        def _placePacked(pathInsts):
+            if not pathInsts:
+                return
+            rules.resetPath()
+            placer.placePath(
+                pathInsts,
+                startLimit=_nextPlacementSlot(placer))
+
+        # Split after complete m0/buffer-load pairs: first half of each
+        # SALU/global stream, first eight DS reads, then the remaining halves.
+        for first, _ in regularHalves:
+            _placePacked(first)
+        _placePacked(p0Halves[0])
+        for _, second in regularHalves:
+            _placePacked(second)
+        _placePacked(p0Halves[1])
+    else:
+        _placeRegularPaths()
+        if p0Split is not None:
+            rules.resetPath()
+            placer.placePath(p0Split[3])
 
     scheduled = Module()
     _emitPreMfma(scheduled)
