@@ -3073,14 +3073,14 @@ class TestInstructionSchedulerWrapPrefetch:
         ] == [f"ds{i}" for i in range(16)]
         assert sum(len(em.instructions) for em in modules) == len(items)
 
-    def test_partition_zero_wait_leaves_prefetch_reads_in_flight(self):
+    def test_partition_zero_wait_precedes_interleaved_prefetch_reads(self):
         import shutil
         from types import SimpleNamespace
         from rocisa import rocIsa
-        from rocisa.container import DSModifiers, vgpr
+        from rocisa.container import DSModifiers, accvgpr, vgpr
         from rocisa.enum import InstType
         from rocisa.instruction import (
-            DSLoadB128, MFMAInstruction, SBarrier, SWaitCnt)
+            DSLoadB128, MXMFMAInstruction, SBarrier, SWaitCnt)
         from Tensile.Components.Subtile.InstructionEmitter import SWaitCntEx
         from Tensile.Components.Subtile.InstructionScheduler import instructionSchedule
 
@@ -3100,9 +3100,17 @@ class TestInstructionSchedulerWrapPrefetch:
                 source=source(kind, **kwargs))
 
         def mfma(index):
-            return MFMAInstruction(
-                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
-                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+            return MXMFMAInstruction(
+                instType=InstType.INST_F8,
+                accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1],
+                acc=accvgpr(0, 4),
+                a=vgpr(0, 8),
+                b=vgpr(8, 8),
+                acc2=accvgpr(0, 4),
+                mxsa=vgpr(16),
+                mxsb=vgpr(17),
+                block=32,
                 comment=f"mfma{index}")
 
         def reads(begin, end):
@@ -3115,7 +3123,7 @@ class TestInstructionSchedulerWrapPrefetch:
             ]
 
         modules = [
-            emitted(0, 'mfma', [mfma(0), mfma(1)], before=6),
+            emitted(0, 'mfma', [mfma(i) for i in range(16)], before=6),
             emitted(1, 'lr', reads(0, 8), before=8, tensor='B',
                     partition=0, targetPartition=1, mtIteration=0),
             emitted(2, 'lr', reads(8, 12), before=1, tensor='SA',
@@ -3131,16 +3139,42 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
 
         items = list(instructionSchedule(modules).flatitems())
+        mfma_positions = [
+            i for i, inst in enumerate(items)
+            if isinstance(inst, MXMFMAInstruction)
+        ]
         wait = next(
             inst for inst in items
             if isinstance(inst, SWaitCnt) and inst.dscnt >= 0
         )
 
-        # gfx950's combined lgkmcnt field tops out at 15, so a requested
-        # threshold of 16 must use the closest encodable partial wait.
-        assert wait.dscnt == 15
-        assert wait.comment == \
-            "Wait for prior LR; leave p0 prefetch reads in flight"
+        assert [type(inst) for inst in items[:4]] == [
+            SWaitCntEx, SBarrier, SWaitCnt, MXMFMAInstruction]
+        assert wait.dscnt == 0
+        assert wait.comment == "Wait for preloop LR before p0 MFMA"
+        assert not any(
+            isinstance(inst, DSLoadB128)
+            for inst in items[:mfma_positions[0]]
+        )
+
+        # All 16 younger reads preserve order while using the eight 4-cycle
+        # slots to spread across nearly the whole MXFP8 MFMA stream.
+        assert [
+            inst.comment for inst in items
+            if isinstance(inst, DSLoadB128)
+        ] == [f"ds{i}" for i in range(16)]
+        reads_per_interval = [
+            sum(isinstance(inst, DSLoadB128)
+                for inst in items[begin + 1:end])
+            for begin, end in zip(mfma_positions, mfma_positions[1:])
+        ]
+        assert sum(count > 0 for count in reads_per_interval) >= 14
+        assert max(reads_per_interval) <= 2
+        assert next(
+            i for i, inst in reversed(list(enumerate(items)))
+            if isinstance(inst, DSLoadB128)
+        ) < mfma_positions[-1]
+        assert sum(len(em.instructions) for em in modules) == len(items)
 
 
 class TestIntegration:
