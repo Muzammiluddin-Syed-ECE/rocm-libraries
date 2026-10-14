@@ -3157,7 +3157,7 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # All 16 younger reads preserve order while using the eight 4-cycle
+        # All 16 younger reads preserve order while using four 4-cycle
         # slots to spread across nearly the whole MXFP8 MFMA stream.
         assert [
             inst.comment for inst in items
@@ -3175,6 +3175,43 @@ class TestInstructionSchedulerWrapPrefetch:
             if isinstance(inst, DSLoadB128)
         ) < mfma_positions[-1]
         assert sum(len(em.instructions) for em in modules) == len(items)
+
+    def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
+        import shutil
+        from rocisa import rocIsa
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.instruction import DSLoadB128, VXorB32
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            _SchedulingRules, _SlotPlacer)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        ds_read = DSLoadB128(
+            dst=vgpr(8, 4), src=vgpr(1),
+            ds=DSModifiers(offset=0))
+        valu = VXorB32(
+            dst=vgpr(2), src0=vgpr(2), src1=vgpr(3))
+        rules = _SchedulingRules(totalSlots=8)
+        placer = _SlotPlacer(
+            intervals=2,
+            numModules=2,
+            pathOrders=[[0], [1]],
+            validators=[rules.noDsReadOrValuInFirstSlot],
+            slotsPerInterval=4)
+
+        placer.placePath([(0, ds_read)])
+        placer.placePath([(1, valu)])
+
+        positions = {
+            id(inst): pos
+            for pos, slot in enumerate(placer._placed)
+            for _, inst in slot
+        }
+        assert positions[id(ds_read)] % 4 != 0
+        assert positions[id(valu)] % 4 != 0
 
 
 class TestIntegration:
