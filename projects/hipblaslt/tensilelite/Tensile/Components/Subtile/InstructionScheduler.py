@@ -219,6 +219,10 @@ _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
 _isWaitCnt = lambda x: isinstance(x, SWaitCnt)
 _isM0Update = lambda x: isinstance(x, CommonInstruction) and hasattr(x, 'dst') and hasattr(x.dst, 'regType') and x.dst.regType == 'm'
+_isVALU = lambda x: isinstance(x, CommonInstruction) \
+    and not isinstance(x, (GlobalReadInstruction, LocalReadInstruction)) \
+    and hasattr(x, 'dst') and hasattr(x.dst, 'regType') \
+    and x.dst.regType == 'v'
 # Typed op detection (see SWaitCntEx.isWaitGr / SBarrier) rather than matching
 # substrings in the instruction comment, which is brittle to comment edits.
 _isWaitGr = lambda x: _isWaitCnt(x) and getattr(x, "isWaitGr", False)
@@ -262,6 +266,12 @@ class _SchedulingRules:
             slots.append(peer)
         return not any(_isDsRead(item[1])
                        for slot in slots for item in placer._placed[slot])
+
+    def noDsReadOrValuInFirstSlot(self, placer, pos, inst):
+        """Reserve each p0 interval's first slot from DS reads and VALU."""
+        if pos % placer.slotsPerInterval != 0:
+            return True
+        return not (_isDsRead(inst) or _isVALU(inst))
 
     def minGapDsReadBeforeWait(self, placer, pos, inst):
         """Reject ds_read too close to an already-placed waitcnt ahead."""
@@ -489,7 +499,7 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     """Move p0's full LR drain before its 16 independent younger reads.
 
     Returns the matched order, a pre-MFMA wait/sync prefix, and the payload
-    path to spread through the eight 4-cycle MXMFMA issue slots.
+    path to spread through four 4-cycle scheduling slots per MXMFMA.
     """
     order = _findPartitionZeroPrefetchOrder(
         preMfmaOrders, emittedModules)
@@ -642,7 +652,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     Rules (shared):
       - MFMA order is preserved.
       - The legacy schedule uses 2 placement slots between adjacent MFMAs.
-      - The selected MXFP8 p0 experiment uses all 8 4-cycle issue slots.
+      - The selected MXFP8 p0 experiment uses 4 4-cycle scheduling slots.
       - At most one ds_read is placed per two-slot SIMD issue pair.
       - Before dependencies are respected at module order level.
       - Minimm distance between ds_read and it waitcnt (hardcoded for now)
@@ -676,7 +686,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     if p0Split is None:
         _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
 
-    slotsPerInterval = 8 if p0Split is not None else 2
+    slotsPerInterval = 4 if p0Split is not None else 2
     placementPathOrders = list(pathOrders)
     if p0Split is not None:
         placementPathOrders.append(p0Split[2])
@@ -713,6 +723,8 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
                        rules.minGapDsReadToWait, rules.noM0WithBufferLoad]
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
+    if p0Split is not None:
+        base_validators.append(rules.noDsReadOrValuInFirstSlot)
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
         base_adjusters.insert(0, rules.deferGrAfterWaitGrDsReads)
