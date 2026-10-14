@@ -406,6 +406,64 @@ def _isWrapPrefetchPath(order, emittedModules):
     )
 
 
+def _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules):
+    """Leave up to 15 current-partition reads outstanding at p0's wait.
+
+    The exact 4-wave dual-period schedule enters partition 0 with 20 older
+    preloop reads, then issues 16 younger reads: eight B reads for partition 1
+    and eight scale rereads.  gfx950's combined lgkmcnt field has a maximum of
+    15, so the requested lgkmcnt(16) experiment encodes as lgkmcnt(15).  That
+    still guarantees every older preloop read while allowing 15 younger reads
+    to remain outstanding and overlap compute.
+
+    Keep this experiment structurally narrow: only the p0 path with a
+    next-partition data LR, both scale tensors, wait_gr+barrier, and exactly
+    16 ds_reads is changed.
+    """
+    for order in preMfmaOrders:
+        modules = [emittedModules[mid] for mid in order]
+        if not (any(em.opType == "wait_gr" for em in modules)
+                and any(em.opType == "sync" for em in modules)):
+            continue
+
+        readModules = [em for em in modules if em.opType == "lr"]
+        if not readModules:
+            continue
+        partitions = {
+            getattr(em.source, "partition", None) for em in readModules
+        }
+        if partitions != {0}:
+            continue
+
+        hasNextPartitionData = any(
+            getattr(em.source, "tensor", None) in ("A", "B")
+            and getattr(em.source, "targetPartition", 0) == 1
+            and getattr(em.source, "mtIteration", 0) == 0
+            for em in readModules
+        )
+        scaleTensors = {
+            getattr(em.source, "tensor", None)
+            for em in readModules
+            if any(_isDsRead(inst) for inst in em.instructions)
+        } & {"SA", "SB"}
+        readCount = sum(
+            _isDsRead(inst)
+            for em in readModules
+            for inst in em.instructions
+        )
+        if not hasNextPartitionData or scaleTensors != {"SA", "SB"} \
+                or readCount != 16:
+            continue
+
+        for em in modules:
+            if em.opType != "wait_lr":
+                continue
+            for inst in em.instructions:
+                if _isWaitCnt(inst) and getattr(inst, "dscnt", -1) == 0:
+                    inst.dscnt = 15
+                    inst.comment = "Wait for prior LR; leave p0 prefetch reads in flight"
+
+
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
     """Extract non-MFMA dependency paths using only EmittedModule.before links.
 
@@ -555,6 +613,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     n = len(emittedModules)
 
     mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
+    _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
     mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
 
     def _emitPreMfma(result):

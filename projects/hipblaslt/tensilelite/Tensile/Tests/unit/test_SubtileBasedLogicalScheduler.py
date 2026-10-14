@@ -3073,6 +3073,75 @@ class TestInstructionSchedulerWrapPrefetch:
         ] == [f"ds{i}" for i in range(16)]
         assert sum(len(em.instructions) for em in modules) == len(items)
 
+    def test_partition_zero_wait_leaves_prefetch_reads_in_flight(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            DSLoadB128, MFMAInstruction, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionEmitter import SWaitCntEx
+        from Tensile.Components.Subtile.InstructionScheduler import instructionSchedule
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        def source(kind, **kwargs):
+            return SimpleNamespace(kind=kind, **kwargs)
+
+        def emitted(module_id, kind, instructions, before=None, **kwargs):
+            return EmittedModule(
+                moduleId=module_id,
+                instructions=instructions,
+                before=before,
+                source=source(kind, **kwargs))
+
+        def mfma(index):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=f"mfma{index}")
+
+        def reads(begin, end):
+            return [
+                DSLoadB128(
+                    dst=vgpr(8, 4), src=vgpr(1),
+                    ds=DSModifiers(offset=index * 16),
+                    comment=f"ds{index}")
+                for index in range(begin, end)
+            ]
+
+        modules = [
+            emitted(0, 'mfma', [mfma(0), mfma(1)], before=6),
+            emitted(1, 'lr', reads(0, 8), before=8, tensor='B',
+                    partition=0, targetPartition=1, mtIteration=0),
+            emitted(2, 'lr', reads(8, 12), before=1, tensor='SA',
+                    partition=0, targetPartition=0, mtIteration=0),
+            emitted(3, 'lr', reads(12, 16), before=2, tensor='SB',
+                    partition=0, targetPartition=0, mtIteration=0),
+            emitted(6, 'wait_lr', [
+                SWaitCnt(dscnt=0, comment="wait_lr")], before=3),
+            emitted(7, 'wait_gr', [
+                SWaitCntEx(vlcnt=13, dscnt=-1, comment="wait_gr")]),
+            emitted(8, 'sync', [
+                SBarrier(comment="barrier")], before=7),
+        ]
+
+        items = list(instructionSchedule(modules).flatitems())
+        wait = next(
+            inst for inst in items
+            if isinstance(inst, SWaitCnt) and inst.dscnt >= 0
+        )
+
+        # gfx950's combined lgkmcnt field tops out at 15, so a requested
+        # threshold of 16 must use the closest encodable partial wait.
+        assert wait.dscnt == 15
+        assert wait.comment == \
+            "Wait for prior LR; leave p0 prefetch reads in flight"
+
 
 class TestIntegration:
 
