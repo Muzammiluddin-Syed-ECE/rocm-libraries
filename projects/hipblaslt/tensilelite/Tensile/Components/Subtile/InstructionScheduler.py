@@ -109,7 +109,8 @@ class _SlotPlacer:
             self._onPlace(self, pos, item[1])
 
     def placePath(self, pathInsts: List[Tuple[int, object]], reverse: bool = False,
-                  multiDU: bool = False):
+                  multiDU: bool = False, startLimit: Optional[int] = None,
+                  overflowToTail: bool = False):
         """Place a sequence of (moduleId, instruction) items into slots.
 
         Walks pathInsts in order, applying adjusters (forward only) and
@@ -120,15 +121,24 @@ class _SlotPlacer:
         When multiDU is True, wait_gr immediately followed by barrier is
         placed as an atomic pair in the same slot so other paths cannot
         insert m0 setup between them.
+
+        startLimit can reserve leading slots for an already-placed prefix.
+        overflowToTail preserves forward path order by placing the first
+        unplaceable item and the rest of its path after the final MFMA,
+        rather than collapsing them into one overfull slot.
         """
-        limit = (self.totalSlots - 1) if reverse else 0
+        limit = ((self.totalSlots - 1) if reverse else 0) \
+            if startLimit is None else startLimit
         if not multiDU:
-            for item in pathInsts:
+            for idx, item in enumerate(pathInsts):
                 mid, inst = item
                 if not reverse:
                     limit = self.adjustLimit(limit, inst)
                 pos = self.findSlot(mid, inst, limit, reverse=reverse)
                 if pos is None:
+                    if overflowToTail and not reverse:
+                        self.leftovers.extend(pathInsts[idx:])
+                        return
                     pos = self._forceSlot(mid, limit, reverse)
                 self.place(pos, item, reverse=reverse)
                 limit = (pos - 1) if reverse else (pos + 1)
@@ -144,6 +154,9 @@ class _SlotPlacer:
                     limit = self.adjustLimit(limit, inst)
                 pos = self.findSlot(mid, inst, limit, reverse=reverse)
                 if pos is None:
+                    if overflowToTail:
+                        self.leftovers.extend(pathInsts[idx:])
+                        return
                     pos = self._forceSlot(mid, limit, reverse)
                 self.place(pos, item, reverse=reverse)
                 sync_item = pathInsts[idx + 1]
@@ -153,6 +166,9 @@ class _SlotPlacer:
                     sync_pos = self.findSlot(sync_item[0], sync_item[1],
                                              pos + 1, reverse=reverse)
                     if sync_pos is None:
+                        if overflowToTail:
+                            self.leftovers.extend(pathInsts[idx + 1:])
+                            return
                         sync_pos = self._forceSlot(sync_item[0], pos + 1, reverse)
                     self.place(sync_pos, sync_item, reverse=reverse)
                     pos = sync_pos
@@ -163,6 +179,9 @@ class _SlotPlacer:
                 limit = self.adjustLimit(limit, inst)
             pos = self.findSlot(mid, inst, limit, reverse=reverse)
             if pos is None:
+                if overflowToTail and not reverse:
+                    self.leftovers.extend(pathInsts[idx:])
+                    return
                 pos = self._forceSlot(mid, limit, reverse)
             self.place(pos, item, reverse=reverse)
             limit = (pos - 1) if reverse else (pos + 1)
@@ -231,12 +250,17 @@ class _SchedulingRules:
         if not _isDsRead(inst):
             return True
         peer = pos ^ 1
-        return not (0 <= peer < placer.totalSlots
-                    and any(_isDsRead(item[1]) for item in placer._placed[peer]))
+        slots = [pos]
+        if 0 <= peer < placer.totalSlots:
+            slots.append(peer)
+        return not any(_isDsRead(item[1])
+                       for slot in slots for item in placer._placed[slot])
 
     def minGapDsReadBeforeWait(self, placer, pos, inst):
         """Reject ds_read too close to an already-placed waitcnt ahead."""
         if not _isDsRead(inst):
+            return True
+        if pos >= self.earliestWaitCntPos:
             return True
         gap = self.minGap * 2
         return self.earliestWaitCntPos - pos >= gap
@@ -244,6 +268,8 @@ class _SchedulingRules:
     def minGapDsReadToWait(self, placer, pos, inst):
         """Reject waitcnt too close to the last placed ds_read."""
         if not _isWaitCnt(inst) or self.lastDsReadPos < 0:
+            return True
+        if pos <= self.lastDsReadPos:
             return True
         gap = self.minGap * 2
         return pos - self.lastDsReadPos >= gap
@@ -364,6 +390,20 @@ def _flattenPath(order, emittedModules, reverse=False):
     if reverse:
         pathInsts.reverse()
     return pathInsts
+
+
+def _isWrapPrefetchPath(order, emittedModules):
+    """Return True for a wait path that reads operands for the next MT.
+
+    Partition-directed PLR marks the final partition's wrap local reads with
+    mtIteration > 0. Those reads feed the next partition-0, not the current
+    partition's MFMAs, so their payload can be scheduled after an early MFMA.
+    """
+    return any(
+        emittedModules[mid].opType == "lr"
+        and getattr(emittedModules[mid].source, "mtIteration", 0) > 0
+        for mid in order
+    )
 
 
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
@@ -553,6 +593,30 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     for order, hasWaitGR in paths:
         if not order:
             continue
+        wrapPrefetch = (not multiDU) and hasWaitGR \
+            and _isWrapPrefetchPath(order, emittedModules)
+        if wrapPrefetch:
+            # The final partition wraps its local-read prefetch to partition 0
+            # of the next MT. Legacy reverse packing runs out of valid slots and
+            # force-stacks wait+barrier, LR swaps, and several ds_reads before
+            # MFMA #1. Keep only the synchronization in the first interval;
+            # current-partition MFMAs do not consume the wrapped LR payload.
+            pathInsts = _flattenPath(order, emittedModules)
+            syncEnd = next(
+                (idx + 1 for idx, (_, inst) in enumerate(pathInsts)
+                 if _isBarrier(inst)),
+                0)
+            if syncEnd:
+                rules.resetPath()
+                placer.placePath(
+                    pathInsts[:syncEnd],
+                    multiDU=True)
+                placer.placePath(
+                    pathInsts[syncEnd:],
+                    startLimit=2,
+                    overflowToTail=True)
+                continue
+
         reverse = (not multiDU) and hasWaitGR
         pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
         rules.resetPath()

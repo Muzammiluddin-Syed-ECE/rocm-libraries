@@ -2979,6 +2979,101 @@ class TestGetNumVgpr:
 # Integration tests
 # ══════════════════════════════════════════════════════════════
 
+class TestInstructionSchedulerWrapPrefetch:
+    """Partition-prefetch LRs must not delay independent MFMAs."""
+
+    @staticmethod
+    def _schedule():
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            DSLoadB128, MFMAInstruction, SBarrier, SWaitCnt, VXorB32)
+        from Tensile.Components.Subtile.InstructionEmitter import SWaitCntEx
+        from Tensile.Components.Subtile.InstructionScheduler import instructionSchedule
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        def source(kind, **kwargs):
+            return SimpleNamespace(kind=kind, **kwargs)
+
+        def emitted(module_id, kind, instructions, before=None, **kwargs):
+            return EmittedModule(
+                moduleId=module_id,
+                instructions=instructions,
+                before=before,
+                source=source(kind, **kwargs))
+
+        def mfma(index):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=f"mfma{index}")
+
+        def ds_read(index):
+            return DSLoadB128(
+                dst=vgpr(8, 4), src=vgpr(1),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"ds{index}")
+
+        modules = [
+            emitted(0, 'mfma', [mfma(i) for i in range(16)], before=6),
+            emitted(1, 'lr', [ds_read(i) for i in range(8)],
+                    before=10, mtIteration=1),
+            emitted(2, 'lr', [ds_read(i) for i in range(8, 16)],
+                    before=1, mtIteration=1),
+            emitted(6, 'wait_lr', [SWaitCnt(dscnt=0, comment="wait_lr")]),
+            emitted(7, 'wait_gr', [
+                SWaitCntEx(vlcnt=16, dscnt=-1, comment="wait_gr")]),
+            emitted(8, 'sync', [SBarrier(comment="barrier")], before=7),
+            emitted(9, 'lr_inc', [
+                VXorB32(dst=vgpr(2), src0=vgpr(2), src1=vgpr(3))
+                for _ in range(2)
+            ], before=8),
+            emitted(10, 'lr_inc', [
+                VXorB32(dst=vgpr(4), src0=vgpr(4), src1=vgpr(5))
+                for _ in range(2)
+            ], before=9),
+        ]
+        return modules, list(instructionSchedule(modules).flatitems())
+
+    def test_wrap_payload_starts_after_second_mfma(self):
+        from rocisa.instruction import (
+            LocalReadInstruction, MFMAInstruction, SBarrier)
+        from Tensile.Components.Subtile.InstructionEmitter import SWaitCntEx
+
+        modules, items = self._schedule()
+        mfma_positions = [
+            i for i, inst in enumerate(items)
+            if isinstance(inst, MFMAInstruction)
+        ]
+        between_first_two = items[mfma_positions[0] + 1:mfma_positions[1]]
+
+        assert [type(inst) for inst in between_first_two] == [
+            SWaitCntEx, SBarrier]
+        assert not any(
+            isinstance(inst, LocalReadInstruction)
+            for inst in items[:mfma_positions[1]])
+
+        # The 16 wrap reads are spread one per covered MFMA interval; only
+        # unavoidable overflow is left after the final MFMA.
+        for begin, end in zip(mfma_positions[1:], mfma_positions[2:]):
+            assert sum(
+                isinstance(inst, LocalReadInstruction)
+                for inst in items[begin + 1:end]
+            ) <= 1
+        assert [
+            inst.comment for inst in items
+            if isinstance(inst, LocalReadInstruction)
+        ] == [f"ds{i}" for i in range(16)]
+        assert sum(len(em.instructions) for em in modules) == len(items)
+
+
 class TestIntegration:
 
     def test_populate_instructions_256x256_fp4(self):
