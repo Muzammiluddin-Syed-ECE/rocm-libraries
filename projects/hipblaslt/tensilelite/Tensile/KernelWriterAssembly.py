@@ -18576,7 +18576,7 @@ class KernelWriterAssembly(KernelWriter):
         # staging window; each active feature reserves its own window, disjoint by
         # construction (the cursor only moves forward).  One helper lays out the block for
         # a given fold state and is used for BOTH the admission check and the real
-        # reservation, so the budget cannot drift from the layout it gates.  Offsets/
+        # reservation, so the budget can never drift from the layout it gates.  Offsets/
         # total match the former hand-advanced `nxt` cursor (test_epilogue_scratch_layout.py).
         def _cvtLayout(withFold):
           s = EpilogueScratch(7 if useSubtile else 4)
@@ -18589,11 +18589,17 @@ class KernelWriterAssembly(KernelWriter):
             cBase = s.reserve("col128", 7, align=2)   # 2-align the second pack quad
           return s, fVoff, fBlend, sAddr, sRing, cBase
 
-        # Fold admission: derived cvt total (no hardcoded +9) drops the `miwt[0]==8`
-        # faith clause; the naive size()-arithmetic is refined to the hole-aware
-        # availableBlockMaxVgpr probe in Rung 3.
+        # Honest fold admission: with ValuC-slot reuse the fold's ONLY fresh high-water is
+        # its cvt block (batchB pack + blended store src reuse dead ValuC -- no extra peak,
+        # see _emit16bitSubtilePairedStoreRepack).  Admit the fold iff that DERIVED block
+        # can actually be checked out under the VGPR cap, probed with the pool's own
+        # cap-aware, hole-aware `availableBlockMaxVgpr` -- the same primitive the general
+        # store path uses.  This fills 2-aligned holes below the high-water (which the
+        # naive `size() + N` arithmetic ignored, under-admitting tiles that genuinely fit),
+        # and replaces BOTH the `miwt[0] == 8` arch/tile faith clause and the magic `+ 9`.
         foldCvtTotal  = _cvtLayout(withFold=True)[0].total()
-        foldFits      = useSubtile and (self.vgprPool.size() + foldCvtTotal) <= maxVgpr
+        foldFits      = useSubtile and \
+                        self.vgprPool.availableBlockMaxVgpr(maxVgpr, foldCvtTotal, 2) >= foldCvtTotal
         isSubtileFold = (bool(kernel.get("DPPStoreFold")) and useSubtile
                          and len(miwt) >= 2 and miwt[0] >= 4 and foldFits)
 
