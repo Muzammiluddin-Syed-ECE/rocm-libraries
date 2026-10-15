@@ -284,6 +284,31 @@ def make_cfg_fp8(MT0, MT1, waveGroup, depthU=128, pgr=2,
     )
 
 
+def make_cfg_du128_4wave():
+    """Target dual-period MXFP8 kernel: MIWT 8x8 and four 4x4 partitions."""
+    return SchedulerConfig(
+        numMFMATilesM=8,
+        numMFMATilesN=8,
+        numSubIterK=1,
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=1, k=1),
+        grB=ReadGranularity(mn=1, k=1),
+        lrSA=ReadGranularity(mn=2, k=1),
+        lrSB=ReadGranularity(mn=2, k=1),
+        grSA=ReadGranularity(mn=8, k=2),
+        grSB=ReadGranularity(mn=8, k=2),
+        partitionSizeM=4,
+        partitionSizeN=4,
+        pgr=2,
+        plr=0,
+        doubleBufferTensors=('A', 'B'),
+        prefetchNextPartition=True,
+        partitionOrder="n-major",
+        scaleReuse=2,
+    )
+
+
 def make_example_granularities_1():
     """Example Granularities 1 from the design doc: LR A,B=1x1, LR SA,SB=2x2."""
     return SchedulerConfig(
@@ -1284,6 +1309,47 @@ class TestAssignVgprTiles:
 # ══════════════════════════════════════════════════════════════
 
 class TestPlaceGRs:
+
+    def test_du128_moves_only_vgpr_safe_wrap_a_to_p2(self):
+        cfg = make_cfg_du128_4wave()
+        sched = LogicalScheduler(cfg)
+        parts = sched.build(stop_after=Pass.GR)
+
+        moved = [
+            lr for lr in parts[2][0].lrs
+            if lr.tensor == 'A' and lr.mtIteration == 1
+        ]
+        assert len(moved) == 1
+        assert (moved[0].tiles.tileId_start,
+                moved[0].tiles.tileId_end) == (0, 4)
+        assert moved[0].targetPartition == 0
+
+        p3_wrap = {
+            lr.tensor for lr in parts[3][0].lrs
+            if lr.mtIteration == 1
+        }
+        assert p3_wrap == {'B', 'SA', 'SB'}
+
+        p2_a_vgprs = {
+            value
+            for tile_map in parts[2][0].mfma.vgpr_tile_maps['A']
+            for value in tile_map.values()
+        }
+        wrap_a_vgprs = {
+            value
+            for tile_map in moved[0].vgpr_tile_map
+            for value in tile_map.values()
+        }
+        assert p2_a_vgprs.isdisjoint(wrap_a_vgprs)
+
+        inc_parts = LogicalScheduler(cfg).build(stop_after=Pass.GR_INC)
+        moved_with_inc = [
+            lr for lr in inc_parts[2][0].lrs
+            if lr.tensor == 'A' and lr.mtIteration == 1
+        ]
+        assert len(moved_with_inc) == 1
+        assert any(op.kind == 'lr_inc' and op.tensor == 'A'
+                   for op in moved_with_inc[0].preOps)
 
     def test_1x1_k1_DU256(self):
         """256x256, DU256, FP4. GR order: A, B, SA, SB.
