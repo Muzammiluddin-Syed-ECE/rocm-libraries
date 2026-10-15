@@ -18563,33 +18563,43 @@ class KernelWriterAssembly(KernelWriter):
         # margin for post-cvt store windows is needed.
         from .Components.GlobalWriteBatch import plsinScalarStoreActive, plsinStoreCol128Active, \
                                                  plsinStorePermlane16Active
+        from .Components.EpilogueScratch import EpilogueScratch
         scalarStore = plsinScalarStoreActive(kernel)
         packPairs   = max(1, int(plsinDebugEnv("TENSILE_PLSIN_STORE_PAIRS", "4"))) if scalarStore else 1
-        miwt = kernel.get("MIWaveTile", [0, 0])
-        maxVgpr = self.states.regCaps["MaxVgpr"]
-        foldFits = (self.vgprPool.size() + 9) <= maxVgpr
-        isSubtileFold = (kernel.get("DPPStoreFold")
-                         and kernel.get("UseSubtileImpl")
-                         and len(miwt) >= 2 and miwt[0] >= 4
-                         and (miwt[0] == 8 or foldFits))
-        # Running cursor over the cvt block.  +0..+6 are the shared staging window; each
-        # active feature appends its own disjoint sub-window, so no two offsets collide.
-        base = 7 if kernel.get("UseSubtileImpl") else 4
-        nxt  = base
-        foldVoff = foldBlend = -1
-        if isSubtileFold:
-          foldVoff, foldBlend = nxt, nxt + 1
-          nxt += 2
-        scalarAddrOff = scalarRingOff = -1
-        if scalarStore:
-          scalarAddrOff, scalarRingOff = nxt, nxt + 1
-          nxt += 1 + 2 * packPairs
-        col128Base = -1
-        if kernel.get("UseSubtileImpl") and \
-           plsinStoreCol128Active(kernel, True if self.states.subtileFusedFullTileStore else None):
-          col128Base = (nxt + 1) & ~1   # 2-align the second pack quad
-          nxt = col128Base + 7
-        numCvtVgprs = nxt if kernel.get("UseSubtileImpl") else 4
+        miwt        = kernel.get("MIWaveTile", [0, 0])
+        maxVgpr     = self.states.regCaps["MaxVgpr"]
+        useSubtile  = bool(kernel.get("UseSubtileImpl"))
+        col128Active = (useSubtile and
+                        plsinStoreCol128Active(kernel, True if self.states.subtileFusedFullTileStore else None))
+
+        # Named-window cvt-block layout (EpilogueScratch).  +0..+base-1 is the shared
+        # staging window; each active feature reserves its own window, disjoint by
+        # construction (the cursor only moves forward).  One helper lays out the block for
+        # a given fold state and is used for BOTH the admission check and the real
+        # reservation, so the budget cannot drift from the layout it gates.  Offsets/
+        # total match the former hand-advanced `nxt` cursor (test_epilogue_scratch_layout.py).
+        def _cvtLayout(withFold):
+          s = EpilogueScratch(7 if useSubtile else 4)
+          fVoff = fBlend = sAddr = sRing = cBase = -1
+          if withFold:
+            fVoff = s.reserve("foldVoff", 1); fBlend = s.reserve("foldBlend", 1)
+          if scalarStore:
+            sAddr = s.reserve("scalarAddr", 1); sRing = s.reserve("scalarRing", 2 * packPairs)
+          if col128Active:
+            cBase = s.reserve("col128", 7, align=2)   # 2-align the second pack quad
+          return s, fVoff, fBlend, sAddr, sRing, cBase
+
+        # Fold admission: derived cvt total (no hardcoded +9) drops the `miwt[0]==8`
+        # faith clause; the naive size()-arithmetic is refined to the hole-aware
+        # availableBlockMaxVgpr probe in Rung 3.
+        foldCvtTotal  = _cvtLayout(withFold=True)[0].total()
+        foldFits      = useSubtile and (self.vgprPool.size() + foldCvtTotal) <= maxVgpr
+        isSubtileFold = (bool(kernel.get("DPPStoreFold")) and useSubtile
+                         and len(miwt) >= 2 and miwt[0] >= 4 and foldFits)
+
+        scratch, foldVoff, foldBlend, scalarAddrOff, scalarRingOff, col128Base = \
+          _cvtLayout(withFold=isSubtileFold)
+        numCvtVgprs = scratch.total() if useSubtile else 4
         pairQuads = 1
         permForRing = plsinStorePermlane16Active(kernel, True if self.states.subtileFusedFullTileStore else None)
         # Fold<->ring composition (TENSILE_PLSIN_FOLD_RING): the ring quad is the store-
