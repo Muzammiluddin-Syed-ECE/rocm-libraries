@@ -22,6 +22,7 @@ _spec = importlib.util.spec_from_file_location("EpilogueScratch", _MODULE_PATH)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 EpilogueScratch = _mod.EpilogueScratch
+borrow_dead_accumulators = _mod.borrow_dead_accumulators
 
 
 def legacy_layout(use_subtile, is_fold, scalar, pack_pairs, col128):
@@ -110,9 +111,35 @@ def test_forward_only_windows_never_overlap():
         assert a_hi <= b_lo, f"overlap: {spans}"
 
 
+def test_borrow_dead_accumulators_accepts_disjoint():
+    # The real fold case: batchA windows (borrowed) disjoint from batchB (live).
+    out = borrow_dead_accumulators(borrowed=[100, 108], live=[104, 112], width=4)
+    assert out == [100, 108]
+    # Adjacent-but-not-overlapping at exactly width apart is fine.
+    borrow_dead_accumulators(borrowed=[0], live=[4], width=4)
+
+
+def test_borrow_dead_accumulators_rejects_clobber_and_self_overlap():
+    # Borrowed window overlaps a live window -> must fail loud.
+    try:
+        borrow_dead_accumulators(borrowed=[100], live=[102], width=4)
+        raise AssertionError("expected clobber assertion")
+    except AssertionError as e:
+        assert "clobbers live" in str(e)
+    # Two borrowed windows overlap each other -> must fail loud.
+    try:
+        borrow_dead_accumulators(borrowed=[100, 103], live=[], width=4)
+        raise AssertionError("expected self-overlap assertion")
+    except AssertionError as e:
+        assert "overlap" in str(e)
+
+
 if __name__ == "__main__":
     test_epilogue_scratch_matches_legacy_cursor()
     test_reserve_rejects_overlap_and_bad_size()
     test_forward_only_windows_never_overlap()
+    test_borrow_dead_accumulators_accepts_disjoint()
+    test_borrow_dead_accumulators_rejects_clobber_and_self_overlap()
     n = sum(1 for _ in _sweep())
-    print(f"OK: EpilogueScratch layout == legacy cursor across {n} parameter combinations")
+    print(f"OK: EpilogueScratch layout == legacy cursor across {n} combos; "
+          f"borrow_dead_accumulators clobber/overlap checks pass")

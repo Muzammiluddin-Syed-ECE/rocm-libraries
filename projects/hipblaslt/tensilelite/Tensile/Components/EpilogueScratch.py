@@ -80,3 +80,34 @@ class EpilogueScratch:
         """Human-readable layout, ordered by offset -- for logging / review."""
         items = sorted(self._windows.items(), key=lambda kv: (kv[1][0], kv[0]))
         return " ".join(f"{n}@+{o}:{s}" for n, (o, s) in items)
+
+
+def borrow_dead_accumulators(borrowed, live, width):
+    """Validate reusing provably-dead accumulator windows as epilogue scratch.
+
+    Each base index in ``borrowed`` names a ``width``-wide VGPR window (e.g. one
+    subtile element's 4 contiguous accumulators) that the caller has proven dead and
+    intends to OVERWRITE as scratch.  This asserts every borrowed window is disjoint
+    from (a) every other borrowed window and (b) every still-LIVE window in ``live``.
+    A violation means the reuse would clobber a value that is still read later -- which
+    in the generated kernel is SILENT WRONG DATA, not a crash -- so fail loud here, at
+    codegen time, instead.
+
+    The caller still owns the *liveness* precondition (that the borrowed windows really
+    are dead at this point); this only enforces the locally-checkable clobber invariant.
+    Returns ``borrowed`` unchanged so the caller keeps the exact register indices.
+    """
+    def _overlaps(a, b):
+        return a < b + width and b < a + width
+
+    bl = list(borrowed)
+    for i, a in enumerate(bl):
+        for b in bl[i + 1:]:
+            assert not _overlaps(a, b), (
+                f"borrow_dead_accumulators: borrowed windows [{a},{a + width}) and "
+                f"[{b},{b + width}) overlap")
+        for lv in live:
+            assert not _overlaps(a, lv), (
+                f"borrow_dead_accumulators: borrowed window [{a},{a + width}) clobbers "
+                f"live window [{lv},{lv + width})")
+    return bl

@@ -52,6 +52,7 @@ from ..Activation import ActivationModule
 from ..AsmStoreState import StoreState
 from ..AsmAddressCalculation import AddrCalculation
 from ..Components.PackData import formatting, PackData_F16, PackData_BF16, PackData_FLOAT8, PackData_FLOAT8_fnuz
+from ..Components.EpilogueScratch import borrow_dead_accumulators
 from rocisa.instruction import ECvtF16toF32, ECvtPkFP8toF32, ECvtPkBF8toF32
 from ..KernelWriterModules import hasSequentialValuC, accToArchMapper, getAccToArchLen
 # NOTE: fusedA2AKernArgLayout / FUSED_A2A_MAX_RANKS are imported lazily inside the
@@ -5074,8 +5075,17 @@ class GlobalWriteBatchWriter:
     # and never grows the high-water past ValuC, which is what lets near-cap tiles host the fold.
     assert sumIdx0 % 2 == 0 and sumIdx1 % 2 == 0, \
       f"ValuC reuse needs 2-aligned batchA element windows (sumIdx0={sumIdx0}, sumIdx1={sumIdx1})"
-    vPack2       = sumIdx0   # batchA sba0's 4 dead ValuC slots  -> batchB packed data
-    vSD          = sumIdx1   # batchA sba1's 4 dead ValuC slots  -> blended store src
+    # First-class, fail-loud borrow of batchA's two now-dead 4-slot accumulator windows
+    # (batchB pack -> vPack2, blended store src -> vSD).  batchA is consumed into vPack by
+    # packPair above, so [sumIdx0..+4) and [sumIdx1..+4) are dead here; the one locally-
+    # checkable hazard is clobbering batchB's STILL-LIVE source windows (partnerSumIdx0/1),
+    # which are read when packing batchB after this overwrite.  Assert disjointness instead
+    # of trusting it -- a violation would be silent wrong-data in the kernel.  Same register
+    # indices as before (vPack2==sumIdx0, vSD==sumIdx1), so codegen is unchanged.
+    vPack2, vSD  = borrow_dead_accumulators(
+                     borrowed=[sumIdx0, sumIdx1],
+                     live=[partnerSumIdx0, partnerSumIdx1],
+                     width=4)
 
     permlane16 = getattr(self, "_permlane16Active", False)
 
