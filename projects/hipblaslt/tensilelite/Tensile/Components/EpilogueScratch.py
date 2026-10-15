@@ -1,0 +1,101 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+
+"""Named-window scratch allocator for the subtile store epilogue.
+
+The subtile 16-bit store checks out one contiguous, aligned block of "cvt" VGPRs and
+sub-divides it into per-feature windows (bf16-convert staging, ds_bpermute address,
+the DPP-fold voffset/blend temps, the scalar/pair pack rings, ...).  Historically those
+sub-windows were carved by a hand-advanced integer cursor with each feature's offset
+computed inline and disjointness guaranteed only by a comment.
+
+``EpilogueScratch`` replaces that cursor with a small forward-only allocator:
+
+* every window is **named**, and the layout is **dumpable** -- disjointness is a
+  property of the allocator, not a promise in a comment;
+* two windows can never overlap (the cursor only moves forward);
+* it produces the **identical** offsets/total the hand cursor did (pinned by
+  ``Tensile/Tests/unit/test_epilogue_scratch_layout.py``), so introducing it is a
+  bit-exact refactor;
+* it provides a first-class, asserted way to borrow provably-dead ValuC accumulator
+  slots (``borrow_dead_accumulators``) rather than raw register-index aliasing.
+
+This owns only the *layout* arithmetic (offsets relative to the block base).  The
+actual pool checkout and the ``base + offset`` absolute-VGPR math stay in the caller,
+so this helper has no dependency on the register pool or rocisa and is trivially
+testable.
+"""
+
+
+class EpilogueScratch:
+    """Forward-only named-window layout over a single checked-out VGPR block.
+
+    Offsets are relative to the block base (the caller adds the absolute ``cvtVgpr``).
+    The leading ``base`` registers are the always-present shared staging window
+    (``+0..+base-1``): the bf16-convert temps, reused as pack/permute scratch.
+    """
+
+    def __init__(self, base):
+        self._base = base
+        self._cursor = base
+        # name -> (offset, size). Insertion order preserved for dump().
+        self._windows = {"staging": (0, base)}
+
+    def reserve(self, name, size, align=1):
+        """Reserve a ``size``-wide window, ``align``-aligned; return its offset.
+
+        ``align`` rounds the start up to the next multiple of ``align``.
+        """
+        if size <= 0:
+            raise ValueError(f"EpilogueScratch.reserve({name!r}, {size}): size must be > 0")
+        if name in self._windows:
+            raise ValueError(f"EpilogueScratch.reserve: window {name!r} already reserved")
+        off = (self._cursor + (align - 1)) & ~(align - 1)
+        self._windows[name] = (off, size)
+        self._cursor = off + size
+        return off
+
+    def offset(self, name):
+        """Offset of a reserved window relative to the block base, or -1 if absent."""
+        w = self._windows.get(name)
+        return w[0] if w is not None else -1
+
+    def total(self):
+        """Total block size to check out (== the legacy ``numCvtVgprs``)."""
+        return self._cursor
+
+    def dump(self):
+        """Human-readable layout, ordered by offset -- for logging / review."""
+        items = sorted(self._windows.items(), key=lambda kv: (kv[1][0], kv[0]))
+        return " ".join(f"{n}@+{o}:{s}" for n, (o, s) in items)
+
+
+def borrow_dead_accumulators(borrowed, live, width):
+    """Validate reusing provably-dead accumulator windows as epilogue scratch.
+
+    Each base index in ``borrowed`` names a ``width``-wide VGPR window (e.g. one
+    subtile element's 4 contiguous accumulators) that the caller has proven dead and
+    intends to OVERWRITE as scratch.  This asserts every borrowed window is disjoint
+    from (a) every other borrowed window and (b) every still-LIVE window in ``live``.
+    A violation means the reuse would clobber a value that is still read later -- which
+    in the generated kernel is SILENT WRONG DATA, not a crash -- so fail loud here, at
+    codegen time, instead.
+
+    The caller still owns the *liveness* precondition (that the borrowed windows really
+    are dead at this point); this only enforces the locally-checkable clobber invariant.
+    Returns ``borrowed`` unchanged so the caller keeps the exact register indices.
+    """
+    def _overlaps(a, b):
+        return a < b + width and b < a + width
+
+    bl = list(borrowed)
+    for i, a in enumerate(bl):
+        for b in bl[i + 1:]:
+            assert not _overlaps(a, b), (
+                f"borrow_dead_accumulators: borrowed windows [{a},{a + width}) and "
+                f"[{b},{b + width}) overlap")
+        for lv in live:
+            assert not _overlaps(a, lv), (
+                f"borrow_dead_accumulators: borrowed window [{a},{a + width}) clobbers "
+                f"live window [{lv},{lv + width})")
+    return bl

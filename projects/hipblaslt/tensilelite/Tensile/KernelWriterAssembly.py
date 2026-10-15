@@ -16637,20 +16637,32 @@ class KernelWriterAssembly(KernelWriter):
         # pool.size() (= startVgprValu) stays within budget for large macro-tiles.
         # If a very large tile causes accvgpr staging to exceed 256 vgprs despite the
         # alignment overhead, reduce the batch via NumElementsPerBatchStore.
-        #   +0..+3: scratch for pack output + ds_bpermute + v_permlane32_swap
-        #           (reuses vgprBf16Temp/Mask/Nan/Inc slots; constants written at batch
-        #           start are overwritten by the packed 16bit values before the store)
-        #   +4: vgprPermAddr       — ds_permute partner-lane byte address
-        #   +5: vgprLaneGroupDelta — lane_group*8, pre-computed once per batch
-        #   +6: vgprAddrScratch    — per-store adjusted D address; avoids modifying addrDVgpr
-        numCvtVgprs = 7 if kernel.get("UseSubtileImpl") else 4
-        cvtAlign    = 2 if kernel.get("UseSubtileImpl") else 1
+        # Named-window layout (EpilogueScratch) -- each feature reserves a named window;
+        # disjointness is enforced by the allocator (cursor only advances), not a
+        # comment.  Produces the same 7-VGPR (UseSubtileImpl) / 4-VGPR block as before:
+        #   staging (+0..+3): pack scratch, reused as vgprBf16Temp/Mask/Nan/Inc
+        #   permAddr    (+4): ds_bpermute partner-lane byte address
+        #   laneGDelta  (+5): lane_group*8, pre-computed once per batch
+        #   addrScratch (+6): per-store adjusted D address
+        # The Track-3 DPP-fold port adds further named windows on top of this base
+        # without touching the existing offsets.
+        from .Components.EpilogueScratch import EpilogueScratch
+        useSubtile  = bool(kernel.get("UseSubtileImpl"))
+        # Base = 4 (the bf16 staging: Temp/Mask/Nan/Inc at +0..+3).
+        # Three subtile-only windows follow, reaching 7 total.
+        scratch     = EpilogueScratch(4)
+        if useSubtile:
+          scratch.reserve("permAddr",    1)   # +4
+          scratch.reserve("laneGDelta",  1)   # +5
+          scratch.reserve("addrScratch", 1)   # +6
+        numCvtVgprs = scratch.total()
+        cvtAlign    = 2 if useSubtile else 1
         cvtVgpr = self.vgprPool.checkOutAligned(numCvtVgprs, cvtAlign, tag="globalWriteElements_cvtVgpr")
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
-                                               vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
-                                               vgprLaneGroupDelta=(cvtVgpr+5) if kernel.get("UseSubtileImpl") else -1, \
-                                               vgprAddrScratch=(cvtVgpr+6) if kernel.get("UseSubtileImpl") else -1)
+                                               vgprPermAddr=(cvtVgpr+4) if useSubtile else -1, \
+                                               vgprLaneGroupDelta=(cvtVgpr+5) if useSubtile else -1, \
+                                               vgprAddrScratch=(cvtVgpr+6) if useSubtile else -1)
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
         cvtVgprStruct = self.FP8CVTVgprStruct(vgprFp8Temp=cvtVgpr, vgprFp8NanInf=(cvtVgpr+1), \
