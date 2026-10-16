@@ -15978,6 +15978,10 @@ class KernelWriterAssembly(KernelWriter):
     vgprPermAddr: int = -1        # per-lane ds_bpermute byte address (partner_lane*4); constant for the whole batch
     vgprLaneGroupDelta: int = -1  # per-lane lane_group*8: M-row byte offset added to addrDVgpr for the dwordx4 store
     vgprAddrScratch: int = -1     # per-store scratch: holds (addrDVgpr scaled + lane_group*8) without modifying addrDVgpr
+    # DPP store-repack fold (DPPStoreFold) extras:
+    vgprVoff: int = -1            # per-store voffset (cndmask result)
+    vgprBlendTmp: int = -1        # blend temp: odd-data / store-2 even-addr
+    vgprStoreData: int = -1       # aliased to vgprBf16Temp (+0); marks fold active for GlobalWriteBatch
 
   class FP8CVTVgprStruct(NamedTuple):
     vgprFp8NanInf: int = -1
@@ -16648,13 +16652,33 @@ class KernelWriterAssembly(KernelWriter):
         # without touching the existing offsets.
         from .Components.EpilogueScratch import EpilogueScratch
         useSubtile  = bool(kernel.get("UseSubtileImpl"))
-        # Base = 4 (the bf16 staging: Temp/Mask/Nan/Inc at +0..+3).
-        # Three subtile-only windows follow, reaching 7 total.
-        scratch     = EpilogueScratch(4)
-        if useSubtile:
-          scratch.reserve("permAddr",    1)   # +4
-          scratch.reserve("laneGDelta",  1)   # +5
-          scratch.reserve("addrScratch", 1)   # +6
+        maxVgpr     = self.states.regCaps["MaxVgpr"]
+        miwt        = kernel.get("MIWaveTile", [0, 0])
+
+        # Named-window layout (EpilogueScratch).  Base = 4 (bf16 staging +0..+3).
+        # The layout helper is used for BOTH admission and reservation so the budget
+        # cannot drift from the layout it gates.
+        def _cvtLayout(withFold):
+          s = EpilogueScratch(4)
+          fVoff = fBlend = -1
+          if useSubtile:
+            s.reserve("permAddr",    1)   # +4
+            s.reserve("laneGDelta",  1)   # +5
+            s.reserve("addrScratch", 1)   # +6
+          if withFold and useSubtile:
+            fVoff  = s.reserve("foldVoff",  1)   # +7
+            fBlend = s.reserve("foldBlend", 1)   # +8
+          return s, fVoff, fBlend
+
+        # DPP-fold admission: honest availableBlockMaxVgpr probe (hole-aware, no
+        # faith clause).  With ValuC-slot reuse the fold's only fresh high-water
+        # is this cvt block; batchB pack + blended store src reuse dead ValuC slots.
+        foldCvtTotal  = _cvtLayout(withFold=True)[0].total()
+        foldFits      = useSubtile and len(miwt) >= 2 and miwt[0] >= 4 and \
+                        self.vgprPool.availableBlockMaxVgpr(maxVgpr, foldCvtTotal, 2) >= foldCvtTotal
+        isSubtileFold = bool(kernel.get("DPPStoreFold")) and foldFits
+
+        scratch, foldVoff, foldBlend = _cvtLayout(withFold=isSubtileFold)
         numCvtVgprs = scratch.total()
         cvtAlign    = 2 if useSubtile else 1
         cvtVgpr = self.vgprPool.checkOutAligned(numCvtVgprs, cvtAlign, tag="globalWriteElements_cvtVgpr")
@@ -16662,7 +16686,10 @@ class KernelWriterAssembly(KernelWriter):
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if useSubtile else -1, \
                                                vgprLaneGroupDelta=(cvtVgpr+5) if useSubtile else -1, \
-                                               vgprAddrScratch=(cvtVgpr+6) if useSubtile else -1)
+                                               vgprAddrScratch=(cvtVgpr+6) if useSubtile else -1, \
+                                               vgprVoff=(cvtVgpr+foldVoff) if isSubtileFold else -1, \
+                                               vgprBlendTmp=(cvtVgpr+foldBlend) if isSubtileFold else -1, \
+                                               vgprStoreData=cvtVgpr if isSubtileFold else -1)
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
         cvtVgprStruct = self.FP8CVTVgprStruct(vgprFp8Temp=cvtVgpr, vgprFp8NanInf=(cvtVgpr+1), \
