@@ -237,7 +237,8 @@ class InstructionEmitter:
                     dstTile = vgprTiles[tile_map[tileId]]
                     swizzled = self.writer.states.subtileLdsSwizzle
                     module.add(emitSingleDsRead(
-                        ti, tileId, subtileK, subIterK_within, dstTile, swizzled=swizzled))
+                        ti, tileId, subtileK, subIterK_within, dstTile, swizzled=swizzled,
+                        mt=placement.mtIteration, k_index=k))
         elif tensor in ('SA', 'SB'):
             # Dual-period MXFP8: one scale dword covers both K phases of the
             # epoch and lives in a globally-colored VGPR that survives across
@@ -262,7 +263,10 @@ class InstructionEmitter:
                     dst=vgpr(vdst),
                     src=vgpr(ti.sharedVgprLROffset[0]),
                     ds=DSModifiers(offset=dsOffset),
-                    comment=f"scale{tc}[group{scaleGroupIdx},K={placement.tiles.subIterK_start}]: load 4B from LDS"))
+                    comment="%s MT=%s tile=%u K=%u" % (
+                        tensor,
+                        "n" if placement.mtIteration == 0 else "n+%d" % placement.mtIteration,
+                        tileId, placement.tiles.subIterK_start)))
         return list(module.flatitems())
 
     def emit_gr(self, placement, unroll_iter=0):
@@ -278,7 +282,7 @@ class InstructionEmitter:
                 for k in range(placement.tiles.subIterK_start, placement.tiles.subIterK_end, grGran.k):
                     subtileK = (k - uid_k_base) // subtileShapeK
                     module.add(emitSingleBufferLoad(ti, self.kernel, tileId, subtileK,
-                                                    writer=self.writer))
+                                                    writer=self.writer, mt=placement.mtIteration))
         elif tensor in ('SA', 'SB'):
             # Dual-period MXFP8: one scale epoch (256 K) feeds scaleReuse data
             # iterations.  Prefetch the next epoch's scales (SRD advance + DTL
@@ -287,7 +291,8 @@ class InstructionEmitter:
             if getattr(self.config, 'dualPeriodScale', False) and unroll_iter > 0:
                 return []
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
-            module.add(globalReadDoScaleSubtile(tc, self.writer, self.kernel))
+            module.add(globalReadDoScaleSubtile(
+                tc, self.writer, self.kernel, mt=placement.mtIteration))
         return list(module.flatitems())
 
     def emit_wait_gr(self, source):

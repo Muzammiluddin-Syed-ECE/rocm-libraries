@@ -1326,7 +1326,7 @@ def _grComputeSubtileOffsets_tlu(writer, module, tileInfo):
 ##################################################
 # Subroutine to generate GR load code
 #
-def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1, writer=None):
+def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1, writer=None, mt=None):
   """Emit buffer_load instructions for a single subtile (sId0, sId1).
 
   When loadRatioGR > 1, multiple local subtiles share the same global read.
@@ -1445,7 +1445,8 @@ def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1, writer=None):
       mubuf = MUBUFModifiers(offen=True, offset12=offsetK, glc=isGlc, slc=isSlc, nt=isNT, lds=True)
       soffset = baseSoffset
     voff = tileInfo.sharedVgprGROffset[i] if useSgpr or len(regList) == 0 else regList.indices[i]
-    module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment="grBaseId = %u, i= %u"%(grBaseId , i)))
+    mt_s = "" if mt is None else (" MT=n" if int(mt) == 0 else " MT=n+%d" % int(mt))
+    module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment="%s%s tile=%u K=%u i=%u" % (tc, mt_s, sId0, sId1, i)))
 
   if kWindowSoffset is not None:
     writer.sgprPool.checkIn(kWindowSoffset)
