@@ -129,7 +129,7 @@ class InstructionEmitter:
             'lr':           lambda em, ui: self.emit_lr(em.source, ui),
             'gr':           lambda em, ui: self.emit_gr(em.source, ui),
             'wait_gr':      lambda em, ui: self.emit_wait_gr(em.source),
-            'wait_lr':      lambda em, ui: self.emit_wait_lr(),
+            'wait_lr':      lambda em, ui: self.emit_wait_lr(em.source),
             'sync':         lambda em, ui: self.emit_sync(),
             'lr_inc':       lambda em, ui: self.emit_lr_inc(em.source, ui),
             'gr_inc':       lambda em, ui: self.emit_gr_inc(em.source, ui),
@@ -331,8 +331,8 @@ class InstructionEmitter:
                            comment=f"Wait GR ({label}): A={counts.A} B={counts.B} SA={counts.SA} SB={counts.SB}")
         return [swait]
 
-    def emit_wait_lr(self):
-        return [SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1,
+    def emit_wait_lr(self, source):
+        return [SWaitCnt(dscnt=source.dscnt, vlcnt=-1, vscnt=-1,
                          comment="Wait for LR to complete")]
 
     def emit_sync(self):
