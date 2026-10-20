@@ -3238,8 +3238,8 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # Split only after complete m0/buffer-load pairs: GR[0:2],
-        # DS[0:8], GR[2:4], then DS[8:16].
+        # Preserve the production-like global-load module: all four complete
+        # m0/load pairs precede the independent DS-read payload.
         assert items[mfma_positions[0] + 1].comment == "m0-0"
         clustered = [
             inst.comment for inst in items
@@ -3248,9 +3248,8 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         assert clustered == [
             "m0-0", "gr-0", "m0-1", "gr-1",
-            *[f"ds{i}" for i in range(8)],
             "m0-2", "gr-2", "m0-3", "gr-3",
-            *[f"ds{i}" for i in range(8, 16)],
+            *[f"ds{i}" for i in range(16)],
         ]
         assert [
             inst.comment for inst in items
