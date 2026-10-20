@@ -495,54 +495,6 @@ def _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules):
                     "Wait for prior LR; leave p0 prefetch reads in flight"
 
 
-def _setPartitionZeroCountedWait(preMfmaOrders, emittedModules):
-    """Wait only for older p0 operands when eight younger B reads precede it.
-
-    In the second scale-reuse iteration, p0's A0-3/B0-3 operands were issued
-    by the preceding iteration.  The only local reads issued in the current
-    pre-MFMA chain are the eight B4-7 reads for partition 1.  Keeping those
-    younger requests outstanding is therefore safe for p0's first MFMA.
-    """
-    for order in preMfmaOrders:
-        waitIndex = next(
-            (index for index, mid in enumerate(order)
-             if emittedModules[mid].opType == "wait_lr"),
-            None)
-        if waitIndex is None:
-            continue
-
-        preceding = [emittedModules[mid] for mid in order[:waitIndex]]
-        reads = [
-            inst for em in preceding
-            for inst in em.instructions if _isDsRead(inst)
-        ]
-        readModules = [
-            em for em in preceding
-            if any(_isDsRead(inst) for inst in em.instructions)
-        ]
-        if len(reads) != 8 or not readModules:
-            continue
-        if any(
-                getattr(em.source, "tensor", None) != "B"
-                or getattr(em.source, "partition", None) != 0
-                or getattr(em.source, "targetPartition", None) != 1
-                or getattr(em.source, "mtIteration", None) != 0
-                for em in readModules):
-            continue
-
-        wait = emittedModules[order[waitIndex]]
-        changed = False
-        for inst in wait.instructions:
-            if _isWaitCnt(inst) and getattr(inst, "dscnt", -1) == 0:
-                inst.dscnt = len(reads)
-                inst.comment = \
-                    "Wait for p0 operands; leave 8 younger B reads in flight"
-                changed = True
-        if changed:
-            return True
-    return False
-
-
 def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     """Move p0's full LR drain before its 16 independent younger reads.
 
@@ -760,10 +712,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         p0Split = _splitPartitionZeroPrefetch(
             preMfmaOrders, emittedModules)
     if p0Split is None:
-        if not _setPartitionZeroCountedWait(
-                preMfmaOrders, emittedModules):
-            _setPartitionZeroPrefetchWait(
-                preMfmaOrders, emittedModules)
+        _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
 
     slotsPerInterval = 4 if p0Split is not None else 2
     placementPathOrders = list(pathOrders)
