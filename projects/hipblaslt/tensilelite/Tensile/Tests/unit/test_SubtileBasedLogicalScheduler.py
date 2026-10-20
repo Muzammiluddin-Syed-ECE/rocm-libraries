@@ -3294,7 +3294,7 @@ class TestInstructionSchedulerWrapPrefetch:
         )
 
         assert [type(inst) for inst in items[:4]] == [
-            SWaitCntEx, SBarrier, SWaitCnt, MXMFMAInstruction]
+            SWaitCntEx, SWaitCnt, MXMFMAInstruction, SBarrier]
         assert wait.dscnt == 0
         assert wait.comment == "Wait for preloop LR before p0 MFMA"
         assert not any(
@@ -3302,9 +3302,11 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # Split only after complete m0/buffer-load pairs: GR[0:2],
-        # DS[0:8], GR[2:4], then DS[8:16].
-        assert items[mfma_positions[0] + 1].comment == "m0-0"
+        # Barrier follows the independent first MFMA, then split only after
+        # complete m0/buffer-load pairs: GR[0:2], DS[0:8], GR[2:4],
+        # then DS[8:16].
+        assert items[mfma_positions[0] + 1].comment == "barrier"
+        assert items[mfma_positions[0] + 2].comment == "m0-0"
         clustered = [
             inst.comment for inst in items
             if getattr(inst, "comment", "").startswith(
@@ -3336,6 +3338,34 @@ class TestInstructionSchedulerWrapPrefetch:
             if isinstance(inst, DSLoadB128)
         ) < mfma_positions[-1]
         assert sum(len(em.instructions) for em in modules) == len(items)
+
+        # The alternate unroll code path has only the eight B payload reads
+        # (scales are reused), but must preserve the same wait/MFMA/barrier
+        # split and keep all younger reads behind the barrier.
+        modules_c1 = [
+            emitted(0, 'mfma', [mfma(i) for i in range(16)], before=6),
+            emitted(1, 'lr', reads(0, 8), before=8, tensor='B',
+                    partition=0, targetPartition=1, mtIteration=0),
+            emitted(6, 'wait_lr', [
+                SWaitCnt(dscnt=0, comment="wait_lr")], before=1),
+            emitted(7, 'wait_gr', [
+                SWaitCntEx(vlcnt=13, dscnt=-1, comment="wait_gr")]),
+            emitted(8, 'sync', [
+                SBarrier(comment="barrier")], before=7),
+            emitted(9, 'gr', global_reads(4)),
+        ]
+        items_c1 = list(instructionSchedule(modules_c1).flatitems())
+        assert [type(inst) for inst in items_c1[:4]] == [
+            SWaitCntEx, SWaitCnt, MXMFMAInstruction, SBarrier]
+        first_mfma_c1 = next(
+            i for i, inst in enumerate(items_c1)
+            if isinstance(inst, MXMFMAInstruction)
+        )
+        assert not any(
+            isinstance(inst, DSLoadB128)
+            for inst in items_c1[:first_mfma_c1]
+        )
+        assert sum(len(em.instructions) for em in modules_c1) == len(items_c1)
 
     def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil

@@ -439,7 +439,7 @@ def _isWrapPrefetchPath(order, emittedModules):
 
 
 def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
-    """Find the exact 16-read p0 dual-period prefetch path."""
+    """Find a p0 dual-period prefetch path for either unroll code path."""
     for order in preMfmaOrders:
         modules = [emittedModules[mid] for mid in order]
         if not (any(em.opType == "wait_gr" for em in modules)
@@ -471,8 +471,11 @@ def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
             for em in readModules
             for inst in em.instructions
         )
-        if not hasNextPartitionData or scaleTensors != {"SA", "SB"} \
-                or readCount != 16:
+        validPayload = (
+            (readCount == 16 and scaleTensors == {"SA", "SB"})
+            or (readCount == 8 and not scaleTensors)
+        )
+        if not hasNextPartitionData or not validPayload:
             continue
         return order
     return None
@@ -483,6 +486,13 @@ def _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules):
     order = _findPartitionZeroPrefetchOrder(
         preMfmaOrders, emittedModules)
     if order is None:
+        return
+    readCount = sum(
+        _isDsRead(inst)
+        for mid in order
+        for inst in emittedModules[mid].instructions
+    )
+    if readCount != 16:
         return
     for mid in order:
         em = emittedModules[mid]
@@ -496,10 +506,14 @@ def _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules):
 
 
 def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
-    """Move p0's full LR drain before its 16 independent younger reads.
+    """Split p0 synchronization around one dependency-safe MFMA.
 
-    Returns the matched order, a pre-MFMA wait/sync prefix, and the payload
-    path to spread through four 4-cycle scheduling slots per MXMFMA.
+    The incoming LR drain and global wait precede the first MFMA. The barrier
+    follows it, before the younger p0 prefetch reads. This mirrors the CMS
+    wait/MFMA/barrier pattern while preserving workgroup visibility.
+
+    Returns the matched order, pre-MFMA waits, payload module order/payload
+    instructions, and the delayed barrier instructions.
     """
     order = _findPartitionZeroPrefetchOrder(
         preMfmaOrders, emittedModules)
@@ -507,7 +521,7 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
         return None
 
     prefixInsts = []
-    for opType in ("wait_gr", "sync", "wait_lr"):
+    for opType in ("wait_gr", "wait_lr"):
         for mid in order:
             em = emittedModules[mid]
             if em.opType != opType:
@@ -518,12 +532,19 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
                     inst.comment = "Wait for preloop LR before p0 MFMA"
                 prefixInsts.append((mid, inst))
 
+    delayedSync = [
+        (mid, inst)
+        for mid in order
+        if emittedModules[mid].opType == "sync"
+        for inst in emittedModules[mid].instructions
+    ]
     payloadOrder = [
         mid for mid in order
         if emittedModules[mid].opType not in ("wait_gr", "sync", "wait_lr")
     ]
     payloadInsts = _flattenPath(payloadOrder, emittedModules)
-    return order, prefixInsts, payloadOrder, payloadInsts
+    readCount = sum(_isDsRead(inst) for _, inst in payloadInsts)
+    return order, prefixInsts, payloadOrder, payloadInsts, delayedSync, readCount
 
 
 def _splitItemsAfterHalf(pathInsts, predicate):
@@ -714,7 +735,9 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     if p0Split is None:
         _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
 
-    slotsPerInterval = 4 if p0Split is not None else 2
+    slotsPerInterval = (
+        4 if p0Split is not None and p0Split[5] == 16 else 2
+    )
     placementPathOrders = list(pathOrders)
     if p0Split is not None:
         placementPathOrders.append(p0Split[2])
@@ -751,7 +774,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
                        rules.minGapDsReadToWait, rules.noM0WithBufferLoad]
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
-    if p0Split is not None:
+    if slotsPerInterval == 4:
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
@@ -762,6 +785,9 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         adjusters=base_adjusters,
         onPlace=rules.trackPlacement,
         slotsPerInterval=slotsPerInterval)
+
+    if p0Split is not None:
+        placer.placePath(p0Split[4], startLimit=0)
 
     def _placeRegularPaths():
         for order, hasWaitGR in paths:
@@ -800,7 +826,8 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
             if multiDU and hasWaitGR:
                 rules.setPostWaitGrDsReadFence(placer)
 
-    if p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
+    if p0Split is not None and p0Split[5] == 16 \
+            and all(not hasWaitGR for _, hasWaitGR in paths):
         regularHalves = [
             _splitItemsAfterHalf(
                 _flattenPath(order, emittedModules), _isBufferLoad)
@@ -828,7 +855,9 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         _placeRegularPaths()
         if p0Split is not None:
             rules.resetPath()
-            placer.placePath(p0Split[3])
+            if p0Split[5] == 8:
+                rules.setupLocalReadSpreading(p0Split[3])
+            placer.placePath(p0Split[3], startLimit=1)
 
     scheduled = Module()
     _emitPreMfma(scheduled)
