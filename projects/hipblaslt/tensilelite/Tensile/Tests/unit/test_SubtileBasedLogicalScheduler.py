@@ -3563,6 +3563,33 @@ class TestIntegration:
                     [8, 9, 10, 11, 12, 23, 24, 25]
                 assert globalReadPositions("B") == \
                     [26, 27, 39, 40, 41, 42, 43, 53]
+
+                writeSwapPositions = [
+                    position
+                    for position, bucket in enumerate(buckets)
+                    for inst in bucket
+                    if type(inst).__name__ == "SXorB32"
+                    and "LocalWriteBaseAddr" in str(inst)
+                    and "LocalWriteBaseAddrMX" not in str(inst)
+                ]
+                assert writeSwapPositions == [57, 57]
+                readSwapPositions = [
+                    position
+                    for position, bucket in enumerate(buckets)
+                    for inst in bucket
+                    if type(inst).__name__ == "VXorB32"
+                    and "LR swap" in (getattr(inst, "comment", "") or "")
+                ]
+                assert readSwapPositions == (
+                    [28, 28, 51, 51, 55, 55]
+                    if ui == 0 else [51, 51, 55, 55])
+                pointerPositions = [
+                    position
+                    for position, bucket in enumerate(buckets)
+                    for inst in bucket
+                    if "CMS earliest legal" in (getattr(inst, "comment", "") or "")
+                ]
+                assert pointerPositions == [11, 11, 40, 40]
                 assert sum(
                     isinstance(inst, GlobalReadInstruction)
                     for inst in global_items) == (18 if ui == 0 else 16)

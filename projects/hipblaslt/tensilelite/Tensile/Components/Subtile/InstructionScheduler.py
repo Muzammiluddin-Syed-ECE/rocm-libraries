@@ -993,6 +993,10 @@ def _scheduleCmsMxfp8LocalSync(
         em for tensor in ("SA", "SB")
         for em in modules(0, "lr_inc", tensor)
     ]
+    dataLrIncs = [
+        exactlyOne(3, "lr_inc", tensor)
+        for tensor in ("A", "B")
+    ]
     relocatedModules = [
         p0A, p1B,
         p0WaitGr, p0Barrier,
@@ -1095,11 +1099,52 @@ def _scheduleCmsMxfp8LocalSync(
             (26, 27, 39, 40, 41, 42, 43, 53), bRequests):
         after[position][0:0] = request
 
-    # The second A/B epochs use updated SRDs. Keep each increment at the
-    # narrow legal boundary after the last old-address request; the next
-    # checkpoint will split pointer and LDS-swap work into CMS positions.
-    appendModule(grIncA, after[11])
-    appendModule(grIncB, after[40])
+    def appendMetadata(inst, text):
+        if not hasattr(inst, "comment"):
+            return
+        old = getattr(inst, "comment", "") or ""
+        inst.comment = f"{old}; {text}" if old else text
+
+    def splitWriteSwap(em, tensor, blockedThrough):
+        swaps = [
+            inst for inst in em.instructions
+            if type(inst).__name__ == "SXorB32"
+        ]
+        if len(swaps) != 1:
+            raise AssertionError(
+                f"CMS MXFP8 {tensor} expected one LDS write swap")
+        pointer = [inst for inst in em.instructions if inst not in swaps]
+        for inst in pointer:
+            appendMetadata(
+                inst,
+                f"CMS earliest legal {tensor} SRD update; "
+                f"old-address requests end at M{blockedThrough}")
+        appendMetadata(swaps[0], f"CMS {tensor} LDS write swap at M57")
+        return pointer, swaps
+
+    # The second A/B epochs use updated SRDs. Their pointer updates are already
+    # at the earliest legal boundary after the last old-address request. Split
+    # the independent LDS write swaps out to the CMS M57 deadline.
+    aPointer, aWriteSwap = splitWriteSwap(grIncA, "A", 11)
+    bPointer, bWriteSwap = splitWriteSwap(grIncB, "B", 40)
+    after[11].extend(aPointer)
+    after[40].extend(bPointer)
+    after[57][0:0] = [*aWriteSwap, *bWriteSwap]
+
+    for em in scaleIncs:
+        tensor = getattr(em.source, "tensor", "scale")
+        for inst in em.instructions:
+            appendMetadata(
+                inst,
+                f"CMS nearest legal {tensor} LR swap; "
+                "p2 scale reads end at M27")
+    for em, blockedThrough in zip(dataLrIncs, (51, 55)):
+        tensor = getattr(em.source, "tensor", "data")
+        for inst in em.instructions:
+            appendMetadata(
+                inst,
+                f"CMS nearest legal {tensor} LR swap; "
+                f"loop-carried reads end at M{blockedThrough}")
 
     for inst in p3WaitGr.instructions:
         if _isWaitCnt(inst):
