@@ -526,28 +526,24 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     return order, prefixInsts, payloadOrder, payloadInsts
 
 
-def _splitOrderAfterHalf(order, emittedModules, predicate):
-    """Split a module path near half of its matching instructions."""
-    if not order:
+def _splitItemsAfterHalf(pathInsts, predicate):
+    """Split an instruction path after half its matching instructions."""
+    if not pathInsts:
         return [], []
 
-    counts = [
-        sum(predicate(inst) for inst in emittedModules[mid].instructions)
-        for mid in order
-    ]
-    total = sum(counts)
+    total = sum(predicate(inst) for _, inst in pathInsts)
     if total == 0:
-        split = (len(order) + 1) // 2
-        return order[:split], order[split:]
+        split = (len(pathInsts) + 1) // 2
+        return pathInsts[:split], pathInsts[split:]
 
     target = (total + 1) // 2
     count = 0
-    for index, moduleCount in enumerate(counts):
-        count += moduleCount
+    for index, (_, inst) in enumerate(pathInsts):
+        count += predicate(inst)
         if count >= target:
             split = index + 1
-            return order[:split], order[split:]
-    return order, []
+            return pathInsts[:split], pathInsts[split:]
+    return pathInsts, []
 
 
 def _nextPlacementSlot(placer):
@@ -806,24 +802,22 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
 
     if p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
         regularHalves = [
-            _splitOrderAfterHalf(order, emittedModules, _isBufferLoad)
+            _splitItemsAfterHalf(
+                _flattenPath(order, emittedModules), _isBufferLoad)
             for order, _ in paths
         ]
-        p0Halves = _splitOrderAfterHalf(
-            p0Split[2], emittedModules, _isDsRead)
+        p0Halves = _splitItemsAfterHalf(p0Split[3], _isDsRead)
 
-        def _placePacked(order):
-            if not order:
+        def _placePacked(pathInsts):
+            if not pathInsts:
                 return
             rules.resetPath()
             placer.placePath(
-                _flattenPath(order, emittedModules),
+                pathInsts,
                 startLimit=_nextPlacementSlot(placer))
 
-        # Cluster half the SALU/global stream, half the independent DS
-        # prefetch, and then the remaining halves of both. The target kernel's
-        # B loads share one module, so this experiment intentionally keeps that
-        # complete module together in the first global cluster.
+        # Split after complete m0/buffer-load pairs: first half of each
+        # SALU/global stream, first eight DS reads, then the remaining halves.
         for first, _ in regularHalves:
             _placePacked(first)
         _placePacked(p0Halves[0])
