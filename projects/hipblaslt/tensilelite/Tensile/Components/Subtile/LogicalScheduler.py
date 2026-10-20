@@ -1638,15 +1638,15 @@ class LogicalScheduler:
                         partition=pi,
                         unrollId=uid))
 
-    def _move_du128_safe_wrap_to_p2(self):
-        """Move the p3 wrap operand disjoint from p2's live MFMA operand."""
+    def _move_du128_wrap_a_to_p2(self):
+        """Move only the VGPR-safe A(n+1) wrap reads from p3 into p2."""
         cfg = self.config
         isTarget = (
             cfg.dualPeriodScale
             and cfg.pgr == 2
             and cfg.prefetchNextPartition
             and cfg.numSubIterK == 1
-            and cfg.partitionOrder in ("m-major", "n-major")
+            and cfg.partitionOrder == "n-major"
             and cfg.partitionSizesM == [4, 4]
             and cfg.partitionSizesN == [4, 4]
         )
@@ -1655,10 +1655,9 @@ class LogicalScheduler:
 
         src = self._partitions[3][0]
         dst = self._partitions[2][0]
-        safeTensor = "A" if cfg.partitionOrder == "n-major" else "B"
         candidates = [
             lr for lr in src.lrs
-            if lr.tensor == safeTensor
+            if lr.tensor == "A"
             and lr.mtIteration == 1
             and lr.targetPartition == 0
             and lr.tiles.subIterK_start == 0
@@ -1718,7 +1717,7 @@ class LogicalScheduler:
             else:
                 self._distribute_grs(gr_list, gr_slot_bounds, unrollId=uid)
 
-        self._move_du128_safe_wrap_to_p2()
+        self._move_du128_wrap_a_to_p2()
         return self._partitions[0]
 
     # ── Annotate dependencies ─────────────────────────────
