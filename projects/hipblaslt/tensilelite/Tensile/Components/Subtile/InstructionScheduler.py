@@ -499,7 +499,7 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     """Move p0's full LR drain before its 16 independent younger reads.
 
     Returns the matched order, a pre-MFMA wait/sync prefix, and the payload
-    path to spread through three 4-cycle scheduling slots per MXMFMA.
+    path to spread through four 4-cycle scheduling slots per MXMFMA.
     """
     order = _findPartitionZeroPrefetchOrder(
         preMfmaOrders, emittedModules)
@@ -680,7 +680,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     Rules (shared):
       - MFMA order is preserved.
       - The legacy schedule uses 2 placement slots between adjacent MFMAs.
-      - The selected MXFP8 p0 experiment uses 3 4-cycle scheduling slots.
+      - The selected MXFP8 p0 experiment uses 4 4-cycle scheduling slots.
       - At most one ds_read is placed per two-slot SIMD issue pair.
       - Before dependencies are respected at module order level.
       - Minimm distance between ds_read and it waitcnt (hardcoded for now)
@@ -714,7 +714,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     if p0Split is None:
         _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
 
-    slotsPerInterval = 3 if p0Split is not None else 2
+    slotsPerInterval = 4 if p0Split is not None else 2
     placementPathOrders = list(pathOrders)
     if p0Split is not None:
         placementPathOrders.append(p0Split[2])
