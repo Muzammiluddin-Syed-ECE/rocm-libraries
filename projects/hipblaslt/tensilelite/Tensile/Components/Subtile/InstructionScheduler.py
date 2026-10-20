@@ -214,6 +214,7 @@ class _SlotPlacer:
 # gfx1250 needs a larger gap (8); other archs use 4.
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT = 4
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250 = 8
+_MX_GLOBAL_DEADLINE_MFMA_GAP = 1
 
 _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
@@ -705,10 +706,11 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
 
     mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
     mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
+    deadlineMxSchedule = len(mfmas) == 16 and all(
+        isinstance(inst, MXMFMAInstruction)
+        and inst.getIssueLatency() == 8 for inst in mfmas)
     p0Split = None
-    if mfmas and all(
-            isinstance(inst, MXMFMAInstruction)
-            and inst.getIssueLatency() == 8 for inst in mfmas):
+    if deadlineMxSchedule:
         p0Split = _splitPartitionZeroPrefetch(
             preMfmaOrders, emittedModules)
     if p0Split is None:
@@ -792,6 +794,22 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
                     continue
 
             reverse = (not multiDU) and hasWaitGR
+            deadlinePath = deadlineMxSchedule and not hasWaitGR and any(
+                emittedModules[mid].opType == "gr" for mid in order)
+            if deadlinePath:
+                # Preserve dependency order while placing optional global-read
+                # work from its latest safe issue deadline backwards.  The
+                # trailing guard prevents a long auxiliary run from delaying
+                # the final MFMAs in the partition.
+                pathInsts = _flattenPath(
+                    order, emittedModules, reverse=True)
+                deadline = placer.totalSlots - 1 \
+                    - _MX_GLOBAL_DEADLINE_MFMA_GAP * slotsPerInterval
+                rules.resetPath()
+                placer.placePath(
+                    pathInsts, reverse=True, startLimit=deadline)
+                continue
+
             pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
             rules.resetPath()
             if not hasWaitGR:

@@ -3337,6 +3337,77 @@ class TestInstructionSchedulerWrapPrefetch:
         ) < mfma_positions[-1]
         assert sum(len(em.instructions) for em in modules) == len(items)
 
+    def test_mx_global_path_uses_latest_deadline_with_mfma_guard(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import accvgpr, mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MXMFMAInstruction, SAddU32)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8,
+                accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1],
+                acc=accvgpr(0, 4),
+                a=vgpr(0, 8),
+                b=vgpr(8, 8),
+                acc2=accvgpr(0, 4),
+                mxsa=vgpr(16),
+                mxsb=vgpr(17),
+                block=32,
+                comment=f"mfma{index}")
+            for index in range(16)
+        ]
+        global_reads = []
+        for index in range(4):
+            global_reads.extend([
+                SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index,
+                    comment=f"m0-{index}"),
+                BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"gr-{index}"),
+            ])
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas, before=None,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1, instructions=global_reads, before=None,
+                source=SimpleNamespace(kind="gr")),
+        ]
+
+        items = list(instructionSchedule(modules).flatitems())
+        mfma_positions = [
+            index for index, inst in enumerate(items)
+            if isinstance(inst, MXMFMAInstruction)
+        ]
+        first_aux = next(
+            index for index, inst in enumerate(items)
+            if not isinstance(inst, MXMFMAInstruction)
+        )
+        last_load = max(
+            index for index, inst in enumerate(items)
+            if isinstance(inst, BufferLoadB128)
+        )
+
+        assert first_aux > mfma_positions[5]
+        assert last_load < mfma_positions[14]
+        assert all(
+            isinstance(inst, MXMFMAInstruction)
+            for inst in items[mfma_positions[14]:]
+        )
+
     def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
         from rocisa import rocIsa
