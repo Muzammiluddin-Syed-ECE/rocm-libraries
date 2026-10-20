@@ -619,12 +619,14 @@ class WaitGROp(BaseOp):
 class WaitLROp(BaseOp):
     """Wait for local reads to complete. Optionally includes a sync barrier."""
     has_sync: bool = False
+    dscnt: int = 0
 
     def __post_init__(self):
         self.kind = 'wait_lr'
 
     def __str__(self):
-        return 'wait_lr_sync' if self.has_sync else 'wait_lr'
+        label = 'wait_lr_sync' if self.has_sync else 'wait_lr'
+        return f'{label}({self.dscnt})' if self.dscnt else label
 
 
 @dataclass
@@ -1062,6 +1064,20 @@ class LogicalScheduler:
         """True when A/B use numUnroll > 1 (MX multi-DU data path)."""
         cfg = self.config
         return bool(cfg.numUnroll) and SchedulerConfig._data_tensors_multi_du(cfg.numUnroll)
+
+    def _wait_lr_dscnt(self, partition: int) -> int:
+        """Leave only p2-safe p0 scale reads outstanding at the p1 boundary."""
+        cfg = self.config
+        critical_first_p0 = (
+            cfg.dualPeriodScale
+            and cfg.pgr == 2
+            and cfg.prefetchNextPartition
+            and cfg.numSubIterK == 1
+            and cfg.partitionOrder == "n-major"
+            and cfg.partitionSizesM == [4, 4]
+            and cfg.partitionSizesN == [4, 4]
+        )
+        return 4 if critical_first_p0 and partition == 1 else 0
 
     @pipeline_pass(Pass.VGPR_TILES)
     def assign_vgpr_tiles(self):
@@ -2419,7 +2435,8 @@ class LogicalScheduler:
                     has_lr_dep = any(
                         isinstance(d.ref, LRPlacement) for d in same + cross)
                     if has_lr_dep:
-                        slot.mfma.preOps.append(WaitLROp())
+                        slot.mfma.preOps.append(
+                            WaitLROp(dscnt=self._wait_lr_dscnt(pi)))
 
                 # ── LRs ──
                 for lr in slot.lrs:
