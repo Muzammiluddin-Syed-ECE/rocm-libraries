@@ -236,13 +236,16 @@ class _SchedulingRules:
     Bound methods are passed as callbacks to _SlotPlacer.
     """
 
-    def __init__(self, totalSlots: int, minGapDsReadToWait: int = _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT):
+    def __init__(self, totalSlots: int,
+                 minGapDsReadToWait: int = _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
+                 grIncLeadSlots: int = 0):
         # Cross-path state
         self.lastDsReadPos = -1
         self.earliestWaitCntPos = totalSlots
         self.waitGrBarrierPos: Optional[int] = None
         self.maxDsReadAfterWaitGr = -1
         self.minGap = minGapDsReadToWait
+        self.grIncLeadSlots = grIncLeadSlots
         # Per-path state
         self._resetPath()
 
@@ -362,7 +365,7 @@ class _SchedulingRules:
     def resetPath(self):
         self._resetPath()
 
-    def setupBufLoadSpreading(self, placer, pathInsts, order):
+    def setupBufLoadSpreading(self, placer, pathInsts, order, emittedModules):
         """Compute buffer-load spreading bounds for a forward path.
 
         Reserves tail slots for non-buffer-load instructions in modules that
@@ -377,6 +380,12 @@ class _SchedulingRules:
             numTailInsts = sum(1 for mid, _ in pathInsts if mid in tailModuleIds)
             # this is an approximation as we don't know exactly how many slots will be use by modules after the GR yet (in this codepath)
             self.bufLoadMaxSlot = max(0, rawMax - numTailInsts)
+            if any(emittedModules[mid].opType == "gr_inc" for mid in order):
+                # Finish the old-address loads early enough to expose the SRD
+                # increment and the first load using the new address before
+                # their latest legal slots.
+                self.bufLoadMaxSlot = max(
+                    0, self.bufLoadMaxSlot - self.grIncLeadSlots)
 
     def setupLocalReadSpreading(self, pathInsts):
         """Enable full-range spreading for the current local-read path."""
@@ -745,9 +754,13 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         return result
 
     paths = _classifyPaths(pathOrders, emittedModules)
+    earlyAddressSchedule = p0Split is None and len(mfmas) == 16 and all(
+        isinstance(inst, MXMFMAInstruction)
+        and inst.getIssueLatency() == 8 for inst in mfmas)
     rules = _SchedulingRules(
         totalSlots=(len(mfmas) - 1) * slotsPerInterval,
-        minGapDsReadToWait=minGapDsReadToWait)
+        minGapDsReadToWait=minGapDsReadToWait,
+        grIncLeadSlots=(2 * slotsPerInterval if earlyAddressSchedule else 0))
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
                        rules.minGapDsReadToWait, rules.noM0WithBufferLoad]
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
@@ -795,7 +808,8 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
             pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
             rules.resetPath()
             if not hasWaitGR:
-                rules.setupBufLoadSpreading(placer, pathInsts, order)
+                rules.setupBufLoadSpreading(
+                    placer, pathInsts, order, emittedModules)
             placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
             if multiDU and hasWaitGR:
                 rules.setPostWaitGrDsReadFence(placer)
