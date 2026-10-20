@@ -933,12 +933,13 @@ def _scheduleCmsMxfp8LocalSync(
         groups, scheduledGroups):
     """Overlay CMS local-read, synchronization, DTL, and loop-tail phasing.
 
-    A/B reads occupy M0-M3/M13-M16 and drain at M6/M20. Data DTL requests
-    follow the CMS A-first M8-M25 and B M26-M53 phases. A counted M46 VMEM
-    wait leaves the newest 15 requests in flight, makes the two early
-    readiness waits redundant, and permits barriers at M7/M21/M47.
+    A/B reads occupy M0-M3/M13-M16 and drain at M6/M20. C0 scale reads are
+    split by first-use deadline: p1 scales share M6, while p2 scales occupy
+    M17-M18 and share M20, avoiding a separate M31 LDS drain. Data DTL
+    requests follow the CMS A-first M8-M25 and B M26-M53 phases. A counted
+    M46 VMEM wait leaves the newest 15 requests in flight, makes the two
+    early readiness waits redundant, and permits barriers at M7/M21/M47.
     Loop-carried reads occupy M48-M55 and drain at M61.
-    C0-only scale reads remain split by first-use deadline.
     """
     mfmas, prefix, after = _splitCmsGlobalStream(scheduledGroups)
 
@@ -1061,7 +1062,22 @@ def _scheduleCmsMxfp8LocalSync(
     for position, tile in zip(range(13, 17), range(4, 8)):
         after[position].extend(bReads[tile])
 
-    setLocalWait(p2WaitLr, "CMS: drain B reads before M21")
+    if hasScaleReads:
+        # These registers are disjoint from the p1 scale registers consumed
+        # through M19, so their reads can use the otherwise-empty M17/M18
+        # intervals and retire at the existing M20 drain.
+        for position, keys in (
+                (17, (("SA", 0), ("SA", 2))),
+                (18, (("SB", 4), ("SB", 6)))):
+            for key in keys:
+                appendModule(scaleReads[key], after[position])
+        for em in scaleIncs:
+            appendModule(em, after[19])
+
+    setLocalWait(
+        p2WaitLr,
+        "CMS: drain B and p2 scale reads before M21"
+        if hasScaleReads else "CMS: drain B reads before M21")
     appendModule(p2WaitLr, after[20])
     appendModule(p1Barrier, after[21])
 
@@ -1071,21 +1087,9 @@ def _scheduleCmsMxfp8LocalSync(
     setLocalWait(p0WaitLr, "CMS: drain loop-carried A/B reads at M61")
     appendModule(p0WaitLr, after[61])
 
-    if hasScaleReads:
-        # The remaining scales are first consumed by p2 (M32).
-        for position, key in zip(
-                range(24, 28),
-                (("SA", 0), ("SA", 2), ("SB", 4), ("SB", 6))):
-            appendModule(scaleReads[key], after[position])
-        for em in scaleIncs:
-            appendModule(em, after[28])
-        setLocalWait(p3WaitLr, "CMS: drain p2 scales before M32")
-        appendModule(p3WaitLr, after[31])
-        retiredIds = set()
-    else:
-        # C1 has no scale payload, so the former p3-entry LDS drain is empty
-        # work after the A/B M6/M20 drains and is deliberately retired.
-        retiredIds = {id(inst) for inst in p3WaitLr.instructions}
+    # The former p3-entry LDS drain is redundant in both copies: C0's p2
+    # scales now share M20, while C1 has no scale payload.
+    retiredIds = {id(inst) for inst in p3WaitLr.instructions}
 
     def requestPairs(emitted):
         insts = [
@@ -1188,7 +1192,7 @@ def _scheduleCmsMxfp8LocalSync(
             appendMetadata(
                 inst,
                 f"CMS nearest legal {tensor} LR swap; "
-                "p2 scale reads end at M27")
+                "p2 scale reads end at M18")
     for em, blockedThrough in zip(dataLrIncs, (51, 55)):
         tensor = getattr(em.source, "tensor", "data")
         for inst in em.instructions:

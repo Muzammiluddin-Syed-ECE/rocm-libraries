@@ -3518,8 +3518,7 @@ class TestIntegration:
                     and not getattr(inst, "isWaitGr", False)
                     and inst.dscnt >= 0
                 ]
-                assert localWaits == (
-                    [6, 20, 31, 61] if ui == 0 else [6, 20, 61])
+                assert localWaits == [6, 20, 61]
 
                 def readPositions(tensor, begin, end):
                     return [
@@ -3547,7 +3546,7 @@ class TestIntegration:
                     and inst.comment.startswith(("SA ", "SB "))
                 ]
                 assert scalePositions == (
-                    [4, 4, 5, 5, 24, 25, 26, 27]
+                    [4, 4, 5, 5, 17, 17, 18, 18]
                     if ui == 0 else [])
 
                 def globalReadPositions(tensor):
@@ -3583,7 +3582,7 @@ class TestIntegration:
                     and "LR swap" in (getattr(inst, "comment", "") or "")
                 ]
                 assert readSwapPositions == (
-                    [28, 28, 51, 51, 55, 55]
+                    [19, 19, 51, 51, 55, 55]
                     if ui == 0 else [51, 51, 55, 55])
                 pointerPositions = [
                     position
@@ -3608,7 +3607,7 @@ class TestIntegration:
                 assert sum(
                     isinstance(inst, GlobalReadInstruction)
                     for inst in global_items) == (18 if ui == 0 else 16)
-                assert len(global_items) == (168 if ui == 0 else 145)
+                assert len(global_items) == (167 if ui == 0 else 145)
 
             loopItems = list(sched.emitMainAndExitLoops(
                 writer, kernel).flatitems())
