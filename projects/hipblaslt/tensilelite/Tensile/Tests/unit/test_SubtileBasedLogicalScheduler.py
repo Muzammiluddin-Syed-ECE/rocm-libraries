@@ -3302,9 +3302,17 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # Split only after complete m0/buffer-load pairs: GR[0:2],
-        # DS[0:8], GR[2:4], then DS[8:16].
+        # Split only after complete m0/buffer-load pairs.  The p0 reads put
+        # p1-critical scales beside their B groups, then defer the four scales
+        # which p1 does not consume.
         assert items[mfma_positions[0] + 1].comment == "m0-0"
+        expected_reads = [
+            "ds8", "ds14",
+            "ds0", "ds1", "ds2", "ds3",
+            "ds15",
+            "ds4", "ds5", "ds6", "ds7",
+            "ds9", "ds10", "ds11", "ds12", "ds13",
+        ]
         clustered = [
             inst.comment for inst in items
             if getattr(inst, "comment", "").startswith(
@@ -3312,9 +3320,9 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         assert clustered == [
             "m0-0", "gr-0", "m0-1", "gr-1",
-            *[f"ds{i}" for i in range(8)],
+            *expected_reads[:8],
             "m0-2", "gr-2", "m0-3", "gr-3",
-            *[f"ds{i}" for i in range(8, 16)],
+            *expected_reads[8:],
         ]
         assert [
             inst.comment for inst in items
@@ -3323,7 +3331,7 @@ class TestInstructionSchedulerWrapPrefetch:
         assert [
             inst.comment for inst in items
             if isinstance(inst, DSLoadB128)
-        ] == [f"ds{i}" for i in range(16)]
+        ] == expected_reads
         reads_per_interval = [
             sum(isinstance(inst, DSLoadB128)
                 for inst in items[begin + 1:end])
