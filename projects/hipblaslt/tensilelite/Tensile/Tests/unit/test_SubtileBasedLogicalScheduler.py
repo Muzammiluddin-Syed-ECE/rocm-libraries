@@ -3337,6 +3337,44 @@ class TestInstructionSchedulerWrapPrefetch:
         ) < mfma_positions[-1]
         assert sum(len(em.instructions) for em in modules) == len(items)
 
+    def test_partition_zero_counted_wait_leaves_only_younger_b_reads(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.instruction import DSLoadB128, SWaitCnt
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            _setPartitionZeroCountedWait)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        reads = [
+            DSLoadB128(
+                dst=vgpr(8, 4), src=vgpr(1),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"younger-b-{index}")
+            for index in range(8)
+        ]
+        wait = SWaitCnt(dscnt=0, comment="wait_lr")
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=reads, before=None,
+                source=SimpleNamespace(
+                    kind="lr", tensor="B", partition=0,
+                    targetPartition=1, mtIteration=0)),
+            EmittedModule(
+                moduleId=1, instructions=[wait], before=0,
+                source=SimpleNamespace(kind="wait_lr")),
+        ]
+
+        assert _setPartitionZeroCountedWait([[0, 1]], modules)
+        assert wait.dscnt == 8
+        assert wait.comment == \
+            "Wait for p0 operands; leave 8 younger B reads in flight"
+
     def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
         from rocisa import rocIsa
