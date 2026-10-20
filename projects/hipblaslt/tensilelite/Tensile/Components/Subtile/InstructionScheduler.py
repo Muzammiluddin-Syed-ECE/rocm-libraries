@@ -706,10 +706,9 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
     mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
     p0Split = None
-    preserveMxComputeBurst = len(mfmas) == 16 and all(
+    if mfmas and all(
             isinstance(inst, MXMFMAInstruction)
-            and inst.getIssueLatency() == 8 for inst in mfmas)
-    if preserveMxComputeBurst:
+            and inst.getIssueLatency() == 8 for inst in mfmas):
         p0Split = _splitPartitionZeroPrefetch(
             preMfmaOrders, emittedModules)
     if p0Split is None:
@@ -751,12 +750,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         minGapDsReadToWait=minGapDsReadToWait)
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
                        rules.minGapDsReadToWait, rules.noM0WithBufferLoad]
-    base_adjusters = [rules.spreadLocalReads]
-    if not preserveMxComputeBurst:
-        # Generic schedules amortize VMEM issue across the MFMA stream.  The
-        # 16-MFMA MX schedule instead packs dependency-safe loads at their
-        # earliest slots, preserving a contiguous compute-only tail.
-        base_adjusters.append(rules.spreadBufferLoads)
+    base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
     if p0Split is not None:
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
     if multiDU:
@@ -800,7 +794,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
             reverse = (not multiDU) and hasWaitGR
             pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
             rules.resetPath()
-            if not hasWaitGR and not preserveMxComputeBurst:
+            if not hasWaitGR:
                 rules.setupBufLoadSpreading(placer, pathInsts, order)
             placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
             if multiDU and hasWaitGR:
