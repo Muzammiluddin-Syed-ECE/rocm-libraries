@@ -16,7 +16,8 @@ Organized by pass:
 """
 import pytest
 from Tensile.Components.Subtile.Kernel import (
-    TileInfo, AB_B8, AB_B16, AB_B16_W32, AB_B4, MXSA_B4, MXSB_B4, CD_F32, CD_F32_W32,
+    TileInfo, AB_B8, AB_B16, AB_B16_W32, AB_B4,
+    MXSA_B4, MXSB_B4, MXSA_B8, MXSB_B8, CD_F32, CD_F32_W32,
 )
 from Tensile.Components.Subtile.LogicalScheduler import (
     GRPlacementStrategy,
@@ -38,15 +39,17 @@ from rocisa.code import Module
 
 def makeTileInfo(tc, kernel):
     """Compatibility wrapper: select geometry from kernel config and return TileInfo."""
-    fp4 = kernel["ProblemType"].get("MXBlockA", 0) > 0
+    has_mx = kernel["ProblemType"].get("MXBlockA", 0) > 0
+    fp4 = has_mx and kernel["ProblemType"]["DataTypeA"].numBytes() == 0.5
+    mxfp8 = has_mx and kernel["ProblemType"]["DataTypeA"].numBytes() == 1
     wave32 = kernel.get("WavefrontSize", 64) == 32
     ab_bf16 = AB_B16_W32 if wave32 else AB_B16
     cd_f32 = CD_F32_W32 if wave32 else CD_F32
     _geo = {
-        'A': AB_B4 if fp4 else ab_bf16,
-        'B': AB_B4 if fp4 else ab_bf16,
-        'MXSA': MXSA_B4,
-        'MXSB': MXSB_B4,
+        'A': AB_B4 if fp4 else (AB_B8 if mxfp8 else ab_bf16),
+        'B': AB_B4 if fp4 else (AB_B8 if mxfp8 else ab_bf16),
+        'MXSA': MXSA_B8 if mxfp8 else MXSA_B4,
+        'MXSB': MXSB_B8 if mxfp8 else MXSB_B4,
         'D': cd_f32,
     }
     # TDM path queries writer.states.subtileLdsSwizzle in TileInfo.__init__.
@@ -294,8 +297,8 @@ def make_cfg_du128_4wave():
         lrB=ReadGranularity(mn=1, k=1),
         grA=ReadGranularity(mn=1, k=1),
         grB=ReadGranularity(mn=1, k=1),
-        lrSA=ReadGranularity(mn=2, k=1),
-        lrSB=ReadGranularity(mn=2, k=1),
+        lrSA=ReadGranularity(mn=2, k=2),
+        lrSB=ReadGranularity(mn=2, k=2),
         grSA=ReadGranularity(mn=8, k=2),
         grSB=ReadGranularity(mn=8, k=2),
         partitionSizeM=4,
@@ -1310,14 +1313,15 @@ class TestAssignVgprTiles:
 
 class TestPlaceGRs:
 
-    def test_du128_moves_only_vgpr_safe_wrap_a_to_p2(self):
+    def test_du128_nmajor_moves_only_vgpr_safe_wrap_a_to_p2(self):
         cfg = make_cfg_du128_4wave()
+        cfg.partitionOrder = "n-major"
         sched = LogicalScheduler(cfg)
         parts = sched.build(stop_after=Pass.GR)
 
         moved = [
             lr for lr in parts[2][0].lrs
-            if lr.tensor == 'A' and lr.mtIteration == 1
+            if lr.tensor == "A" and lr.mtIteration == 1
         ]
         assert len(moved) == 1
         assert (moved[0].tiles.tileId_start,
@@ -1328,28 +1332,58 @@ class TestPlaceGRs:
             lr.tensor for lr in parts[3][0].lrs
             if lr.mtIteration == 1
         }
-        assert p3_wrap == {'B', 'SA', 'SB'}
+        assert p3_wrap == {'B'}
 
-        p2_a_vgprs = {
+        p2_operand_vgprs = {
             value
-            for tile_map in parts[2][0].mfma.vgpr_tile_maps['A']
+            for tile_map in parts[2][0].mfma.vgpr_tile_maps["A"]
             for value in tile_map.values()
         }
-        wrap_a_vgprs = {
+        wrap_operand_vgprs = {
             value
             for tile_map in moved[0].vgpr_tile_map
             for value in tile_map.values()
         }
-        assert p2_a_vgprs.isdisjoint(wrap_a_vgprs)
+        assert p2_operand_vgprs.isdisjoint(wrap_operand_vgprs)
 
         inc_parts = LogicalScheduler(cfg).build(stop_after=Pass.GR_INC)
         moved_with_inc = [
             lr for lr in inc_parts[2][0].lrs
-            if lr.tensor == 'A' and lr.mtIteration == 1
+            if lr.tensor == "A" and lr.mtIteration == 1
         ]
         assert len(moved_with_inc) == 1
-        assert any(op.kind == 'lr_inc' and op.tensor == 'A'
+        assert any(op.kind == 'lr_inc' and op.tensor == "A"
                    for op in moved_with_inc[0].preOps)
+
+    def test_du128_mmajor_keeps_cms_a_then_b_wrap_phase_in_p3(self):
+        cfg = make_cfg_du128_4wave()
+        cfg.partitionOrder = "m-major"
+        sched = LogicalScheduler(cfg)
+        parts = sched.build(stop_after=Pass.GR)
+
+        assert not [
+            lr for lr in parts[2][0].lrs if lr.mtIteration == 1
+        ]
+        p3_wrap = {
+            lr.tensor for lr in parts[3][0].lrs
+            if lr.mtIteration == 1
+        }
+        assert p3_wrap == {'A', 'B'}
+
+        for tensor in ('A', 'B'):
+            live_vgprs = {
+                value
+                for tile_map in parts[3][0].mfma.vgpr_tile_maps[tensor]
+                for value in tile_map.values()
+            }
+            wrap_vgprs = {
+                value
+                for lr in parts[3][0].lrs
+                if lr.tensor == tensor and lr.mtIteration == 1
+                for tile_map in lr.vgpr_tile_map
+                for value in tile_map.values()
+            }
+            assert live_vgprs.isdisjoint(wrap_vgprs)
 
     def test_1x1_k1_DU256(self):
         """256x256, DU256, FP4. GR order: A, B, SA, SB.
@@ -3112,6 +3146,18 @@ class TestGetNumVgpr:
 class TestInstructionSchedulerWrapPrefetch:
     """Partition-prefetch LRs must not delay independent MFMAs."""
 
+    def test_cms_mx_order_matches_reference_quadrant_traversal(self):
+        from Tensile.Components.Subtile.InstructionEmitter import (
+            _cms_mx_order)
+
+        assert _cms_mx_order(
+            [0, 1, 2, 3], [4, 5, 6, 7]) == [
+                (0, 4), (1, 4), (2, 4), (3, 4),
+                (0, 5), (1, 5), (2, 5), (3, 5),
+                (0, 6), (1, 6), (2, 6), (3, 6),
+                (0, 7), (1, 7), (2, 7), (3, 7),
+            ]
+
     @staticmethod
     def _schedule():
         import shutil
@@ -3376,6 +3422,113 @@ class TestInstructionSchedulerWrapPrefetch:
 
 
 class TestIntegration:
+
+    def test_du128_mxfp8_integrated_cms_schedule(self):
+        """The target loop reproduces the CMS phase boundaries in both paths."""
+        from rocisa.instruction import (
+            GlobalReadInstruction, LocalReadInstruction,
+            MXMFMAInstruction, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        kernel = create_kernel_fp8(256, 256, [2, 2], depthU=128)
+        kernel["ProblemType"]["MXBlockA"] = 32
+        kernel["ProblemType"]["MXBlockB"] = 32
+        kernel["_DualPeriodMXFP8"] = True
+        kernel["_ScalePeriodUA"] = 256
+        kernel["_ScalePeriodUB"] = 256
+        kernel["_DepthUMXSA"] = 8
+        kernel["_DepthUMXSB"] = 8
+        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = \
+            make_writer_and_tileinfos(kernel, fp4=True)
+        cfg = make_cfg_du128_4wave()
+        cfg.partitionOrder = "m-major"
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.allocVgprTiles(
+            writer, tiA, tiB,
+            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+
+        def split_mfma_intervals(items):
+            positions = [
+                index for index, inst in enumerate(items)
+                if isinstance(inst, MXMFMAInstruction)
+            ]
+            assert len(positions) == 16
+            prefix = items[:positions[0]]
+            trailing = [
+                items[begin + 1:(
+                    positions[index + 1]
+                    if index + 1 < len(positions) else len(items))]
+                for index, begin in enumerate(positions)
+            ]
+            return prefix, trailing
+
+        try:
+            sched.populate_instructions(
+                writer, kernel,
+                tileInfoA=tiA, tileInfoB=tiB,
+                dtileInfo=dTileInfo,
+                scaleTileInfoA=scaleTiA,
+                scaleTileInfoB=scaleTiB)
+
+            assert sched.unroll_factor == 2
+            for ui, emitted_loop in enumerate(sched._emitted_per_unroll):
+                assert all(
+                    em.unrollId == ui
+                    and em.scheduleProfile == "cms-mxfp8-du128"
+                    for partition in emitted_loop
+                    for group in partition
+                    for em in group)
+
+                scheduled = [
+                    list(instructionSchedule(partition[0]).flatitems())
+                    for partition in emitted_loop
+                ]
+                phases = [split_mfma_intervals(items)
+                          for items in scheduled]
+
+                p0_prefix, p0 = phases[0]
+                assert len(p0_prefix) == 1 \
+                    and isinstance(p0_prefix[0], SWaitCnt)
+                assert any(getattr(inst, "isWaitGr", False)
+                           for inst in p0[6])
+                assert isinstance(p0[7][0], SBarrier)
+                assert sum(
+                    isinstance(inst, LocalReadInstruction)
+                    for bucket in p0[7:15] for inst in bucket
+                ) == (16 if ui == 0 else 8)
+                assert all(not bucket for bucket in p0[:6])
+                assert not p0[15]
+
+                p1_prefix, p1 = phases[1]
+                assert p1_prefix[0].dscnt == (4 if ui == 0 else 0)
+                assert any(getattr(inst, "isWaitGr", False)
+                           for inst in p1[4])
+                assert isinstance(p1[5][0], SBarrier)
+                assert all(not bucket for bucket in p1[11:])
+
+                _, p2 = phases[2]
+                assert all(not bucket for bucket in p2[:7])
+                assert all(not bucket for bucket in p2[12:])
+                assert sum(isinstance(inst, GlobalReadInstruction)
+                           for bucket in p2[7:12] for inst in bucket) == 5
+
+                p3_prefix, p3 = phases[3]
+                assert len(p3_prefix) == 2
+                assert isinstance(p3[0][0], SBarrier)
+                p3_reads = [
+                    inst.comment
+                    for bucket in p3
+                    for inst in bucket
+                    if isinstance(inst, LocalReadInstruction)
+                ]
+                assert len(p3_reads) == 16
+                assert all(comment.startswith("A ") for comment in p3_reads[:8])
+                assert all(comment.startswith("B ") for comment in p3_reads[8:])
+                assert not p3[15]
+        finally:
+            sched.deallocVgprTiles(writer)
 
     def test_populate_instructions_256x256_fp4(self):
         """Full pipeline: emit → populate_instructions → instructionSchedule."""

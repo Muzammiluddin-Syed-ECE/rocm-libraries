@@ -764,6 +764,8 @@ class EmittedModule:
     instructions: list = field(default_factory=list)
     before: Optional[int] = None   # moduleId that must complete before this module
     source: Optional[Emittable] = None
+    unrollId: int = 0              # emitted dual-period code path
+    scheduleProfile: str = ""      # optional target-specific instruction policy
 
     @property
     def opType(self) -> str:
@@ -1638,8 +1640,15 @@ class LogicalScheduler:
                         partition=pi,
                         unrollId=uid))
 
-    def _move_du128_wrap_a_to_p2(self):
-        """Move only the VGPR-safe A(n+1) wrap reads from p3 into p2."""
+    def _move_du128_nmajor_wrap_a_to_p2(self):
+        """Keep the retained N-major wrap balance outside the CMS profile.
+
+        The integrated M-major CMS schedule deliberately leaves both wrap
+        operands in partition 3.  That reproduces the reference kernel's
+        next-buffer A-then-B read phase and leaves partition 2 available for
+        its long compute burst.  The retained N-major schedule still benefits
+        from moving its VGPR-disjoint A wrap reads into partition 2.
+        """
         cfg = self.config
         isTarget = (
             cfg.dualPeriodScale
@@ -1717,7 +1726,7 @@ class LogicalScheduler:
             else:
                 self._distribute_grs(gr_list, gr_slot_bounds, unrollId=uid)
 
-        self._move_du128_wrap_a_to_p2()
+        self._move_du128_nmajor_wrap_a_to_p2()
         return self._partitions[0]
 
     # ── Annotate dependencies ─────────────────────────────

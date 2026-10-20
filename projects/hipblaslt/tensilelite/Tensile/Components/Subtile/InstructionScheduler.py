@@ -554,6 +554,355 @@ def _nextPlacementSlot(placer):
     return 0
 
 
+def _cmsMxfp8PartitionIndex(mfmaModule, mfmas):
+    """Identify one quadrant of the integrated DU128 MXFP8 CMS profile."""
+    if getattr(mfmaModule, "scheduleProfile", "") != "cms-mxfp8-du128":
+        return None
+    if len(mfmas) != 16 or not all(
+            isinstance(inst, MXMFMAInstruction)
+            and inst.getIssueLatency() == 8 for inst in mfmas):
+        return None
+
+    source = mfmaModule.source
+    tileMaps = getattr(source, "vgpr_tile_maps", {})
+    if not {"A", "B", "SA", "SB"}.issubset(tileMaps):
+        return None
+
+    tileA = tuple(getattr(getattr(source, "tileA", None),
+                          "tileId_list", ()))
+    tileB = tuple(getattr(getattr(source, "tileB", None),
+                          "tileId_list", ()))
+    quadrants = {
+        ((0, 1, 2, 3), (0, 1, 2, 3)): 0,
+        ((4, 5, 6, 7), (0, 1, 2, 3)): 1,
+        ((0, 1, 2, 3), (4, 5, 6, 7)): 2,
+        ((4, 5, 6, 7), (4, 5, 6, 7)): 3,
+    }
+    return quadrants.get((tileA, tileB))
+
+
+def _groupLocalReadItems(emittedModule):
+    """Map one data LR module's emitted instructions to its logical tiles."""
+    tiles = emittedModule.source.tiles
+    tileIds = list(range(tiles.tileId_start, tiles.tileId_end))
+    if not tileIds or len(emittedModule.instructions) % len(tileIds):
+        return {}
+    readsPerTile = len(emittedModule.instructions) // len(tileIds)
+    return {
+        tile: emittedModule.instructions[
+            index * readsPerTile:(index + 1) * readsPerTile]
+        for index, tile in enumerate(tileIds)
+    }
+
+
+def _adjustVmcntForScheduledLoads(scheduled):
+    """Preserve a wait's original request set after moving younger VMEM."""
+    bufLoadCount = 0
+    for inst in scheduled.flatitems():
+        if _isBufferLoad(inst):
+            bufLoadCount += 1
+        elif _isWaitCnt(inst) and inst.vlcnt >= 0:
+            if getattr(inst, 'adjustVmcnt', True):
+                inst.vlcnt += bufLoadCount
+
+
+def _scheduleCmsMxfp8Partition(
+        emittedModules, mfmaIdx, pathOrders, mfmas):
+    """Apply the integrated FP8-CMS structure to one MXFP8 quadrant.
+
+    This is intentionally a complete profile rather than a stack of the
+    isolated experiments.  It co-schedules the M-major MFMA traversal with:
+
+      * first-use data/scale LDS reads,
+      * wait/MFMA/barrier separation,
+      * early SRD increments,
+      * deadline-clustered global traffic, and
+      * the reference schedule's compute-only middle and tail windows.
+
+    Returns None for every non-matching loop variant so the generic scheduler
+    remains unchanged.
+    """
+    partition = _cmsMxfp8PartitionIndex(
+        emittedModules[mfmaIdx], mfmas)
+    if partition is None:
+        return None
+
+    nonMfma = [
+        (mid, em) for mid, em in enumerate(emittedModules)
+        if mid != mfmaIdx
+    ]
+
+    def modules(opType, tensor=None):
+        return [
+            (mid, em) for mid, em in nonMfma
+            if em.opType == opType
+            and (tensor is None
+                 or getattr(em.source, "tensor", None) == tensor)
+        ]
+
+    def exactlyOne(opType, tensor=None):
+        matches = modules(opType, tensor)
+        return matches[0] if len(matches) == 1 else None
+
+    waitLr = exactlyOne("wait_lr")
+    grByTensor = {
+        tensor: exactlyOne("gr", tensor)
+        for tensor in ("A", "B", "SA", "SB")
+    }
+    grIncByTensor = {
+        tensor: exactlyOne("gr_inc", tensor)
+        for tensor in ("A", "B", "SA", "SB")
+    }
+    lrByTensor = {
+        tensor: modules("lr", tensor)
+        for tensor in ("A", "B", "SA", "SB")
+    }
+    lrIncByTensor = {
+        tensor: exactlyOne("lr_inc", tensor)
+        for tensor in ("A", "B", "SA", "SB")
+    }
+
+    # Match only the steady-state profile. NGLL/NLL and unrelated scaled
+    # kernels continue through the generic scheduler.
+    signatureOk = waitLr is not None
+    if partition == 0:
+        signatureOk = signatureOk and exactlyOne("wait_gr") is not None \
+            and exactlyOne("sync") is not None \
+            and grByTensor["A"] is not None \
+            and grByTensor["B"] is not None \
+            and len(lrByTensor["A"]) == 1 \
+            and (
+                (len(lrByTensor["SA"]) == 4
+                 and len(lrByTensor["SB"]) == 4)
+                or (not lrByTensor["SA"] and not lrByTensor["SB"])
+            )
+    elif partition == 1:
+        signatureOk = signatureOk and exactlyOne("wait_gr") is not None \
+            and exactlyOne("sync") is not None \
+            and grByTensor["A"] is not None \
+            and grByTensor["B"] is not None \
+            and grIncByTensor["A"] is not None \
+            and len(lrByTensor["B"]) == 1
+    elif partition == 2:
+        signatureOk = signatureOk \
+            and grByTensor["A"] is not None \
+            and grByTensor["B"] is not None \
+            and grIncByTensor["B"] is not None \
+            and not modules("lr") \
+            and not modules("wait_gr") \
+            and not modules("sync")
+    else:
+        signatureOk = signatureOk and exactlyOne("wait_gr") is not None \
+            and exactlyOne("sync") is not None \
+            and grByTensor["B"] is not None \
+            and grByTensor["SA"] is not None \
+            and grByTensor["SB"] is not None \
+            and grIncByTensor["SA"] is not None \
+            and grIncByTensor["SB"] is not None \
+            and len(lrByTensor["A"]) == 1 \
+            and len(lrByTensor["B"]) == 1 \
+            and lrIncByTensor["A"] is not None \
+            and lrIncByTensor["B"] is not None
+    if not signatureOk:
+        return None
+
+    prefix = []
+    after = [[] for _ in mfmas]
+    consumed = set()
+
+    def putItems(items, destination):
+        for inst in items:
+            assert id(inst) not in consumed
+            consumed.add(id(inst))
+            destination.append(inst)
+
+    def putModule(modulePair, destination):
+        assert modulePair is not None
+        putItems(modulePair[1].instructions, destination)
+
+    def putChunks(items, positions, width):
+        chunks = [
+            items[index:index + width]
+            for index in range(0, len(items), width)
+        ]
+        assert len(chunks) <= len(positions)
+        for chunk, position in zip(chunks, positions):
+            putItems(chunk, after[position])
+
+    unrollId = getattr(emittedModules[mfmaIdx], "unrollId", 0)
+    waitLrInsts = waitLr[1].instructions
+
+    if partition == 0:
+        # Current operands were read in the previous loop tail. Drain them
+        # before M0, but delay the DTL wait to M6 and put M7 between it and
+        # the barrier, exactly as in the CMS synchronization pattern.
+        for inst in waitLrInsts:
+            if _isWaitCnt(inst):
+                inst.dscnt = 0
+                inst.comment = "CMS: wait for prior-loop A/B reads"
+        putModule(waitLr, prefix)
+        putModule(exactlyOne("wait_gr"), after[6])
+        putModule(exactlyOne("sync"), after[7])
+
+        dataReads = _groupLocalReadItems(lrByTensor["A"][0][1])
+        if set(dataReads) != {4, 5, 6, 7}:
+            return None
+
+        if lrByTensor["SA"]:
+            scaleReads = {}
+            for tensor in ("SA", "SB"):
+                for _, em in lrByTensor[tensor]:
+                    scaleReads[(tensor, em.source.tiles.tileId_start)] = \
+                        list(em.instructions)
+            requiredScales = {
+                ("SA", 0), ("SA", 2), ("SA", 4), ("SA", 6),
+                ("SB", 0), ("SB", 2), ("SB", 4), ("SB", 6),
+            }
+            if set(scaleReads) != requiredScales:
+                return None
+            localReads = [
+                *scaleReads[("SA", 4)],
+                *scaleReads[("SB", 0)],
+                *dataReads[4],
+                *dataReads[5],
+                *scaleReads[("SA", 6)],
+                *dataReads[6],
+                *dataReads[7],
+                *scaleReads[("SB", 2)],
+                # These four scale groups are first consumed in p2.
+                *scaleReads[("SA", 0)],
+                *scaleReads[("SA", 2)],
+                *scaleReads[("SB", 4)],
+                *scaleReads[("SB", 6)],
+            ]
+        else:
+            localReads = [
+                inst for tile in (4, 5, 6, 7)
+                for inst in dataReads[tile]
+            ]
+        # Five DTL requests occupy the CMS GRA window after M8.
+        globalItems = [
+            *grByTensor["A"][1].instructions,
+            *grByTensor["B"][1].instructions,
+        ]
+        putChunks(globalItems, list(range(8, 13)), 2)
+        # Where the streams overlap, SALU/VMEM precedes LDS issue. This keeps
+        # DS/VALU out of the first post-MFMA slot, as required by the retained
+        # four-slot safety rule.
+        putChunks(localReads, list(range(7, 15)), 2)
+        for tensor in ("SA", "SB"):
+            if lrIncByTensor[tensor] is not None:
+                putModule(lrIncByTensor[tensor], after[14])
+
+    elif partition == 1:
+        # Only the last four C0 reads are p2-only scale groups.
+        for inst in waitLrInsts:
+            if _isWaitCnt(inst):
+                inst.dscnt = 4 if unrollId == 0 else 0
+                inst.comment = (
+                    "CMS: wait for p1 data/scales; leave 4 p2 scales"
+                    if unrollId == 0
+                    else "CMS: wait for p1 A reads")
+        putModule(waitLr, prefix)
+
+        # Finish the old-address B requests and expose A's SRD update early.
+        putChunks(grByTensor["B"][1].instructions, [0, 1, 2], 2)
+        putChunks(grIncByTensor["A"][1].instructions, [2, 3], 2)
+
+        # CMS places a matrix issue between the p1 wait and barrier.
+        putModule(exactlyOne("wait_gr"), after[4])
+        putModule(exactlyOne("sync"), after[5])
+
+        bReads = _groupLocalReadItems(lrByTensor["B"][0][1])
+        if set(bReads) != {4, 5, 6, 7}:
+            return None
+        localReads = [
+            inst for tile in (4, 5, 6, 7)
+            for inst in bReads[tile]
+        ]
+        putChunks(localReads, [5, 6, 7, 8], 2)
+
+        # Launch the first new-address A request at the reference deadline.
+        putModule(grByTensor["A"], after[10])
+
+    elif partition == 2:
+        for inst in waitLrInsts:
+            if _isWaitCnt(inst):
+                inst.dscnt = 0
+                inst.comment = "CMS: wait for p2 B reads"
+        putModule(waitLr, prefix)
+
+        # Preserve M28-M38 as a compute-only run globally, then cluster the
+        # remaining VMEM/address path at M39-M43 and leave M44-M47 clean.
+        putChunks(grByTensor["A"][1].instructions, [7, 8, 9], 2)
+        putChunks(grIncByTensor["B"][1].instructions, [9, 10], 2)
+        putChunks(grByTensor["B"][1].instructions, [10, 11], 2)
+
+    else:
+        # Current p3 operands are already resident. The DTL wait can cross M48;
+        # the barrier still precedes every next-buffer LDS read.
+        for inst in waitLrInsts:
+            if _isWaitCnt(inst):
+                inst.dscnt = 0
+                inst.comment = "CMS: final current-operand LDS drain"
+        putModule(waitLr, prefix)
+        putModule(exactlyOne("wait_gr"), prefix)
+        putModule(exactlyOne("sync"), after[0])
+
+        aReads = _groupLocalReadItems(lrByTensor["A"][0][1])
+        bReads = _groupLocalReadItems(lrByTensor["B"][0][1])
+        if set(aReads) != {0, 1, 2, 3} \
+                or set(bReads) != {0, 1, 2, 3}:
+            return None
+        localReads = [
+            inst
+            for tensorReads in (aReads, bReads)
+            for tile in (0, 1, 2, 3)
+            for inst in tensorReads[tile]
+        ]
+        putChunks(localReads, list(range(0, 8)), 2)
+        putModule(lrIncByTensor["A"], after[3])
+        putModule(lrIncByTensor["B"], after[7])
+
+        # B traffic starts at M52. Scale address work and requests follow in
+        # dependency order and finish by M62, leaving the final MFMA clean.
+        globalItems = [
+            *grByTensor["B"][1].instructions,
+            *grIncByTensor["SA"][1].instructions,
+            *grByTensor["SA"][1].instructions,
+            *grIncByTensor["SB"][1].instructions,
+            *grByTensor["SB"][1].instructions,
+        ]
+        putChunks(globalItems, list(range(4, 15)), 2)
+
+    expected = [
+        inst
+        for mid, em in nonMfma
+        for inst in em.instructions
+    ]
+    if len(consumed) != len(expected) \
+            or any(id(inst) not in consumed for inst in expected):
+        missing = [
+            f"{em.opType}:{type(inst).__name__}"
+            for _, em in nonMfma
+            for inst in em.instructions
+            if id(inst) not in consumed
+        ]
+        raise AssertionError(
+            "integrated CMS profile left instructions unscheduled: "
+            + ", ".join(missing))
+
+    scheduled = Module()
+    for inst in prefix:
+        scheduled.add(inst)
+    for index, mfma in enumerate(mfmas):
+        scheduled.add(mfma)
+        for inst in after[index]:
+            scheduled.add(inst)
+    _adjustVmcntForScheduledLoads(scheduled)
+    return scheduled
+
+
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
     """Extract non-MFMA dependency paths using only EmittedModule.before links.
 
@@ -705,6 +1054,11 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
 
     mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
     mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
+    cmsMxfp8 = _scheduleCmsMxfp8Partition(
+        emittedModules, mfmaIdx, pathOrders, mfmas)
+    if cmsMxfp8 is not None:
+        return cmsMxfp8
+
     p0Split = None
     if mfmas and all(
             isinstance(inst, MXMFMAInstruction)
@@ -834,14 +1188,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     _emitPreMfma(scheduled)
     scheduled.add(placer.assemble(mfmas))
 
-    # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
-    # that the scheduler placed before it within this subIterK.
-    bufLoadCount = 0
-    for inst in scheduled.flatitems():
-        if _isBufferLoad(inst):
-            bufLoadCount += 1
-        elif _isWaitCnt(inst) and inst.vlcnt >= 0:
-            if getattr(inst, 'adjustVmcnt', True):
-                inst.vlcnt += bufLoadCount
+    # Post-pass: adjust waits for buffer_loads moved before them.
+    _adjustVmcntForScheduledLoads(scheduled)
 
     return scheduled
