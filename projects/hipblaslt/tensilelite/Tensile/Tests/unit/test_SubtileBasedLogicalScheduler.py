@@ -3424,7 +3424,7 @@ class TestInstructionSchedulerWrapPrefetch:
 class TestIntegration:
 
     def test_du128_mxfp8_integrated_cms_schedule(self):
-        """The unified target stream enforces CMS local-read deadlines."""
+        """The unified target stream enforces CMS read/request deadlines."""
         from rocisa.instruction import (
             GlobalReadInstruction, LocalReadInstruction,
             MXMFMAInstruction, SBarrier, SWaitCnt)
@@ -3491,11 +3491,9 @@ class TestIntegration:
                 assert sum(isinstance(item, MXMFMAInstruction)
                            for item in global_items) == 64
                 prefix, buckets = split_mfma_intervals(global_items)
-                assert len(prefix) == 2
+                assert len(prefix) == 1
                 assert isinstance(prefix[0], SWaitCnt) \
                     and prefix[0].dscnt == 0
-                assert getattr(prefix[1], "isWaitGr", False) \
-                    and prefix[1].vlcnt == 14
 
                 barriers = [
                     position
@@ -3503,7 +3501,7 @@ class TestIntegration:
                     for inst in bucket
                     if isinstance(inst, SBarrier)
                 ]
-                assert barriers == [0, 13, 48]
+                assert barriers == [7, 21, 47]
 
                 waitGr = [
                     (position, inst.vlcnt)
@@ -3511,7 +3509,7 @@ class TestIntegration:
                     for inst in bucket
                     if getattr(inst, "isWaitGr", False)
                 ]
-                assert waitGr == [(12, 15), (47, 16)]
+                assert waitGr == [(46, 0)]
 
                 localWaits = [
                     position
@@ -3552,10 +3550,23 @@ class TestIntegration:
                     [4, 4, 5, 5, 24, 25, 26, 27]
                     if ui == 0 else [])
 
+                def globalReadPositions(tensor):
+                    return [
+                        position
+                        for position, bucket in enumerate(buckets)
+                        for inst in bucket
+                        if isinstance(inst, GlobalReadInstruction)
+                        and inst.comment.startswith(tensor + " ")
+                    ]
+
+                assert globalReadPositions("A") == \
+                    [8, 9, 10, 11, 12, 23, 24, 25]
+                assert globalReadPositions("B") == \
+                    [26, 27, 39, 40, 41, 42, 43, 53]
                 assert sum(
                     isinstance(inst, GlobalReadInstruction)
                     for inst in global_items) == (18 if ui == 0 else 16)
-                assert len(global_items) == (170 if ui == 0 else 147)
+                assert len(global_items) == (168 if ui == 0 else 145)
         finally:
             sched.deallocVgprTiles(writer)
 
