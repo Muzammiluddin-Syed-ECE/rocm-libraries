@@ -3239,7 +3239,7 @@ class TestInstructionSchedulerWrapPrefetch:
         )
 
         # Split only after complete m0/buffer-load pairs: GR[0:2],
-        # DS[0:8], GR[2:4], then DS[8:16].
+        # DS[0:8], GR[2:4], then DS[8:16], using three MFMA slots.
         assert items[mfma_positions[0] + 1].comment == "m0-0"
         clustered = [
             inst.comment for inst in items
@@ -3273,7 +3273,7 @@ class TestInstructionSchedulerWrapPrefetch:
         ) < mfma_positions[-1]
         assert sum(len(em.instructions) for em in modules) == len(items)
 
-    def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
+    def test_three_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
         from rocisa import rocIsa
         from rocisa.container import DSModifiers, vgpr
@@ -3291,13 +3291,13 @@ class TestInstructionSchedulerWrapPrefetch:
             ds=DSModifiers(offset=0))
         valu = VXorB32(
             dst=vgpr(2), src0=vgpr(2), src1=vgpr(3))
-        rules = _SchedulingRules(totalSlots=8)
+        rules = _SchedulingRules(totalSlots=6)
         placer = _SlotPlacer(
             intervals=2,
             numModules=2,
             pathOrders=[[0], [1]],
             validators=[rules.noDsReadOrValuInFirstSlot],
-            slotsPerInterval=4)
+            slotsPerInterval=3)
 
         placer.placePath([(0, ds_read)])
         placer.placePath([(1, valu)])
@@ -3307,8 +3307,8 @@ class TestInstructionSchedulerWrapPrefetch:
             for pos, slot in enumerate(placer._placed)
             for _, inst in slot
         }
-        assert positions[id(ds_read)] % 4 != 0
-        assert positions[id(valu)] % 4 != 0
+        assert positions[id(ds_read)] % 3 != 0
+        assert positions[id(valu)] % 3 != 0
 
 
 class TestIntegration:
