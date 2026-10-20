@@ -526,6 +526,47 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     return order, prefixInsts, payloadOrder, payloadInsts
 
 
+def _orderPartitionZeroScaleDataReads(p0Split, emittedModules):
+    """Order p0 reads by the first partition that consumes their operands.
+
+    The exact four-wave dual-period MXFP8 path has eight B data reads and four
+    reads for each scale tensor.  Put the p1-critical scale groups next to the
+    corresponding B groups while preserving both reads of each B tile:
+
+      SA0, SB4, B4x2, B5x2, SB6, B6x2, B7x2,
+      SA2, SA4, SA6, SB0, SB2
+
+    Scale-buffer swaps and any other payload instructions remain after all
+    reads, in their original order.  Returning None leaves unrelated paths on
+    their legacy module ordering.
+    """
+    reads = {"B": [], "SA": [], "SB": []}
+    nonReads = []
+    for mid, inst in p0Split[3]:
+        em = emittedModules[mid]
+        tensor = getattr(em.source, "tensor", None)
+        if _isDsRead(inst) and tensor in reads:
+            reads[tensor].append((mid, inst))
+        else:
+            nonReads.append((mid, inst))
+
+    if len(reads["B"]) != 8 or len(reads["SA"]) != 4 \
+            or len(reads["SB"]) != 4:
+        return None
+
+    b = reads["B"]
+    sa = reads["SA"]
+    sb = reads["SB"]
+    orderedReads = [
+        sa[0], sb[2],
+        *b[0:4],
+        sb[3],
+        *b[4:8],
+        sa[1], sa[2], sa[3], sb[0], sb[1],
+    ]
+    return orderedReads + nonReads
+
+
 def _splitItemsAfterHalf(pathInsts, predicate):
     """Split an instruction path after half its matching instructions."""
     if not pathInsts:
@@ -714,9 +755,18 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     if p0Split is None:
         _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
 
+    p0Payload = p0Split[3] if p0Split is not None else None
+    p0PayloadReordered = False
+    if p0Split is not None:
+        reordered = _orderPartitionZeroScaleDataReads(
+            p0Split, emittedModules)
+        if reordered is not None:
+            p0Payload = reordered
+            p0PayloadReordered = True
+
     slotsPerInterval = 4 if p0Split is not None else 2
     placementPathOrders = list(pathOrders)
-    if p0Split is not None:
+    if p0Split is not None and not p0PayloadReordered:
         placementPathOrders.append(p0Split[2])
 
     def _emitPreMfma(result):
@@ -736,7 +786,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         for m in mfmas:
             result.add(m)
         if p0Split is not None:
-            for _, inst in p0Split[3]:
+            for _, inst in p0Payload:
                 result.add(inst)
         for order in pathOrders:
             for mid in order:
@@ -806,7 +856,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
                 _flattenPath(order, emittedModules), _isBufferLoad)
             for order, _ in paths
         ]
-        p0Halves = _splitItemsAfterHalf(p0Split[3], _isDsRead)
+        p0Halves = _splitItemsAfterHalf(p0Payload, _isDsRead)
 
         def _placePacked(pathInsts):
             if not pathInsts:
@@ -828,7 +878,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         _placeRegularPaths()
         if p0Split is not None:
             rules.resetPath()
-            placer.placePath(p0Split[3])
+            placer.placePath(p0Payload)
 
     scheduled = Module()
     _emitPreMfma(scheduled)
