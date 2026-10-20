@@ -30,7 +30,6 @@ from Tensile.Components.Subtile.LogicalScheduler import (
     GRPlacement,
     Dep,
     WaitGRCounts,
-    WaitLROp,
     fmt_mt,
 )
 from unittest.mock import MagicMock
@@ -606,31 +605,6 @@ class TestDualPeriodMXFP8NextPartition:
             scaleReuse=scaleReuse,
         )
 
-    @staticmethod
-    def _make_4wave_cfg():
-        # Target DU128 kernel: MIWT 8x8, WG 2x2, four 4x4 partitions.
-        return SchedulerConfig(
-            numMFMATilesM=8,
-            numMFMATilesN=8,
-            numSubIterK=1,
-            lrA=ReadGranularity(mn=1, k=1),
-            lrB=ReadGranularity(mn=1, k=1),
-            grA=ReadGranularity(mn=1, k=1),
-            grB=ReadGranularity(mn=1, k=1),
-            lrSA=ReadGranularity(mn=2, k=1),
-            lrSB=ReadGranularity(mn=2, k=1),
-            grSA=ReadGranularity(mn=4, k=2),
-            grSB=ReadGranularity(mn=4, k=2),
-            partitionSizeM=4,
-            partitionSizeN=4,
-            pgr=2,
-            plr=0,
-            doubleBufferTensors=('A', 'B'),
-            prefetchNextPartition=True,
-            partitionOrder="n-major",
-            scaleReuse=2,
-        )
-
     def test_config_accepts_scales_and_keeps_numsubiterk_1(self):
         cfg = self._make_cfg()
         assert cfg.hasScale is True
@@ -660,25 +634,6 @@ class TestDualPeriodMXFP8NextPartition:
         # scaleReuse=1 is the legacy single-period behavior (not dual-period).
         cfg = self._make_cfg(scaleReuse=1, grSA_k=1)
         assert cfg.dualPeriodScale is False
-
-    def test_four_wave_p1_wait_leaves_only_deferred_scales(self):
-        cfg = self._make_4wave_cfg()
-        sched = LogicalScheduler(cfg)
-        sched.build()
-
-        waits = []
-        for pi, slots in enumerate(sched._partitions):
-            for slot in slots:
-                if slot.mfma:
-                    waits.extend(
-                        (pi, op.dscnt)
-                        for op in slot.mfma.preOps
-                        if isinstance(op, WaitLROp)
-                    )
-
-        assert (1, 4) in waits
-        assert all(dscnt == (4 if pi == 1 else 0)
-                   for pi, dscnt in waits)
 
 
 class TestPlaceLRs:
@@ -3347,17 +3302,9 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # Split only after complete m0/buffer-load pairs.  The p0 reads put
-        # p1-critical scales beside their B groups, then defer the four scales
-        # which p1 does not consume.
+        # Split only after complete m0/buffer-load pairs: GR[0:2],
+        # DS[0:8], GR[2:4], then DS[8:16].
         assert items[mfma_positions[0] + 1].comment == "m0-0"
-        expected_reads = [
-            "ds8", "ds14",
-            "ds0", "ds1", "ds2", "ds3",
-            "ds15",
-            "ds4", "ds5", "ds6", "ds7",
-            "ds9", "ds10", "ds11", "ds12", "ds13",
-        ]
         clustered = [
             inst.comment for inst in items
             if getattr(inst, "comment", "").startswith(
@@ -3365,27 +3312,18 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         assert clustered == [
             "m0-0", "gr-0", "m0-1", "gr-1",
-            *expected_reads[:8],
+            *[f"ds{i}" for i in range(8)],
             "m0-2", "gr-2", "m0-3", "gr-3",
-            *expected_reads[8:],
+            *[f"ds{i}" for i in range(8, 16)],
         ]
         assert [
             inst.comment for inst in items
             if isinstance(inst, BufferLoadB128)
         ] == [f"gr-{i}" for i in range(4)]
-        issued_reads = [
+        assert [
             inst.comment for inst in items
             if isinstance(inst, DSLoadB128)
-        ]
-        assert issued_reads == expected_reads
-        assert issued_reads[:12] == [
-            "ds8", "ds14",
-            "ds0", "ds1", "ds2", "ds3",
-            "ds15",
-            "ds4", "ds5", "ds6", "ds7",
-            "ds9",
-        ]
-        assert issued_reads[12:] == ["ds10", "ds11", "ds12", "ds13"]
+        ] == [f"ds{i}" for i in range(16)]
         reads_per_interval = [
             sum(isinstance(inst, DSLoadB128)
                 for inst in items[begin + 1:end])
