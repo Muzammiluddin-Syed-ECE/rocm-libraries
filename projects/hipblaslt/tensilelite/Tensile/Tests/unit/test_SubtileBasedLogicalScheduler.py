@@ -3563,6 +3563,8 @@ class TestIntegration:
                     [8, 9, 10, 11, 12, 23, 24, 25]
                 assert globalReadPositions("B") == \
                     [26, 27, 39, 40, 41, 42, 43, 53]
+                assert globalReadPositions("SA") == ([48] if ui == 0 else [])
+                assert globalReadPositions("SB") == ([52] if ui == 0 else [])
 
                 writeSwapPositions = [
                     position
@@ -3590,15 +3592,19 @@ class TestIntegration:
                     if "CMS earliest legal" in (getattr(inst, "comment", "") or "")
                 ]
                 assert pointerPositions == [11, 11, 40, 40]
-                sbScaleAddressPositions = [
-                    position
-                    for position, bucket in enumerate(buckets)
-                    for inst in bucket
-                    if "finish SB scale address" in (
-                        getattr(inst, "comment", "") or "")
-                ]
-                assert sbScaleAddressPositions == (
-                    [58, 59, 59, 59] if ui == 0 else [])
+                for tensor, expected in (
+                        ("SA", [44, 44, 45, 45]),
+                        ("SB", [49, 49, 50, 50])):
+                    scaleAddressPositions = [
+                        position
+                        for position, bucket in enumerate(buckets)
+                        for inst in bucket
+                        if f"{tensor} address" in (
+                            getattr(inst, "comment", "") or "")
+                    ]
+                    assert scaleAddressPositions == (
+                        expected if ui == 0 else [])
+                assert max(len(bucket) for bucket in buckets) <= 4
                 assert sum(
                     isinstance(inst, GlobalReadInstruction)
                     for inst in global_items) == (18 if ui == 0 else 16)

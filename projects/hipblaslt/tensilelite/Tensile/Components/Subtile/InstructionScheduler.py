@@ -980,7 +980,14 @@ def _scheduleCmsMxfp8LocalSync(
     }
     grIncA = exactlyOne(1, "gr_inc", "A")
     grIncB = exactlyOne(2, "gr_inc", "B")
-    grIncSB = exactlyOne(3, "gr_inc", "SB")
+    scaleGr = {
+        tensor: exactlyOne(3, "gr", tensor)
+        for tensor in ("SA", "SB")
+    }
+    scaleGrInc = {
+        tensor: exactlyOne(3, "gr_inc", tensor)
+        for tensor in ("SA", "SB")
+    }
 
     scaleReads = {}
     for tensor in ("SA", "SB"):
@@ -1006,8 +1013,9 @@ def _scheduleCmsMxfp8LocalSync(
         p0WaitGr, p0Barrier,
         p1WaitLr, p1WaitGr, p1Barrier,
         p2WaitLr, p3WaitLr, p3WaitGr, p3Barrier,
-        grIncA, grIncB, grIncSB,
+        grIncA, grIncB,
         *dataGr["A"], *dataGr["B"],
+        *scaleGr.values(), *scaleGrInc.values(),
         *scaleReads.values(), *scaleIncs,
     ]
     relocatedIds = {
@@ -1141,14 +1149,37 @@ def _scheduleCmsMxfp8LocalSync(
     after[40].extend(bPointer)
     after[57][0:0] = [*aWriteSwap, *bWriteSwap]
 
-    # C0's SB scale-address update used to extend through M61 and clobber SCC
-    # after the desired M60 loop compare. Preserve its instruction order but
-    # finish all SCC-writing SALU/XOR work by M59; the SB request remains M62.
-    sbPointer = list(grIncSB.instructions)
-    for inst in sbPointer:
-        appendMetadata(inst, "CMS: finish SB scale address before M60 control")
-    after[58].extend(sbPointer[:2])
-    after[59].extend(sbPointer[2:])
+    def placeVisibleChunks(em, positions, metadata):
+        """Split one module by real instructions while retaining TextBlocks."""
+        chunks = [[] for _ in positions]
+        chunk = 0
+        visible = 0
+        for inst in em.instructions:
+            isText = type(inst).__name__ == "TextBlock"
+            if not isText and visible == 2 and chunk + 1 < len(chunks):
+                chunk += 1
+                visible = 0
+            chunks[chunk].append(inst)
+            if not isText:
+                appendMetadata(inst, metadata)
+                visible += 1
+        for position, items in zip(positions, chunks):
+            # SALU/VMEM should lead the post-MFMA interval when it shares one
+            # with LDS traffic.
+            after[position][0:0] = items
+
+    # Overlay C0-only scale traffic into C1's otherwise empty/slack windows.
+    # Both scale requests stay younger than the M46 data drain. Their address
+    # updates finish before their request, before M60 control, and no bucket
+    # grows beyond the four-instruction target.
+    placeVisibleChunks(
+        scaleGrInc["SA"], (44, 45),
+        "CMS C0 scale overlay: SA address before M48 request")
+    after[48][0:0] = scaleGr["SA"].instructions
+    placeVisibleChunks(
+        scaleGrInc["SB"], (49, 50),
+        "CMS C0 scale overlay: SB address before M52 request")
+    after[52][0:0] = scaleGr["SB"].instructions
 
     for em in scaleIncs:
         tensor = getattr(em.source, "tensor", "scale")
