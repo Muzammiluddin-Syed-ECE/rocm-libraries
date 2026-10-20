@@ -1406,7 +1406,10 @@ def mainLoop(writer, kernel):
   if schedulerPartitionPrefetch:
       assert schedulerPlr == 0, \
           "dual-period MXFP8 subtile kernel requires PrefetchLocalRead=0"
-      schedulerPartitionOrder = "n-major"
+      # Match the hand-scheduled CMS traversal:
+      # (M0,N0) -> (M1,N0) -> (M0,N1) -> (M1,N1).
+      # Partition-directed local reads follow this order automatically.
+      schedulerPartitionOrder = "m-major"
       schedulerDoubleBuffer = ('A', 'B')
       # Split the wave's MFMA-tile grid in half along each dim -> a 2x2 partition
       # grid (8x4 -> 4x2 for the 8-wave MI, 8x8 -> 4x4 for the 4-wave MI).

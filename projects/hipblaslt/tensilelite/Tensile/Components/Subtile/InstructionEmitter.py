@@ -76,6 +76,12 @@ def _zigzag_order(rows, cols):
                 result.append((r, c))
     return result
 
+
+def _cms_mx_order(aTiles, bTiles):
+    """Traverse A fastest inside each B tile, matching the FP8 CMS kernel."""
+    return [(a, b) for b in bTiles for a in aTiles]
+
+
 class InstructionEmitter:
     """Emits GPU instructions for each opType in the LogicalScheduler output.
 
@@ -162,7 +168,21 @@ class InstructionEmitter:
         bTiles = placement.tileB.tileId_list
 
         hasWmmaSourceCache = self.writer.states.asmCaps.get("HasWMMA_V3", False)
-        if hasWmmaSourceCache and len(aTiles) > 1 and len(bTiles) > 1:
+        useCmsMxOrder = (
+            self.hasScale
+            and getattr(self.config, 'dualPeriodScale', False)
+            and self.config.prefetchNextPartition
+            and self.config.partitionOrder == "m-major"
+            and len(aTiles) == 4
+            and len(bTiles) == 4
+        )
+        if useCmsMxOrder:
+            # Co-design the MFMA traversal with the partition-prefetch order.
+            # This produces the CMS sequence A0B0,A1B0,... and lets the
+            # logical scheduler derive next-partition reads from the same
+            # M-major quadrant traversal.
+            abPairs = _cms_mx_order(aTiles, bTiles)
+        elif hasWmmaSourceCache and len(aTiles) > 1 and len(bTiles) > 1:
             # Zigzag ordering: traverse the AxB tile grid in snake order so
             # every consecutive WMMA pair shares exactly one operand (A or B),
             # guaranteeing a VGPR source-cache hit at every step.
