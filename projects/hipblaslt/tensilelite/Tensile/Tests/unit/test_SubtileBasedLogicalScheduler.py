@@ -14,7 +14,6 @@ Organized by pass:
   11. BuildPreloop / BuildNGLL / BuildNLL — Loop variant construction
   12. Integration    — Full pipeline with real instructions
 """
-from copy import deepcopy
 import pytest
 from Tensile.Components.Subtile.Kernel import (
     TileInfo, AB_B8, AB_B16, AB_B16_W32, AB_B4,
@@ -3425,12 +3424,12 @@ class TestInstructionSchedulerWrapPrefetch:
 class TestIntegration:
 
     def test_du128_mxfp8_integrated_cms_schedule(self):
-        """The target loop reproduces the CMS phase boundaries in both paths."""
+        """The unified target stream enforces CMS local-read deadlines."""
         from rocisa.instruction import (
             GlobalReadInstruction, LocalReadInstruction,
             MXMFMAInstruction, SBarrier, SWaitCnt)
         from Tensile.Components.Subtile.InstructionScheduler import (
-            instructionSchedule, instructionScheduleCmsMxfp8Loop)
+            instructionScheduleCmsMxfp8Loop)
 
         kernel = create_kernel_fp8(256, 256, [2, 2], depthU=128)
         kernel["ProblemType"]["MXBlockA"] = 32
@@ -3455,7 +3454,7 @@ class TestIntegration:
                 index for index, inst in enumerate(items)
                 if isinstance(inst, MXMFMAInstruction)
             ]
-            assert len(positions) == 16
+            assert len(positions) == 64
             prefix = items[:positions[0]]
             trailing = [
                 items[begin + 1:(
@@ -3482,7 +3481,6 @@ class TestIntegration:
                     for group in partition
                     for em in group)
 
-                partition_loop = deepcopy(emitted_loop)
                 global_schedule = instructionScheduleCmsMxfp8Loop(
                     emitted_loop)
                 assert global_schedule is not None
@@ -3490,61 +3488,74 @@ class TestIntegration:
                     item for item in global_schedule.flatitems()
                     if not isinstance(item, TextBlock)
                 ]
-                scheduled = [
-                    list(instructionSchedule(partition[0]).flatitems())
-                    for partition in partition_loop
-                ]
-                partition_items = [
-                    item for items in scheduled for item in items
-                    if not isinstance(item, TextBlock)
-                ]
-                assert [str(item) for item in global_items] == [
-                    str(item) for item in partition_items
-                ]
                 assert sum(isinstance(item, MXMFMAInstruction)
                            for item in global_items) == 64
-                phases = [split_mfma_intervals(items)
-                          for items in scheduled]
+                prefix, buckets = split_mfma_intervals(global_items)
+                assert len(prefix) == 2
+                assert isinstance(prefix[0], SWaitCnt) \
+                    and prefix[0].dscnt == 0
+                assert getattr(prefix[1], "isWaitGr", False) \
+                    and prefix[1].vlcnt == 14
 
-                p0_prefix, p0 = phases[0]
-                assert len(p0_prefix) == 1 \
-                    and isinstance(p0_prefix[0], SWaitCnt)
-                assert any(getattr(inst, "isWaitGr", False)
-                           for inst in p0[6])
-                assert isinstance(p0[7][0], SBarrier)
-                assert sum(
-                    isinstance(inst, LocalReadInstruction)
-                    for bucket in p0[7:15] for inst in bucket
-                ) == (16 if ui == 0 else 8)
-                assert all(not bucket for bucket in p0[:6])
-                assert not p0[15]
+                barriers = [
+                    position
+                    for position, bucket in enumerate(buckets)
+                    for inst in bucket
+                    if isinstance(inst, SBarrier)
+                ]
+                assert barriers == [0, 13, 48]
 
-                p1_prefix, p1 = phases[1]
-                assert p1_prefix[0].dscnt == (4 if ui == 0 else 0)
-                assert any(getattr(inst, "isWaitGr", False)
-                           for inst in p1[4])
-                assert isinstance(p1[5][0], SBarrier)
-                assert all(not bucket for bucket in p1[11:])
+                waitGr = [
+                    (position, inst.vlcnt)
+                    for position, bucket in enumerate(buckets)
+                    for inst in bucket
+                    if getattr(inst, "isWaitGr", False)
+                ]
+                assert waitGr == [(12, 15), (47, 16)]
 
-                _, p2 = phases[2]
-                assert all(not bucket for bucket in p2[:7])
-                assert all(not bucket for bucket in p2[12:])
-                assert sum(isinstance(inst, GlobalReadInstruction)
-                           for bucket in p2[7:12] for inst in bucket) == 5
+                localWaits = [
+                    position
+                    for position, bucket in enumerate(buckets)
+                    for inst in bucket
+                    if isinstance(inst, SWaitCnt)
+                    and not getattr(inst, "isWaitGr", False)
+                    and inst.dscnt >= 0
+                ]
+                assert localWaits == ([6, 20, 31] if ui == 0 else [6, 20])
 
-                p3_prefix, p3 = phases[3]
-                assert len(p3_prefix) == 2
-                assert isinstance(p3[0][0], SBarrier)
-                p3_reads = [
-                    inst.comment
-                    for bucket in p3
+                def readPositions(tensor, begin, end):
+                    return [
+                        position
+                        for position in range(begin, end)
+                        for inst in buckets[position]
+                        if isinstance(inst, LocalReadInstruction)
+                        and inst.comment.startswith(tensor + " ")
+                    ]
+
+                assert readPositions("A", 0, 4) == \
+                    [0, 0, 1, 1, 2, 2, 3, 3]
+                assert readPositions("B", 13, 17) == \
+                    [13, 13, 14, 14, 15, 15, 16, 16]
+                assert readPositions("A", 48, 52) == \
+                    [48, 48, 49, 49, 50, 50, 51, 51]
+                assert readPositions("B", 52, 56) == \
+                    [52, 52, 53, 53, 54, 54, 55, 55]
+
+                scalePositions = [
+                    position
+                    for position, bucket in enumerate(buckets)
                     for inst in bucket
                     if isinstance(inst, LocalReadInstruction)
+                    and inst.comment.startswith(("SA ", "SB "))
                 ]
-                assert len(p3_reads) == 16
-                assert all(comment.startswith("A ") for comment in p3_reads[:8])
-                assert all(comment.startswith("B ") for comment in p3_reads[8:])
-                assert not p3[15]
+                assert scalePositions == (
+                    [4, 4, 5, 5, 24, 25, 26, 27]
+                    if ui == 0 else [])
+
+                assert sum(
+                    isinstance(inst, GlobalReadInstruction)
+                    for inst in global_items) == (18 if ui == 0 else 16)
+                assert len(global_items) == (170 if ui == 0 else 147)
         finally:
             sched.deallocVgprTiles(writer)
 

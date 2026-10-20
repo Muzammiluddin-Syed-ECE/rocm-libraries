@@ -903,13 +903,199 @@ def _scheduleCmsMxfp8Partition(
     return scheduled
 
 
+def _splitCmsGlobalStream(scheduledGroups):
+    """Return one 64-MFMA stream as (mfmas, prefix, post-MFMA buckets)."""
+    items = [
+        inst
+        for scheduled in scheduledGroups
+        for inst in scheduled.flatitems()
+    ]
+    mfmas = []
+    prefix = []
+    after = []
+    current = -1
+    for inst in items:
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            mfmas.append(inst)
+            after.append([])
+            current += 1
+        elif current < 0:
+            prefix.append(inst)
+        else:
+            after[current].append(inst)
+    if len(mfmas) != 64:
+        raise AssertionError(
+            f"CMS MXFP8 global stream has {len(mfmas)} MFMAs, expected 64")
+    return mfmas, prefix, after
+
+
+def _scheduleCmsMxfp8LocalSync(
+        groups, scheduledGroups, originalVmcnt):
+    """Overlay the first CMS-fidelity stage on the unified 64-MFMA stream.
+
+    The existing request phasing does not make the p1/p2 operands available
+    early enough to copy the reference's barrier positions.  Keep the counted
+    VMEM waits before those operands, issue one independent MFMA before each
+    barrier, and then place the A/B reads in the reference M0-M3/M13-M16
+    windows.  Their LDS drains move to M6/M20.  C0-only scale reads are split
+    by first use: p1 scales drain at M6 and p2 scales drain at M31.
+    """
+    mfmas, prefix, after = _splitCmsGlobalStream(scheduledGroups)
+
+    def modules(partition, opType, tensor=None):
+        return [
+            em for em in groups[partition]
+            if em.opType == opType
+            and (tensor is None
+                 or getattr(em.source, "tensor", None) == tensor)
+        ]
+
+    def exactlyOne(partition, opType, tensor=None):
+        matches = modules(partition, opType, tensor)
+        if len(matches) != 1:
+            raise AssertionError(
+                f"CMS MXFP8 P{partition} expected one {opType}/{tensor}, "
+                f"found {len(matches)}")
+        return matches[0]
+
+    p0A = exactlyOne(0, "lr", "A")
+    p1B = exactlyOne(1, "lr", "B")
+    p0WaitGr = exactlyOne(0, "wait_gr")
+    p0Barrier = exactlyOne(0, "sync")
+    p1WaitLr = exactlyOne(1, "wait_lr")
+    p1WaitGr = exactlyOne(1, "wait_gr")
+    p1Barrier = exactlyOne(1, "sync")
+    p2WaitLr = exactlyOne(2, "wait_lr")
+    p3WaitLr = exactlyOne(3, "wait_lr")
+
+    scaleReads = {}
+    for tensor in ("SA", "SB"):
+        for em in modules(0, "lr", tensor):
+            scaleReads[(tensor, em.source.tiles.tileId_start)] = em
+    hasScaleReads = any(em.instructions for em in scaleReads.values())
+    if hasScaleReads and set(scaleReads) != {
+            ("SA", 0), ("SA", 2), ("SA", 4), ("SA", 6),
+            ("SB", 0), ("SB", 2), ("SB", 4), ("SB", 6)}:
+        raise AssertionError("CMS MXFP8 scale-read signature changed")
+
+    scaleIncs = [
+        em for tensor in ("SA", "SB")
+        for em in modules(0, "lr_inc", tensor)
+    ]
+    relocatedModules = [
+        p0A, p1B,
+        p0WaitGr, p0Barrier,
+        p1WaitLr, p1WaitGr, p1Barrier,
+        p2WaitLr, p3WaitLr,
+        *scaleReads.values(), *scaleIncs,
+    ]
+    relocatedIds = {
+        id(inst)
+        for em in relocatedModules
+        for inst in em.instructions
+    }
+    prefix = [inst for inst in prefix if id(inst) not in relocatedIds]
+    after = [
+        [inst for inst in bucket if id(inst) not in relocatedIds]
+        for bucket in after
+    ]
+
+    def appendModule(em, destination):
+        destination.extend(em.instructions)
+
+    def setLocalWait(em, comment):
+        for inst in em.instructions:
+            if _isWaitCnt(inst):
+                inst.dscnt = 0
+                inst.comment = comment
+
+    # The p0 VMEM wait must still precede the A reads. M0 is independent, so
+    # it covers part of the inter-wave barrier latency.
+    for inst in p0WaitGr.instructions:
+        if _isWaitCnt(inst):
+            inst.vlcnt = originalVmcnt[id(inst)]
+    appendModule(p0WaitGr, prefix)
+    appendModule(p0Barrier, after[0])
+
+    aReads = _groupLocalReadItems(p0A)
+    bReads = _groupLocalReadItems(p1B)
+    if set(aReads) != {4, 5, 6, 7} \
+            or set(bReads) != {4, 5, 6, 7}:
+        raise AssertionError("CMS MXFP8 data-read signature changed")
+    for position, tile in zip(range(0, 4), range(4, 8)):
+        after[position].extend(aReads[tile])
+
+    if hasScaleReads:
+        # These four scale groups feed p1 (M16) and share its M6 drain.
+        appendModule(scaleReads[("SA", 4)], after[4])
+        appendModule(scaleReads[("SB", 0)], after[4])
+        appendModule(scaleReads[("SA", 6)], after[5])
+        appendModule(scaleReads[("SB", 2)], after[5])
+
+    setLocalWait(p1WaitLr, "CMS: drain A and p1 scales before M7")
+    appendModule(p1WaitLr, after[6])
+
+    # Move the second readiness wait ahead of the B reads. M13 separates it
+    # from the barrier, after which B4-B7 occupy the reference read window.
+    for inst in p1WaitGr.instructions:
+        if _isWaitCnt(inst):
+            inst.vlcnt = originalVmcnt[id(inst)]
+    appendModule(p1WaitGr, after[12])
+    appendModule(p1Barrier, after[13])
+    for position, tile in zip(range(13, 17), range(4, 8)):
+        after[position].extend(bReads[tile])
+
+    setLocalWait(p2WaitLr, "CMS: drain B reads before M21")
+    appendModule(p2WaitLr, after[20])
+
+    if hasScaleReads:
+        # The remaining scales are first consumed by p2 (M32).
+        for position, key in zip(
+                range(24, 28),
+                (("SA", 0), ("SA", 2), ("SB", 4), ("SB", 6))):
+            appendModule(scaleReads[key], after[position])
+        for em in scaleIncs:
+            appendModule(em, after[28])
+        setLocalWait(p3WaitLr, "CMS: drain p2 scales before M32")
+        appendModule(p3WaitLr, after[31])
+        retiredIds = set()
+    else:
+        # C1 has no scale payload, so the former p3-entry LDS drain is empty
+        # work after the A/B M6/M20 drains and is deliberately retired.
+        retiredIds = {id(inst) for inst in p3WaitLr.instructions}
+
+    result = Module("CMS MXFP8 local-read/synchronization schedule")
+    for inst in prefix:
+        result.add(inst)
+    for index, mfma in enumerate(mfmas):
+        result.add(mfma)
+        for inst in after[index]:
+            result.add(inst)
+
+    expectedIds = {
+        id(inst)
+        for group in groups
+        for em in group
+        if em.opType != "mfma"
+        for inst in em.instructions
+    }
+    actualIds = [
+        id(inst) for inst in result.flatitems()
+        if not isinstance(inst, (MFMAInstruction, MXMFMAInstruction))
+    ]
+    if len(actualIds) != len(set(actualIds)):
+        raise AssertionError("CMS MXFP8 global schedule duplicated instructions")
+    missing = expectedIds - set(actualIds) - retiredIds
+    extra = set(actualIds) - expectedIds
+    if missing or extra:
+        raise AssertionError(
+            "CMS MXFP8 global schedule instruction mismatch: "
+            f"missing={len(missing)} extra={len(extra)}")
+    return result
+
+
 def instructionScheduleCmsMxfp8Loop(emitted3d):
     """Schedule the exact CMS-MXFP8 target through one 64-MFMA entry point.
-
-    The first prototype revision intentionally delegates each quadrant to the
-    retained partition scheduler and concatenates the four results.  This keeps
-    the generated instruction stream unchanged while establishing the global
-    seam used by later CMS-fidelity experiments.
 
     Returns None for every non-matching loop so generic and exit-loop emission
     continue through the existing per-group scheduler.
@@ -920,6 +1106,14 @@ def instructionScheduleCmsMxfp8Loop(emitted3d):
 
     groups = [partition[0] for partition in emitted3d]
     scheduledGroups = []
+    originalVmcnt = {
+        id(inst): inst.vlcnt
+        for group in groups
+        for em in group
+        if em.opType == "wait_gr"
+        for inst in em.instructions
+        if _isWaitCnt(inst)
+    }
     unrollIds = set()
     for expectedPartition, emittedModules in enumerate(groups):
         mfmaModules = [
@@ -947,11 +1141,8 @@ def instructionScheduleCmsMxfp8Loop(emitted3d):
     if len(unrollIds) != 1:
         return None
 
-    result = Module("CMS MXFP8 unified 64-MFMA schedule")
-    for partition, scheduled in enumerate(scheduledGroups):
-        result.addComment0(f"partition={partition} subIterK=0")
-        result.add(scheduled)
-    return result
+    return _scheduleCmsMxfp8LocalSync(
+        groups, scheduledGroups, originalVmcnt)
 
 
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
