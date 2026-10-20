@@ -1674,6 +1674,42 @@ class LogicalScheduler:
         moved.subIterK_slot = 0
         dst.lrs.append(moved)
 
+    def _move_du128_b_global_tail_to_p2(self):
+        """Move B(n+2) tiles 2-3 from p3 into otherwise sparse p2."""
+        cfg = self.config
+        isTarget = (
+            cfg.dualPeriodScale
+            and cfg.pgr == 2
+            and cfg.prefetchNextPartition
+            and cfg.numSubIterK == 1
+            and cfg.partitionOrder == "n-major"
+            and cfg.partitionSizesM == [4, 4]
+            and cfg.partitionSizesN == [4, 4]
+        )
+        if not isTarget:
+            return
+
+        src = self._partitions[3][0]
+        dst = self._partitions[2][0]
+        candidates = [
+            gr for gr in src.grs
+            if gr.tensor == "B"
+            and gr.mtIteration == 2
+            and gr.tiles.subIterK_start == 0
+            and gr.tiles.subIterK_end == 1
+            and gr.tiles.tileId_start == 2
+            and gr.tiles.tileId_end == 4
+        ]
+        if len(candidates) != 1:
+            return
+
+        moved = candidates[0]
+        src.grs_by_unroll[moved.unrollId].remove(moved)
+        moved.partition = 2
+        moved.subIterK_slot = 0
+        dst.grs_by_unroll.setdefault(moved.unrollId, []).append(moved)
+        dst.grs_by_unroll[moved.unrollId].sort(key=self._gr_sort_key)
+
     @pipeline_pass(Pass.GR)
     def place_GRs(self) -> PartitionSchedule:
         """Place Global Reads by iterating MFMAs across partitions.
@@ -1718,6 +1754,7 @@ class LogicalScheduler:
                 self._distribute_grs(gr_list, gr_slot_bounds, unrollId=uid)
 
         self._move_du128_wrap_a_to_p2()
+        self._move_du128_b_global_tail_to_p2()
         return self._partitions[0]
 
     # ── Annotate dependencies ─────────────────────────────
