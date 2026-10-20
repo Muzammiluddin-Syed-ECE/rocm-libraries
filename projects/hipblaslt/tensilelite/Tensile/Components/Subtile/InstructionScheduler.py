@@ -903,6 +903,57 @@ def _scheduleCmsMxfp8Partition(
     return scheduled
 
 
+def instructionScheduleCmsMxfp8Loop(emitted3d):
+    """Schedule the exact CMS-MXFP8 target through one 64-MFMA entry point.
+
+    The first prototype revision intentionally delegates each quadrant to the
+    retained partition scheduler and concatenates the four results.  This keeps
+    the generated instruction stream unchanged while establishing the global
+    seam used by later CMS-fidelity experiments.
+
+    Returns None for every non-matching loop so generic and exit-loop emission
+    continue through the existing per-group scheduler.
+    """
+    if len(emitted3d) != 4 \
+            or any(len(partition) != 1 for partition in emitted3d):
+        return None
+
+    groups = [partition[0] for partition in emitted3d]
+    scheduledGroups = []
+    unrollIds = set()
+    for expectedPartition, emittedModules in enumerate(groups):
+        mfmaModules = [
+            (index, module)
+            for index, module in enumerate(emittedModules)
+            if module.opType == "mfma"
+        ]
+        if len(mfmaModules) != 1:
+            return None
+        mfmaIdx, mfmaModule = mfmaModules[0]
+        mfmas = [
+            inst for inst in mfmaModule.instructions
+            if isinstance(inst, (MFMAInstruction, MXMFMAInstruction))
+        ]
+        if _cmsMxfp8PartitionIndex(mfmaModule, mfmas) != expectedPartition:
+            return None
+        unrollIds.add(getattr(mfmaModule, "unrollId", None))
+        _, pathOrders, _ = extractPathsFromBeforeDeps(emittedModules)
+        scheduled = _scheduleCmsMxfp8Partition(
+            emittedModules, mfmaIdx, pathOrders, mfmas)
+        if scheduled is None:
+            return None
+        scheduledGroups.append(scheduled)
+
+    if len(unrollIds) != 1:
+        return None
+
+    result = Module("CMS MXFP8 unified 64-MFMA schedule")
+    for partition, scheduled in enumerate(scheduledGroups):
+        result.addComment0(f"partition={partition} subIterK=0")
+        result.add(scheduled)
+    return result
+
+
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
     """Extract non-MFMA dependency paths using only EmittedModule.before links.
 

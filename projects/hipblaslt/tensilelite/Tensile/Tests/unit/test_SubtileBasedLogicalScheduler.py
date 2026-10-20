@@ -14,6 +14,7 @@ Organized by pass:
   11. BuildPreloop / BuildNGLL / BuildNLL — Loop variant construction
   12. Integration    — Full pipeline with real instructions
 """
+from copy import deepcopy
 import pytest
 from Tensile.Components.Subtile.Kernel import (
     TileInfo, AB_B8, AB_B16, AB_B16_W32, AB_B4,
@@ -34,7 +35,7 @@ from Tensile.Components.Subtile.LogicalScheduler import (
     fmt_mt,
 )
 from unittest.mock import MagicMock
-from rocisa.code import Module
+from rocisa.code import Module, TextBlock
 
 
 def makeTileInfo(tc, kernel):
@@ -3429,7 +3430,7 @@ class TestIntegration:
             GlobalReadInstruction, LocalReadInstruction,
             MXMFMAInstruction, SBarrier, SWaitCnt)
         from Tensile.Components.Subtile.InstructionScheduler import (
-            instructionSchedule)
+            instructionSchedule, instructionScheduleCmsMxfp8Loop)
 
         kernel = create_kernel_fp8(256, 256, [2, 2], depthU=128)
         kernel["ProblemType"]["MXBlockA"] = 32
@@ -3481,10 +3482,27 @@ class TestIntegration:
                     for group in partition
                     for em in group)
 
+                partition_loop = deepcopy(emitted_loop)
+                global_schedule = instructionScheduleCmsMxfp8Loop(
+                    emitted_loop)
+                assert global_schedule is not None
+                global_items = [
+                    item for item in global_schedule.flatitems()
+                    if not isinstance(item, TextBlock)
+                ]
                 scheduled = [
                     list(instructionSchedule(partition[0]).flatitems())
-                    for partition in emitted_loop
+                    for partition in partition_loop
                 ]
+                partition_items = [
+                    item for items in scheduled for item in items
+                    if not isinstance(item, TextBlock)
+                ]
+                assert [str(item) for item in global_items] == [
+                    str(item) for item in partition_items
+                ]
+                assert sum(isinstance(item, MXMFMAInstruction)
+                           for item in global_items) == 64
                 phases = [split_mfma_intervals(items)
                           for items in scheduled]
 
