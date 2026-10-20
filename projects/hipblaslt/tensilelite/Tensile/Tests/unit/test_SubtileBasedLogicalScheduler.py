@@ -2378,6 +2378,70 @@ class TestBuildPreloop:
         # (LR data is loaded fresh, not from a previous MT iteration)
         assert 'lr_inc' not in all_ops
 
+    def test_pgr2_mt1_precedes_partial_wait_with_guarded_full_wait(self):
+        """PGR2 overlaps MT1 GR with the first wait without weakening NLL."""
+        cfg = make_cfg_256x256_fp4()
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.build_preloop()
+
+        emitted = sched._preloop_emitted[0][0]
+        sources = [em.source for em in emitted]
+
+        init_idx = next(i for i, src in enumerate(sources)
+                        if getattr(src, 'label', None) == 'initC_overlap')
+        guard_idx = next(i for i, src in enumerate(sources)
+                         if getattr(src, 'kind', None) == 'skip'
+                         and src.rawLabel
+                         and src.target == 'SubtilePreloopNoMT1')
+        mt1_indices = [
+            i for i, src in enumerate(sources)
+            if isinstance(src, GRPlacement) and src.mtIteration == 1
+        ]
+        wait_indices = [
+            i for i, src in enumerate(sources)
+            if getattr(src, 'kind', None) == 'wait_gr'
+        ]
+        sync_idx = next(i for i, src in enumerate(sources)
+                        if getattr(src, 'kind', None) == 'sync')
+        first_lr_idx = next(i for i, src in enumerate(sources)
+                            if isinstance(src, LRPlacement))
+
+        assert init_idx < guard_idx < min(mt1_indices)
+        assert len(wait_indices) == 2
+        partial_idx, full_idx = wait_indices
+        assert max(mt1_indices) < partial_idx < full_idx < sync_idx < first_lr_idx
+
+        partial_counts = sources[partial_idx].wait_gr_counts
+        expected = WaitGRCounts()
+        for i in mt1_indices:
+            gr = sources[i]
+            setattr(expected, gr.tensor,
+                    getattr(expected, gr.tensor) + sched._count_gr_atoms(gr))
+        assert partial_counts == expected
+        assert sum(vars(partial_counts).values()) > 0
+        assert sources[full_idx].wait_gr_counts == WaitGRCounts()
+
+        labels = [getattr(src, 'label', None) for src in sources]
+        assert 'branch_SubtilePreloopWaitDone' in labels
+        assert 'SubtilePreloopNoMT1' in labels
+        assert 'SubtilePreloopWaitDone' in labels
+
+    def test_pgr1_preloop_keeps_single_full_wait(self):
+        """The guarded partial-wait path is exclusive to PGR2."""
+        cfg = make_cfg_256x256_fp4(pgr=1)
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.build_preloop()
+
+        emitted = sched._preloop_emitted[0][0]
+        waits = [em.source for em in emitted if em.opType == 'wait_gr']
+        labels = [getattr(em.source, 'label', None) for em in emitted]
+
+        assert len(waits) == 1
+        assert waits[0].wait_gr_counts == WaitGRCounts()
+        assert 'SubtilePreloopNoMT1' not in labels
+
     def test_multi_du_preloop(self):
         """Multi-DU: PGR=1 preloop loads per-uid with GRIncOps between uids."""
         cfg = make_cfg_256x256_fp4(grSA_k_gran=2, grSB_k_gran=2, pgr=1)

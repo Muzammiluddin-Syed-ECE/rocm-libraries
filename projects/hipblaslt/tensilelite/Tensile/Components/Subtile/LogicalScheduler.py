@@ -3546,6 +3546,41 @@ class LogicalScheduler:
                                        emitter.dtileInfo)
         return InlineModuleOp(build=_build_initC, label="initC_overlap")
 
+    def _wait_gr_counts_for_ops(self, ops) -> WaitGRCounts:
+        """Count GR atoms in an op sequence for a partial preloop wait."""
+        counts = WaitGRCounts()
+        for op in ops:
+            if not isinstance(op, GRPlacement):
+                continue
+            tensor = op.tensor
+            setattr(counts, tensor,
+                    getattr(counts, tensor) + self._count_gr_atoms(op))
+        return counts
+
+    @staticmethod
+    def _make_internal_label_op(name: str) -> InlineModuleOp:
+        """Create a local label used to join guarded preloop paths."""
+        def _build_label(_emitter):
+            from rocisa.code import Label, Module
+            module = Module()
+            module.add(Label(name, ""))
+            return module
+        return InlineModuleOp(build=_build_label, label=name)
+
+    @staticmethod
+    def _make_internal_branch_op(target: str) -> InlineModuleOp:
+        """Create an unconditional branch between guarded preloop paths."""
+        def _build_branch(_emitter):
+            from rocisa.code import Label, Module
+            from rocisa.instruction import SBranch
+            module = Module()
+            module.add(SBranch(
+                labelName=Label(target, "").getLabelName(),
+                comment="join guarded preloop wait paths"))
+            return module
+        return InlineModuleOp(build=_build_branch,
+                              label=f"branch_{target}")
+
     def build_preloop(self) -> EmittedSchedule:
         """Build preloop: pipeline initialization sequence before mainloop.
 
@@ -3563,11 +3598,13 @@ class LogicalScheduler:
         PGR=2 sequence:
           GR(MT 0)    — all tensors, all tiles (× numUnroll if unrolled)
           initC       — accumulator zeroing, overlapped with in-flight GR
-          WaitGR      — wait for global reads to land in LDS
+          guard(LE 1) — skip speculative MT 1 loads on the NLL path
+          GR(MT 1)    — first partition tiles (× numUnroll if unrolled)
+          WaitGR      — partial wait; leave MT 1 loads in flight
+          cold WaitGR — full drain when the guard skipped MT 1
           Sync        — barrier
           LR          — first partition, subIterK=0
           skip(LE 1, NLL)
-          GR(MT 1)    — first partition tiles (× numUnroll if unrolled)
           skip(LE 2, NGLL)
 
         Returns [1 partition][1 subIterK][EmittedModules] to match emit() shape.
@@ -3638,27 +3675,48 @@ class LogicalScheduler:
                 for uid in range(maxUnroll):
                     mt1_ops.extend(self._make_preloop_mt1_grs_uid(uid))
                     mt1_ops.extend(self._make_depops_uid(GRIncOp, uid))
+                mt1_counts = self._wait_gr_counts_for_ops(mt1_ops)
+                no_mt1_label = "SubtilePreloopNoMT1"
+                wait_done_label = "SubtilePreloopWaitDone"
                 emitted = self._to_emitted([
                     *preloop_ops,
                     initC_op,
+                    SkipOp(compare='LE', value=1, target=no_mt1_label,
+                           rawLabel=True,
+                           branchComment="skip MT1 prefetch on NLL path"),
+                    *mt1_ops,
+                    WaitGROp(wait_gr_counts=mt1_counts),
+                    self._make_internal_branch_op(wait_done_label),
+                    self._make_internal_label_op(no_mt1_label),
                     WaitGROp(wait_gr_counts=WaitGRCounts()),
+                    self._make_internal_label_op(wait_done_label),
                     SyncOp(),
                     *self._make_lr_all_tensors(lr_tiles),
                     SkipOp(compare='LE', value=1, target='NLL'),
-                    *mt1_ops,
                     *gl2_preloop_ops,
                     SkipOp(compare='LE', value=2, target='NGLL'),
                 ])
             else:
+                mt1_ops = self._make_preloop_mt1_grs()
+                mt1_counts = self._wait_gr_counts_for_ops(mt1_ops)
+                no_mt1_label = "SubtilePreloopNoMT1"
+                wait_done_label = "SubtilePreloopWaitDone"
                 emitted = self._to_emitted([
                     *self._make_gr_all_tensors(0, all_tiles),
                     *self._make_depops_all_tensors(GRIncOp),
                     initC_op,
+                    SkipOp(compare='LE', value=1, target=no_mt1_label,
+                           rawLabel=True,
+                           branchComment="skip MT1 prefetch on NLL path"),
+                    *mt1_ops,
+                    WaitGROp(wait_gr_counts=mt1_counts),
+                    self._make_internal_branch_op(wait_done_label),
+                    self._make_internal_label_op(no_mt1_label),
                     WaitGROp(wait_gr_counts=WaitGRCounts()),
+                    self._make_internal_label_op(wait_done_label),
                     SyncOp(),
                     *self._make_lr_all_tensors(lr_tiles),
                     SkipOp(compare='LE', value=1, target='NLL'),
-                    *self._make_preloop_mt1_grs(),
                     *gl2_preloop_ops,
                     SkipOp(compare='LE', value=2, target='NGLL'),
                 ])
