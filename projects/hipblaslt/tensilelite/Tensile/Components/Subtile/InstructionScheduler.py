@@ -416,15 +416,9 @@ def _classifyPaths(pathOrders, emittedModules):
     return paths
 
 
-def _flattenPath(order, emittedModules, reverse=False, excludeInstIds=None):
+def _flattenPath(order, emittedModules, reverse=False):
     """Flatten a path of module indices into (moduleId, instruction) pairs."""
-    excluded = excludeInstIds or set()
-    pathInsts = [
-        (mid, inst)
-        for mid in order
-        for inst in emittedModules[mid].instructions
-        if id(inst) not in excluded
-    ]
+    pathInsts = [(mid, inst) for mid in order for inst in emittedModules[mid].instructions]
     if reverse:
         pathInsts.reverse()
     return pathInsts
@@ -558,44 +552,6 @@ def _nextPlacementSlot(placer):
         if placer._placed[pos]:
             return pos + 1
     return 0
-
-
-def _independentGlobalPairBeforePreMfmaWait(
-        mfmas, preMfmaOrders, pathOrders, emittedModules):
-    """Select one dependency-free m0/buffer-load pair to issue before wait_lr.
-
-    The fixed DU128 quadrant order makes the first MFMA in each partition
-    depend on the incoming LR payload, so the LDS drain itself cannot cross an
-    MFMA. A regular GR path can nevertheless contain work independent of that
-    drain. Issuing one complete m0/buffer-load pair first delays wait_lr to its
-    actual first consumer and starts the global request earlier.
-
-    Restrict this experiment to the 16-MFMA MX schedule and to partitions whose
-    complete pre-MFMA dependency path is only wait_lr. This excludes partition
-    zero setup and paths containing LR swaps/reads or workgroup synchronization.
-    """
-    if len(mfmas) != 16 or not all(
-            isinstance(inst, MXMFMAInstruction)
-            and inst.getIssueLatency() == 8 for inst in mfmas):
-        return []
-
-    preModules = [
-        emittedModules[mid]
-        for order in preMfmaOrders
-        for mid in order
-    ]
-    if not preModules or any(em.opType != "wait_lr" for em in preModules):
-        return []
-
-    for order in pathOrders:
-        if not order or emittedModules[order[0]].opType != "gr":
-            continue
-        pathInsts = _flattenPath(order, emittedModules)
-        if len(pathInsts) >= 2 \
-                and _isM0Update(pathInsts[0][1]) \
-                and _isBufferLoad(pathInsts[1][1]):
-            return pathInsts[:2]
-    return []
 
 
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
@@ -758,20 +714,12 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     if p0Split is None:
         _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
 
-    preWaitGlobalPair = []
-    if p0Split is None:
-        preWaitGlobalPair = _independentGlobalPairBeforePreMfmaWait(
-            mfmas, preMfmaOrders, pathOrders, emittedModules)
-    preWaitGlobalIds = {id(inst) for _, inst in preWaitGlobalPair}
-
     slotsPerInterval = 4 if p0Split is not None else 2
     placementPathOrders = list(pathOrders)
     if p0Split is not None:
         placementPathOrders.append(p0Split[2])
 
     def _emitPreMfma(result):
-        for _, inst in preWaitGlobalPair:
-            result.add(inst)
         for order in preMfmaOrders:
             if p0Split is not None and order == p0Split[0]:
                 for _, inst in p0Split[1]:
@@ -827,8 +775,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
                 # force-stacks wait+barrier, LR swaps, and several ds_reads before
                 # MFMA #1. Keep only the synchronization in the first interval;
                 # current-partition MFMAs do not consume the wrapped LR payload.
-                pathInsts = _flattenPath(
-                    order, emittedModules, excludeInstIds=preWaitGlobalIds)
+                pathInsts = _flattenPath(order, emittedModules)
                 syncEnd = next(
                     (idx + 1 for idx, (_, inst) in enumerate(pathInsts)
                      if _isBarrier(inst)),
@@ -845,11 +792,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
                     continue
 
             reverse = (not multiDU) and hasWaitGR
-            pathInsts = _flattenPath(
-                order, emittedModules, reverse=reverse,
-                excludeInstIds=preWaitGlobalIds)
-            if not pathInsts:
-                continue
+            pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
             rules.resetPath()
             if not hasWaitGR:
                 rules.setupBufLoadSpreading(placer, pathInsts, order)

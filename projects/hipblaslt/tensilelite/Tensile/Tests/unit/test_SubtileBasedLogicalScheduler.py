@@ -3337,67 +3337,6 @@ class TestInstructionSchedulerWrapPrefetch:
         ) < mfma_positions[-1]
         assert sum(len(em.instructions) for em in modules) == len(items)
 
-    def test_independent_global_pair_delays_partition_entry_lr_wait(self):
-        import shutil
-        from types import SimpleNamespace
-        from rocisa import rocIsa
-        from rocisa.container import accvgpr, mgpr, sgpr, vgpr
-        from rocisa.enum import InstType
-        from rocisa.instruction import (
-            BufferLoadB128, MXMFMAInstruction, SAddU32, SWaitCnt)
-        from Tensile.Components.Subtile.InstructionScheduler import instructionSchedule
-
-        ri = rocIsa.getInstance()
-        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
-        ri.init((9, 5, 0), asm)
-        ri.setKernel((9, 5, 0), 64)
-
-        def emitted(module_id, kind, instructions, before=None):
-            return EmittedModule(
-                moduleId=module_id,
-                instructions=instructions,
-                before=before,
-                source=SimpleNamespace(kind=kind))
-
-        def mfma(index):
-            return MXMFMAInstruction(
-                instType=InstType.INST_F8,
-                accType=InstType.INST_F32,
-                variant=[16, 16, 128, 1],
-                acc=accvgpr(0, 4),
-                a=vgpr(0, 8),
-                b=vgpr(8, 8),
-                acc2=accvgpr(0, 4),
-                mxsa=vgpr(16),
-                mxsb=vgpr(17),
-                block=32,
-                comment=f"mfma{index}")
-
-        gr = []
-        for index in range(2):
-            gr.extend([
-                SAddU32(
-                    dst=mgpr(0), src0=sgpr(20), src1=index,
-                    comment=f"m0-{index}"),
-                BufferLoadB128(
-                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
-                    soffset=0, comment=f"gr-{index}"),
-            ])
-
-        modules = [
-            emitted(0, 'mfma', [mfma(i) for i in range(16)], before=2),
-            emitted(1, 'gr', gr),
-            emitted(2, 'wait_lr', [
-                SWaitCnt(dscnt=0, comment="wait_lr")]),
-        ]
-        items = list(instructionSchedule(modules).flatitems())
-
-        assert [inst.comment for inst in items[:4]] == [
-            "m0-0", "gr-0", "wait_lr", "mfma0"]
-        assert [inst.comment for inst in items].count("m0-0") == 1
-        assert [inst.comment for inst in items].count("gr-0") == 1
-        assert sum(len(em.instructions) for em in modules) == len(items)
-
     def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
         from rocisa import rocIsa
