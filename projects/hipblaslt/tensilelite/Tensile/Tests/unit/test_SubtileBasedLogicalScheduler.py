@@ -3618,6 +3618,42 @@ class TestIntegration:
                 == "CMS: initial preloop A/B read drain"
             ]
             assert len(initialDrains) == 1
+            preloopEnd = initialDrains[0]
+            preloopRequests = [
+                (index, inst)
+                for index, inst in enumerate(loopItems[:preloopEnd])
+                if isinstance(inst, GlobalReadInstruction)
+            ]
+            firstRequests = [
+                index for index, inst in preloopRequests
+                if "MT=n " in inst.comment
+            ]
+            secondRequests = [
+                index for index, inst in preloopRequests
+                if "MT=n+1 " in inst.comment
+            ]
+            assert len(firstRequests) == 18
+            assert len(secondRequests) == 10
+            preloopGrWaits = [
+                (index, inst.vlcnt)
+                for index, inst in enumerate(loopItems[:preloopEnd])
+                if getattr(inst, "isWaitGr", False)
+            ]
+            assert [vlcnt for _, vlcnt in preloopGrWaits] == [10, 0]
+            assert max(secondRequests) < preloopGrWaits[0][0]
+            assert preloopGrWaits[0][0] < preloopGrWaits[1][0]
+
+            preloopLocalReads = [
+                index for index, inst in enumerate(loopItems[:preloopEnd])
+                if isinstance(inst, LocalReadInstruction)
+            ]
+            assert len(preloopLocalReads) == 20
+            assert max(preloopLocalReads) < preloopEnd
+            nllSkip = next(
+                index for index, inst in enumerate(loopItems)
+                if (getattr(inst, "comment", "") or "") == "skip to NLL"
+            )
+            assert preloopEnd < nllSkip
             loopBegin = next(
                 index for index, inst in enumerate(loopItems)
                 if "LoopBeginL:" in str(inst))

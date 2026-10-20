@@ -3586,6 +3586,34 @@ class LogicalScheduler:
                                        emitter.dtileInfo)
         return InlineModuleOp(build=_build_initC, label="initC_overlap")
 
+    def _is_cms_mxfp8_profile(self) -> bool:
+        """Return whether this is the exact DU128 CMS-fidelity target."""
+        cfg = self.config
+        return (
+            cfg.dualPeriodScale
+            and cfg.pgr == 2
+            and cfg.prefetchNextPartition
+            and cfg.numSubIterK == 1
+            and cfg.partitionOrder == "m-major"
+            and cfg.partitionSizesM == [4, 4]
+            and cfg.partitionSizesN == [4, 4]
+        )
+
+    @staticmethod
+    def _make_cms_preloop_lr_drain_op() -> InlineModuleOp:
+        """Create the one-time LDS drain in the CMS preloop hot/cold join."""
+        def _build_drain(_emitter):
+            from rocisa.code import Module
+            from rocisa.instruction import SWaitCnt
+            module = Module()
+            module.add(SWaitCnt(
+                dscnt=0,
+                comment="CMS: initial preloop A/B read drain"))
+            return module
+        return InlineModuleOp(
+            build=_build_drain,
+            label="cms_preloop_lr_drain")
+
     def _wait_gr_counts_for_ops(self, ops) -> WaitGRCounts:
         """Count GR atoms in an op sequence for a partial preloop wait."""
         counts = WaitGRCounts()
@@ -3673,6 +3701,11 @@ class LogicalScheduler:
             lr_tiles['SB'] = MFMATileRange(0, cfg.lrSB.k, *part0['B'])
 
         initC_op = self._make_initC_op()
+        cms_preloop_lr_drain = (
+            [self._make_cms_preloop_lr_drain_op()]
+            if self._is_cms_mxfp8_profile()
+            else []
+        )
 
         if cfg.pgr == 1:
             maxUnroll = max(cfg.numUnroll.values()) if cfg.numUnroll else 1
@@ -3732,6 +3765,7 @@ class LogicalScheduler:
                     self._make_internal_label_op(wait_done_label),
                     SyncOp(),
                     *self._make_lr_all_tensors(lr_tiles),
+                    *cms_preloop_lr_drain,
                     SkipOp(compare='LE', value=1, target='NLL'),
                     *gl2_preloop_ops,
                     SkipOp(compare='LE', value=2, target='NGLL'),
@@ -3756,6 +3790,7 @@ class LogicalScheduler:
                     self._make_internal_label_op(wait_done_label),
                     SyncOp(),
                     *self._make_lr_all_tensors(lr_tiles),
+                    *cms_preloop_lr_drain,
                     SkipOp(compare='LE', value=1, target='NLL'),
                     *gl2_preloop_ops,
                     SkipOp(compare='LE', value=2, target='NGLL'),
@@ -3910,7 +3945,7 @@ class LogicalScheduler:
         """
         from rocisa.code import Module, Label
         from rocisa.instruction import (SSubU32, SCmpEQU32, SCBranchSCC0,
-                                        SCBranchSCC1, SBranch, SWaitCnt)
+                                        SCBranchSCC1, SBranch)
         from rocisa.container import sgpr
 
         assert self._emitter is not None, \
@@ -4039,13 +4074,6 @@ class LogicalScheduler:
             getattr(em, "scheduleProfile", "") == "cms-mxfp8-du128"
             for em in mainloopModules
         )
-        if cmsMxfp8Mainloop:
-            # The steady-state lgkmcnt moves under M61-M63. Drain the preloop
-            # reads once before LoopBeginL so the first C0 iteration is safe;
-            # loop-back branches intentionally land after this one-time wait.
-            module.add(SWaitCnt(
-                dscnt=0,
-                comment="CMS: initial preloop A/B read drain"))
         module.add(loopBegin)
         # Debug: emit `s_mov_b32 m0, LoopCounterL; s_ttracedata` at the start of
         # every mainloop iteration so SQTT / trace decoders can identify iterations
