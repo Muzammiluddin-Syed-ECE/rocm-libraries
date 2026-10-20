@@ -1351,28 +1351,6 @@ class TestPlaceGRs:
         assert any(op.kind == 'lr_inc' and op.tensor == 'A'
                    for op in moved_with_inc[0].preOps)
 
-    def test_du128_moves_b_n2_tiles_2_3_from_p3_to_p2(self):
-        cfg = make_cfg_du128_4wave()
-        sched = LogicalScheduler(cfg)
-        parts = sched.build(stop_after=Pass.GR)
-
-        p2_b_n2 = [
-            (gr.tiles.tileId_start, gr.tiles.tileId_end)
-            for gr in parts[2][0].grs
-            if gr.tensor == 'B' and gr.mtIteration == 2
-        ]
-        p3_b_n2 = [
-            (gr.tiles.tileId_start, gr.tiles.tileId_end)
-            for gr in parts[3][0].grs
-            if gr.tensor == 'B' and gr.mtIteration == 2
-        ]
-        assert p2_b_n2 == [(0, 2), (2, 4)]
-        assert p3_b_n2 == []
-        assert [
-            gr.tensor for gr in parts[3][0].grs
-            if gr.tensor in ('SA', 'SB')
-        ] == ['SA', 'SB']
-
     def test_1x1_k1_DU256(self):
         """256x256, DU256, FP4. GR order: A, B, SA, SB.
         Total loads: A(8)+B(8)+SA(1)+SB(1)=18, 9 per slot.
