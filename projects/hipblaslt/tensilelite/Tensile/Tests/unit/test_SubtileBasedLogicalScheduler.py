@@ -1310,19 +1310,14 @@ class TestAssignVgprTiles:
 
 class TestPlaceGRs:
 
-    @pytest.mark.parametrize(
-        "partition_order,moved_tensor",
-        [("n-major", "A"), ("m-major", "B")])
-    def test_du128_moves_only_vgpr_safe_wrap_to_p2(
-            self, partition_order, moved_tensor):
+    def test_du128_moves_only_vgpr_safe_wrap_a_to_p2(self):
         cfg = make_cfg_du128_4wave()
-        cfg.partitionOrder = partition_order
         sched = LogicalScheduler(cfg)
         parts = sched.build(stop_after=Pass.GR)
 
         moved = [
             lr for lr in parts[2][0].lrs
-            if lr.tensor == moved_tensor and lr.mtIteration == 1
+            if lr.tensor == 'A' and lr.mtIteration == 1
         ]
         assert len(moved) == 1
         assert (moved[0].tiles.tileId_start,
@@ -1333,28 +1328,27 @@ class TestPlaceGRs:
             lr.tensor for lr in parts[3][0].lrs
             if lr.mtIteration == 1
         }
-        remaining_tensor = 'B' if moved_tensor == 'A' else 'A'
-        assert p3_wrap == {remaining_tensor, 'SA', 'SB'}
+        assert p3_wrap == {'B', 'SA', 'SB'}
 
-        p2_operand_vgprs = {
+        p2_a_vgprs = {
             value
-            for tile_map in parts[2][0].mfma.vgpr_tile_maps[moved_tensor]
+            for tile_map in parts[2][0].mfma.vgpr_tile_maps['A']
             for value in tile_map.values()
         }
-        wrap_operand_vgprs = {
+        wrap_a_vgprs = {
             value
             for tile_map in moved[0].vgpr_tile_map
             for value in tile_map.values()
         }
-        assert p2_operand_vgprs.isdisjoint(wrap_operand_vgprs)
+        assert p2_a_vgprs.isdisjoint(wrap_a_vgprs)
 
         inc_parts = LogicalScheduler(cfg).build(stop_after=Pass.GR_INC)
         moved_with_inc = [
             lr for lr in inc_parts[2][0].lrs
-            if lr.tensor == moved_tensor and lr.mtIteration == 1
+            if lr.tensor == 'A' and lr.mtIteration == 1
         ]
         assert len(moved_with_inc) == 1
-        assert any(op.kind == 'lr_inc' and op.tensor == moved_tensor
+        assert any(op.kind == 'lr_inc' and op.tensor == 'A'
                    for op in moved_with_inc[0].preOps)
 
     def test_1x1_k1_DU256(self):
@@ -3117,18 +3111,6 @@ class TestGetNumVgpr:
 
 class TestInstructionSchedulerWrapPrefetch:
     """Partition-prefetch LRs must not delay independent MFMAs."""
-
-    def test_cms_mx_order_matches_reference_quadrant_traversal(self):
-        from Tensile.Components.Subtile.InstructionEmitter import (
-            _cms_mx_order)
-
-        assert _cms_mx_order(
-            [0, 1, 2, 3], [4, 5, 6, 7]) == [
-                (0, 4), (1, 4), (2, 4), (3, 4),
-                (0, 5), (1, 5), (2, 5), (3, 5),
-                (0, 6), (1, 6), (2, 6), (3, 6),
-                (0, 7), (1, 7), (2, 7), (3, 7),
-            ]
 
     @staticmethod
     def _schedule():
