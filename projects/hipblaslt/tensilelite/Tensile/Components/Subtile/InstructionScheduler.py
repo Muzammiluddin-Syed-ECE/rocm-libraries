@@ -934,9 +934,10 @@ def _scheduleCmsMxfp8LocalSync(
     """Overlay CMS local-read, synchronization, DTL, and loop-tail phasing.
 
     A/B reads occupy M0-M3/M13-M16 and drain at M6/M20. Data DTL requests
-    follow the CMS A-first M8-M25 and B M26-M53 phases. A single M46 VMEM
-    drain makes the two early readiness waits redundant and permits barriers
-    at M7/M21/M47. Loop-carried reads occupy M48-M55 and drain at M61.
+    follow the CMS A-first M8-M25 and B M26-M53 phases. A counted M46 VMEM
+    wait leaves the newest 15 requests in flight, makes the two early
+    readiness waits redundant, and permits barriers at M7/M21/M47.
+    Loop-carried reads occupy M48-M55 and drain at M61.
     C0-only scale reads remain split by first-use deadline.
     """
     mfmas, prefix, after = _splitCmsGlobalStream(scheduledGroups)
@@ -1198,8 +1199,9 @@ def _scheduleCmsMxfp8LocalSync(
 
     for inst in p3WaitGr.instructions:
         if _isWaitCnt(inst):
-            inst.vlcnt = 0
-            inst.comment = "CMS: drain loop-carried data DTL requests"
+            inst.vlcnt = 15
+            inst.comment = (
+                "CMS: wait for loop-carried data, leave 15 requests in flight")
     appendModule(p3WaitGr, after[46])
     appendModule(p3Barrier, after[47])
     retiredIds.update(

@@ -3508,7 +3508,7 @@ class TestIntegration:
                     for inst in bucket
                     if getattr(inst, "isWaitGr", False)
                 ]
-                assert waitGr == [(46, 0)]
+                assert waitGr == [(46, 15)]
 
                 localWaits = [
                     position
