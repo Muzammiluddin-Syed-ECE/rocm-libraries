@@ -3439,6 +3439,7 @@ class TestIntegration:
         kernel["_ScalePeriodUB"] = 256
         kernel["_DepthUMXSA"] = 8
         kernel["_DepthUMXSB"] = 8
+        kernel["NoTailLoop"] = False
         writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = \
             make_writer_and_tileinfos(kernel, fp4=True)
         cfg = make_cfg_du128_4wave()
@@ -3491,9 +3492,7 @@ class TestIntegration:
                 assert sum(isinstance(item, MXMFMAInstruction)
                            for item in global_items) == 64
                 prefix, buckets = split_mfma_intervals(global_items)
-                assert len(prefix) == 1
-                assert isinstance(prefix[0], SWaitCnt) \
-                    and prefix[0].dscnt == 0
+                assert prefix == []
 
                 barriers = [
                     position
@@ -3519,7 +3518,8 @@ class TestIntegration:
                     and not getattr(inst, "isWaitGr", False)
                     and inst.dscnt >= 0
                 ]
-                assert localWaits == ([6, 20, 31] if ui == 0 else [6, 20])
+                assert localWaits == (
+                    [6, 20, 31, 61] if ui == 0 else [6, 20, 61])
 
                 def readPositions(tensor, begin, end):
                     return [
@@ -3590,10 +3590,58 @@ class TestIntegration:
                     if "CMS earliest legal" in (getattr(inst, "comment", "") or "")
                 ]
                 assert pointerPositions == [11, 11, 40, 40]
+                sbScaleAddressPositions = [
+                    position
+                    for position, bucket in enumerate(buckets)
+                    for inst in bucket
+                    if "finish SB scale address" in (
+                        getattr(inst, "comment", "") or "")
+                ]
+                assert sbScaleAddressPositions == (
+                    [58, 59, 59, 59] if ui == 0 else [])
                 assert sum(
                     isinstance(inst, GlobalReadInstruction)
                     for inst in global_items) == (18 if ui == 0 else 16)
                 assert len(global_items) == (168 if ui == 0 else 145)
+
+            loopItems = list(sched.emitMainAndExitLoops(
+                writer, kernel).flatitems())
+            initialDrains = [
+                index for index, inst in enumerate(loopItems)
+                if (getattr(inst, "comment", "") or "")
+                == "CMS: initial preloop A/B read drain"
+            ]
+            assert len(initialDrains) == 1
+            loopBegin = next(
+                index for index, inst in enumerate(loopItems)
+                if "LoopBeginL:" in str(inst))
+            assert initialDrains[0] < loopBegin
+
+            previousBoundary = loopBegin
+            branchComments = ("copy 0 exit", "restart mainloop")
+            for ui, branchComment in enumerate(branchComments):
+                dec = next(
+                    index for index, inst in enumerate(loopItems)
+                    if (getattr(inst, "comment", "") or "")
+                    == f"dec counterL (copy {ui})")
+                compare = next(
+                    index for index, inst in enumerate(loopItems)
+                    if (getattr(inst, "comment", "") or "")
+                    == f"counterL == 2? (copy {ui} exit)")
+                branch = next(
+                    index for index, inst in enumerate(loopItems)
+                    if (getattr(inst, "comment", "") or "")
+                    .startswith(branchComment))
+                assert compare == dec + 1
+                assert sum(
+                    isinstance(inst, MXMFMAInstruction)
+                    for inst in loopItems[previousBoundary:dec]
+                ) == 61
+                assert sum(
+                    isinstance(inst, MXMFMAInstruction)
+                    for inst in loopItems[compare + 1:branch]
+                ) == 3
+                previousBoundary = branch + 1
         finally:
             sched.deallocVgprTiles(writer)
 

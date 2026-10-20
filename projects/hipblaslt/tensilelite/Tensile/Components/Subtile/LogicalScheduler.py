@@ -105,14 +105,45 @@ def _hoistSetupBeforeLastMFMA(loopBody, setupInsts):
     return rebuilt
 
 
-def _emitBodySetupBranch(module, loopBody, setupInsts, branch, hoist):
+def _placeSetupAfterMFMA(loopBody, setupInsts, mfmaIndex):
+    """Place loop-control setup immediately after one indexed MFMA.
+
+    This supports schedules that deliberately reserve an MFMA-relative control
+    slot before the end of the loop. If the requested MFMA is absent, retain
+    the generic behavior by appending the setup after the body.
+    """
+    from rocisa.instruction import MFMAInstruction, MXMFMAInstruction
+
+    rebuilt = Module(loopBody.name)
+    currentMfma = -1
+    placed = False
+    for inst in loopBody.flatitems():
+        rebuilt.add(inst)
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            currentMfma += 1
+            if currentMfma == mfmaIndex:
+                for setup in setupInsts:
+                    rebuilt.add(setup)
+                placed = True
+    if not placed:
+        for setup in setupInsts:
+            rebuilt.add(setup)
+    return rebuilt
+
+
+def _emitBodySetupBranch(
+        module, loopBody, setupInsts, branch, hoist, afterMfma=None):
     """Append a loop body, its dec+compare setup, and the trailing control branch.
 
+    When ``afterMfma`` is set, place setup directly after that zero-based MFMA
+    while leaving the branch after the complete body.
     When ``hoist`` is set, the setup is moved above the body's last MFMA (via
     _hoistSetupBeforeLastMFMA) so the branch lands right after that MFMA to hide
     branching latency. Otherwise the setup and branch simply follow the body.
     """
-    if hoist:
+    if afterMfma is not None:
+        module.add(_placeSetupAfterMFMA(loopBody, setupInsts, afterMfma))
+    elif hoist:
         module.add(_hoistSetupBeforeLastMFMA(loopBody, setupInsts))
     else:
         module.add(loopBody)
@@ -3879,7 +3910,7 @@ class LogicalScheduler:
         """
         from rocisa.code import Module, Label
         from rocisa.instruction import (SSubU32, SCmpEQU32, SCBranchSCC0,
-                                        SCBranchSCC1, SBranch)
+                                        SCBranchSCC1, SBranch, SWaitCnt)
         from rocisa.container import sgpr
 
         assert self._emitter is not None, \
@@ -3997,6 +4028,24 @@ class LogicalScheduler:
         exitValue = self.config.pgr
 
         exitLabels = [Label(f"ExitC{ui}", "") for ui in range(uf - 1)]
+        mainloopModules = [
+            em
+            for emittedLoop in self._emitted_per_unroll
+            for partition in emittedLoop
+            for group in partition
+            for em in group
+        ]
+        cmsMxfp8Mainloop = bool(mainloopModules) and all(
+            getattr(em, "scheduleProfile", "") == "cms-mxfp8-du128"
+            for em in mainloopModules
+        )
+        if cmsMxfp8Mainloop:
+            # The steady-state lgkmcnt moves under M61-M63. Drain the preloop
+            # reads once before LoopBeginL so the first C0 iteration is safe;
+            # loop-back branches intentionally land after this one-time wait.
+            module.add(SWaitCnt(
+                dscnt=0,
+                comment="CMS: initial preloop A/B read drain"))
         module.add(loopBegin)
         # Debug: emit `s_mov_b32 m0, LoopCounterL; s_ttracedata` at the start of
         # every mainloop iteration so SQTT / trace decoders can identify iterations
@@ -4032,7 +4081,10 @@ class LogicalScheduler:
                 branch = SCBranchSCC0(
                     labelName=loopBegin.getLabelName(),
                     comment="restart mainloop")
-            _emitBodySetupBranch(module, loopBody, setupInsts, branch, hoist=isGfx1250)
+            _emitBodySetupBranch(
+                module, loopBody, setupInsts, branch,
+                hoist=isGfx1250,
+                afterMfma=(60 if cmsMxfp8Mainloop and not isGfx1250 else None))
 
         # ── NGLL + NLL exit paths ──
         hasNGLL = self.config.pgr >= 2

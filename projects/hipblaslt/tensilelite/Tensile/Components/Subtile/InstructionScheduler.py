@@ -931,12 +931,13 @@ def _splitCmsGlobalStream(scheduledGroups):
 
 def _scheduleCmsMxfp8LocalSync(
         groups, scheduledGroups):
-    """Overlay CMS local-read, synchronization, and DTL request phasing.
+    """Overlay CMS local-read, synchronization, DTL, and loop-tail phasing.
 
     A/B reads occupy M0-M3/M13-M16 and drain at M6/M20. Data DTL requests
     follow the CMS A-first M8-M25 and B M26-M53 phases. A single M46 VMEM
     drain makes the two early readiness waits redundant and permits barriers
-    at M7/M21/M47. C0-only scale reads remain split by first-use deadline.
+    at M7/M21/M47. Loop-carried reads occupy M48-M55 and drain at M61.
+    C0-only scale reads remain split by first-use deadline.
     """
     mfmas, prefix, after = _splitCmsGlobalStream(scheduledGroups)
 
@@ -958,6 +959,7 @@ def _scheduleCmsMxfp8LocalSync(
 
     p0A = exactlyOne(0, "lr", "A")
     p1B = exactlyOne(1, "lr", "B")
+    p0WaitLr = exactlyOne(0, "wait_lr")
     p0WaitGr = exactlyOne(0, "wait_gr")
     p0Barrier = exactlyOne(0, "sync")
     p1WaitLr = exactlyOne(1, "wait_lr")
@@ -978,6 +980,7 @@ def _scheduleCmsMxfp8LocalSync(
     }
     grIncA = exactlyOne(1, "gr_inc", "A")
     grIncB = exactlyOne(2, "gr_inc", "B")
+    grIncSB = exactlyOne(3, "gr_inc", "SB")
 
     scaleReads = {}
     for tensor in ("SA", "SB"):
@@ -999,10 +1002,11 @@ def _scheduleCmsMxfp8LocalSync(
     ]
     relocatedModules = [
         p0A, p1B,
+        p0WaitLr,
         p0WaitGr, p0Barrier,
         p1WaitLr, p1WaitGr, p1Barrier,
         p2WaitLr, p3WaitLr, p3WaitGr, p3Barrier,
-        grIncA, grIncB,
+        grIncA, grIncB, grIncSB,
         *dataGr["A"], *dataGr["B"],
         *scaleReads.values(), *scaleIncs,
     ]
@@ -1051,6 +1055,12 @@ def _scheduleCmsMxfp8LocalSync(
     setLocalWait(p2WaitLr, "CMS: drain B reads before M21")
     appendModule(p2WaitLr, after[20])
     appendModule(p1Barrier, after[21])
+
+    # The initial preloop instance is drained once outside LoopBeginL. Every
+    # subsequent iteration consumes the M48-M55 wrap reads here, under the
+    # final three MFMAs just like the FP8 CMS tail.
+    setLocalWait(p0WaitLr, "CMS: drain loop-carried A/B reads at M61")
+    appendModule(p0WaitLr, after[61])
 
     if hasScaleReads:
         # The remaining scales are first consumed by p2 (M32).
@@ -1130,6 +1140,15 @@ def _scheduleCmsMxfp8LocalSync(
     after[11].extend(aPointer)
     after[40].extend(bPointer)
     after[57][0:0] = [*aWriteSwap, *bWriteSwap]
+
+    # C0's SB scale-address update used to extend through M61 and clobber SCC
+    # after the desired M60 loop compare. Preserve its instruction order but
+    # finish all SCC-writing SALU/XOR work by M59; the SB request remains M62.
+    sbPointer = list(grIncSB.instructions)
+    for inst in sbPointer:
+        appendMetadata(inst, "CMS: finish SB scale address before M60 control")
+    after[58].extend(sbPointer[:2])
+    after[59].extend(sbPointer[2:])
 
     for em in scaleIncs:
         tensor = getattr(em.source, "tensor", "scale")
