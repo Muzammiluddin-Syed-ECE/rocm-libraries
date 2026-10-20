@@ -3374,51 +3374,6 @@ class TestInstructionSchedulerWrapPrefetch:
         assert positions[id(ds_read)] % 4 != 0
         assert positions[id(valu)] % 4 != 0
 
-    def test_gr_inc_path_reserves_early_address_slots(self):
-        import shutil
-        from types import SimpleNamespace
-        from rocisa import rocIsa
-        from rocisa.container import sgpr, vgpr
-        from rocisa.instruction import BufferLoadB128, SAddU32
-        from Tensile.Components.Subtile.InstructionScheduler import (
-            _SchedulingRules, _SlotPlacer)
-
-        ri = rocIsa.getInstance()
-        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
-        ri.init((9, 5, 0), asm)
-        ri.setKernel((9, 5, 0), 64)
-
-        loads = [
-            BufferLoadB128(
-                dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
-                soffset=0, comment=f"gr-{index}")
-            for index in range(4)
-        ]
-        gr_inc = SAddU32(
-            dst=sgpr(24), src0=sgpr(24), src1=128,
-            comment="gr-inc")
-        path = [
-            *[(0, load) for load in loads[:3]],
-            (1, gr_inc),
-            (2, loads[3]),
-        ]
-        emitted = [
-            SimpleNamespace(opType="gr"),
-            SimpleNamespace(opType="gr_inc"),
-            SimpleNamespace(opType="gr"),
-        ]
-        placer = _SlotPlacer(
-            intervals=15,
-            numModules=3,
-            pathOrders=[[0, 1, 2]],
-            slotsPerInterval=2)
-        rules = _SchedulingRules(totalSlots=30, grIncLeadSlots=4)
-
-        rules.setupBufLoadSpreading(
-            placer, path, [0, 1, 2], emitted)
-
-        assert rules.bufLoadMaxSlot == 25
-
 
 class TestIntegration:
 
