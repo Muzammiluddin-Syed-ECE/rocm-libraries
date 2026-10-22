@@ -3380,6 +3380,22 @@ class TestInstructionSchedulerWrapPrefetch:
             emitted(9, 'gr', global_reads(4)),
         ]
 
+        # Semantic ranks mirror an 8x8 tile grid split into four 4x4
+        # partitions. Data reads are two-instruction atomic groups; scale reads
+        # are one-instruction groups. The scheduler must use these deadlines,
+        # not the module/tensor names or a fixed read count.
+        rank_by_index = {
+            0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2, 6: 3, 7: 3,
+            8: 0, 9: 8, 10: 16, 11: 24,
+            12: 16, 13: 18, 14: 0, 15: 2,
+        }
+        for em in modules[1:4]:
+            em.instructionMetadata = []
+            for inst in em.instructions:
+                index = int(inst.comment[2:])
+                em.instructionMetadata.append(
+                    (rank_by_index[index], 2 if index < 8 else 1))
+
         items = list(instructionSchedule(modules).flatitems())
         mfma_positions = [
             i for i, inst in enumerate(items)
@@ -3399,9 +3415,14 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # Split only after complete m0/buffer-load pairs: GR[0:2],
-        # DS[0:8], GR[2:4], then DS[8:16].
+        # Split only after complete m0/buffer-load pairs. Local reads are
+        # ordered by first consumer, with shorter groups winning equal
+        # deadlines, then divided into two equal cohorts.
         assert items[mfma_positions[0] + 1].comment == "m0-0"
+        expected_reads = [
+            "ds8", "ds14", "ds0", "ds1", "ds2", "ds3", "ds15", "ds4",
+            "ds5", "ds6", "ds7", "ds9", "ds10", "ds12", "ds13", "ds11",
+        ]
         clustered = [
             inst.comment for inst in items
             if getattr(inst, "comment", "").startswith(
@@ -3409,9 +3430,9 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         assert clustered == [
             "m0-0", "gr-0", "m0-1", "gr-1",
-            *[f"ds{i}" for i in range(8)],
+            *expected_reads[:8],
             "m0-2", "gr-2", "m0-3", "gr-3",
-            *[f"ds{i}" for i in range(8, 16)],
+            *expected_reads[8:],
         ]
         assert [
             inst.comment for inst in items
@@ -3420,7 +3441,7 @@ class TestInstructionSchedulerWrapPrefetch:
         assert [
             inst.comment for inst in items
             if isinstance(inst, DSLoadB128)
-        ] == [f"ds{i}" for i in range(16)]
+        ] == expected_reads
         reads_per_interval = [
             sum(isinstance(inst, DSLoadB128)
                 for inst in items[begin + 1:end])
@@ -3433,6 +3454,103 @@ class TestInstructionSchedulerWrapPrefetch:
             if isinstance(inst, DSLoadB128)
         ) < mfma_positions[-1]
         assert sum(len(em.instructions) for em in modules) == len(items)
+
+    @pytest.mark.parametrize(
+        "cfg,partition,mt_iteration,tensor,tile_id,expected",
+        [
+            (make_cfg_du128_4wave(), 0, 0, "SA", 0, 0),
+            (make_cfg_du128_4wave(), 0, 0, "B", 5, 1),
+            (make_cfg_du128_4wave(), 0, 0, "SA", 2, 8),
+            (make_cfg_du128_4wave(), 0, 0, "SB", 2, 18),
+            (make_cfg_du128_4wave(), 2, 1, "A", 0, 16),
+            (make_cfg_du128_4wave(), 3, 1, "B", 3, 3),
+        ],
+    )
+    def test_first_consumer_rank_uses_partition_geometry(
+            self, cfg, partition, mt_iteration, tensor, tile_id, expected):
+        from types import SimpleNamespace
+        from Tensile.Components.Subtile.InstructionEmitter import InstructionEmitter
+
+        emitter = object.__new__(InstructionEmitter)
+        emitter.config = cfg
+        emitter.writer = SimpleNamespace(
+            states=SimpleNamespace(asmCaps={}))
+        gran = {
+            "A": cfg.lrA, "B": cfg.lrB,
+            "SA": cfg.lrSA, "SB": cfg.lrSB,
+        }[tensor]
+        placement = LRPlacement(
+            tensor=tensor,
+            mtIteration=mt_iteration,
+            tiles=MFMATileRange(0, 1, tile_id, tile_id + gran.mn),
+            subIterK_slot=0,
+            partition=partition,
+            targetPartition=(partition + 1) % cfg.numPartitions,
+        )
+
+        assert emitter._first_consumer_rank(placement, tile_id) == expected
+
+    def test_first_consumer_rank_supports_non_square_partition_grid(self):
+        from types import SimpleNamespace
+        from Tensile.Components.Subtile.InstructionEmitter import InstructionEmitter
+
+        cfg = SchedulerConfig(
+            numMFMATilesM=8, numMFMATilesN=4, numSubIterK=1,
+            lrA=ReadGranularity(1, 1), lrB=ReadGranularity(1, 1),
+            grA=ReadGranularity(1, 1), grB=ReadGranularity(1, 1),
+            lrSA=ReadGranularity(2, 1), lrSB=ReadGranularity(2, 1),
+            grSA=ReadGranularity(8, 2), grSB=ReadGranularity(4, 2),
+            partitionSizeM=4, partitionSizeN=2,
+            pgr=2, plr=0, doubleBufferTensors=("A", "B"),
+            prefetchNextPartition=True, partitionOrder="n-major",
+            scaleReuse=2,
+        )
+        emitter = object.__new__(InstructionEmitter)
+        emitter.config = cfg
+        emitter.writer = SimpleNamespace(
+            states=SimpleNamespace(asmCaps={}))
+        placement = LRPlacement(
+            tensor="SA", mtIteration=0,
+            tiles=MFMATileRange(0, 1, 2, 4),
+            subIterK_slot=0, partition=0, targetPartition=1)
+
+        # Partition 1 is 4x2. A2 is first consumed after A0/A1 (four MFMAs).
+        assert emitter._first_consumer_rank(placement, 2) == 4
+
+    def test_data_only_partition_zero_prefetch_is_recognized(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.instruction import DSLoadB128, SBarrier
+        from Tensile.Components.Subtile.InstructionEmitter import SWaitCntEx
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            _findPartitionZeroPrefetchOrder)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        def emitted(module_id, kind, instructions, before=None, **kwargs):
+            return EmittedModule(
+                moduleId=module_id, instructions=instructions, before=before,
+                source=SimpleNamespace(kind=kind, **kwargs))
+
+        modules = [
+            emitted(0, "wait_gr", [SWaitCntEx(vlcnt=7)]),
+            emitted(1, "sync", [SBarrier()], before=0),
+            emitted(2, "lr", [
+                DSLoadB128(
+                    dst=vgpr(8, 4), src=vgpr(1),
+                    ds=DSModifiers(offset=index * 16))
+                for index in range(3)
+            ], before=1, tensor="B", partition=0,
+                    targetPartition=1, mtIteration=0),
+        ]
+
+        assert _findPartitionZeroPrefetchOrder(
+            [[0, 1, 2]], modules) == [0, 1, 2]
 
     def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil

@@ -470,7 +470,13 @@ def _isWrapPrefetchPath(order, emittedModules):
 
 
 def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
-    """Find the exact 16-read p0 dual-period prefetch path."""
+    """Find p0's partition-prefetch path from semantic placement metadata.
+
+    C0 contains data and scale reads while scale-reuse bodies contain only
+    data reads. The read count and tensor mix vary with the macrotile, so the
+    invariant is instead that at least one emitted A/B LR in partition 0 feeds
+    a later partition in the current MT.
+    """
     for order in preMfmaOrders:
         modules = [emittedModules[mid] for mid in order]
         if not (any(em.opType == "wait_gr" for em in modules)
@@ -492,18 +498,12 @@ def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
             and getattr(em.source, "mtIteration", 0) == 0
             for em in readModules
         )
-        scaleTensors = {
-            getattr(em.source, "tensor", None)
-            for em in readModules
-            if any(_isDsRead(inst) for inst in em.instructions)
-        } & {"SA", "SB"}
         readCount = sum(
             _isDsRead(inst)
             for em in readModules
             for inst in em.instructions
         )
-        if not hasNextPartitionData or scaleTensors != {"SA", "SB"} \
-                or readCount != 16:
+        if not hasNextPartitionData or readCount == 0:
             continue
         return order
     return None
@@ -527,7 +527,7 @@ def _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules):
 
 
 def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
-    """Move p0's full LR drain before its 16 independent younger reads.
+    """Move p0's full LR drain before its independent younger reads.
 
     Returns the matched order, a pre-MFMA wait/sync prefix, and the payload
     path to spread through four 4-cycle scheduling slots per MXMFMA.
@@ -555,6 +555,42 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     ]
     payloadInsts = _flattenPath(payloadOrder, emittedModules)
     return order, prefixInsts, payloadOrder, payloadInsts
+
+
+def _orderLocalReadsByFirstConsumer(pathInsts, emittedModules):
+    """Order independent local-read atoms by their next MFMA consumer.
+
+    The emitter tags each instruction in an atomic read group with a rank
+    derived from the configured partition traversal. Sort complete groups by
+    that deadline. If two operands feed the same MFMA, issue the shorter group
+    first (for example, one scale read before a two-instruction data read).
+    Non-read payload such as LDS pointer updates remains after the read cohort
+    in its original order.
+
+    Return None when semantic metadata is unavailable, preserving unrelated
+    schedules byte-for-byte.
+    """
+    reads = []
+    nonReads = []
+    module_offsets = {}
+    for original_index, item in enumerate(pathInsts):
+        mid, inst = item
+        instruction_index = module_offsets.get(mid, 0)
+        module_offsets[mid] = instruction_index + 1
+        if not _isDsRead(inst):
+            nonReads.append(item)
+            continue
+        metadata = emittedModules[mid].instructionMetadata
+        if instruction_index >= len(metadata):
+            return None
+        rank, span = metadata[instruction_index]
+        rank = rank if rank is not None else float("inf")
+        reads.append((rank, span, original_index, item))
+
+    if not reads:
+        return None
+    reads.sort(key=lambda entry: entry[:3])
+    return [item for _, _, _, item in reads] + nonReads
 
 
 def _splitItemsAfterHalf(pathInsts, predicate):
@@ -745,9 +781,18 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     if p0Split is None:
         _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
 
+    p0Payload = p0Split[3] if p0Split is not None else None
+    p0PayloadReordered = False
+    if p0Split is not None:
+        reordered = _orderLocalReadsByFirstConsumer(
+            p0Payload, emittedModules)
+        if reordered is not None:
+            p0Payload = reordered
+            p0PayloadReordered = True
+
     slotsPerInterval = 4 if p0Split is not None else 2
     placementPathOrders = list(pathOrders)
-    if p0Split is not None:
+    if p0Split is not None and not p0PayloadReordered:
         placementPathOrders.append(p0Split[2])
 
     def _emitPreMfma(result):
@@ -767,7 +812,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         for m in mfmas:
             result.add(m)
         if p0Split is not None:
-            for _, inst in p0Split[3]:
+            for _, inst in p0Payload:
                 result.add(inst)
         for order in pathOrders:
             for mid in order:
@@ -837,7 +882,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
                 _flattenPath(order, emittedModules), _isBufferLoad)
             for order, _ in paths
         ]
-        p0Halves = _splitItemsAfterHalf(p0Split[3], _isDsRead)
+        p0Halves = _splitItemsAfterHalf(p0Payload, _isDsRead)
 
         def _placePacked(pathInsts):
             if not pathInsts:
@@ -859,7 +904,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         _placeRegularPaths()
         if p0Split is not None:
             rules.resetPath()
-            placer.placePath(p0Split[3])
+            placer.placePath(p0Payload)
 
     scheduled = Module()
     _emitPreMfma(scheduled)
