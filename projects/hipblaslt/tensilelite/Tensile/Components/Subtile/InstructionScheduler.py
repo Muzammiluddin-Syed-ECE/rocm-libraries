@@ -27,9 +27,13 @@ class _SlotPlacer:
     def __init__(self, intervals: int, numModules: int,
                  pathOrders: List[List[int]],
                  validators=None, adjusters=None, onPlace=None,
-                 slotsPerInterval: int = 2):
+                 slotsPerInterval: int = 2,
+                 oneDtlPerInterval: bool = False,
+                 maxInstructionsPerInterval: Optional[int] = None):
         self.slotsPerInterval = slotsPerInterval
         self.totalSlots = intervals * slotsPerInterval
+        self.oneDtlPerInterval = oneDtlPerInterval
+        self.maxInstructionsPerInterval = maxInstructionsPerInterval
         self._n = numModules
         self._prevInPath: List[int] = [-1] * numModules
         self._nextInPath: List[int] = [-1] * numModules
@@ -48,8 +52,29 @@ class _SlotPlacer:
 
     # ── Placement ──
 
+    def _intervalHasDtlLoad(self, pos: int) -> bool:
+        begin = (pos // self.slotsPerInterval) * self.slotsPerInterval
+        end = min(self.totalSlots, begin + self.slotsPerInterval)
+        return any(
+            _isDtlLoad(item[1])
+            for slot in range(begin, end)
+            for item in self._placed[slot]
+        )
+
+    def _intervalInstructionCount(self, pos: int) -> int:
+        begin = (pos // self.slotsPerInterval) * self.slotsPerInterval
+        end = min(self.totalSlots, begin + self.slotsPerInterval)
+        return sum(
+            len(self._placed[slot])
+            for slot in range(begin, end)
+        )
+
     def _canPlace(self, pos: int, inst) -> bool:
         if pos < 0 or pos >= self.totalSlots or len(self._placed[pos]) >= 2:
+            return False
+        if (self.maxInstructionsPerInterval is not None
+                and self._intervalInstructionCount(pos)
+                >= self.maxInstructionsPerInterval):
             return False
         return all(v(self, pos, inst) for v in self._validators)
 
@@ -130,6 +155,13 @@ class _SlotPlacer:
                 (setupPos // self.slotsPerInterval + 1)
                 * self.slotsPerInterval - 1,
             )
+            if (self.oneDtlPerInterval
+                    and self._intervalHasDtlLoad(setupPos)):
+                continue
+            if (self.maxInstructionsPerInterval is not None
+                    and self._intervalInstructionCount(setupPos)
+                    + 2 > self.maxInstructionsPerInterval):
+                continue
             if not self._canPlace(setupPos, setupInst):
                 continue
             for loadPos in range(
@@ -157,7 +189,12 @@ class _SlotPlacer:
             )
             setupPos = max(first, intervalBegin)
             loadPos = max(setupPos, loadLo)
-            if (setupPos <= min(setupHi, intervalEnd)
+            if ((not self.oneDtlPerInterval
+                    or not self._intervalHasDtlLoad(setupPos))
+                    and (self.maxInstructionsPerInterval is None
+                         or self._intervalInstructionCount(setupPos)
+                         + 2 <= self.maxInstructionsPerInterval)
+                    and setupPos <= min(setupHi, intervalEnd)
                     and loadPos <= min(loadHi, intervalEnd)):
                 self.place(setupPos, setupItem)
                 self.place(loadPos, loadItem)
@@ -230,6 +267,13 @@ class _SlotPlacer:
                         limit = pairEnd + 1
                         idx += 2
                         continue
+                    if self.oneDtlPerInterval:
+                        raise RuntimeError(
+                            "unable to place one DTL bundle per MFMA interval "
+                            f"(path index {idx}, start slot {limit}, "
+                            f"total slots {self.totalSlots}, "
+                            f"setup={getattr(inst, 'comment', '')!r}, "
+                            f"load={getattr(pathInsts[idx + 1][1], 'comment', '')!r})")
                 if not reverse:
                     limit = self.adjustLimit(limit, inst)
                 pos = self.findSlot(mid, inst, limit, reverse=reverse)
@@ -358,15 +402,16 @@ class _SchedulingRules:
     # ── Validators: (placer, pos, inst) -> bool ──
 
     def oneDsReadPerInterval(self, placer, pos, inst):
-        """At most one ds_read per two-slot SIMD issue pair."""
+        """Use at most the non-leading slot count for DS reads per interval."""
         if not _isDsRead(inst):
             return True
-        peer = pos ^ 1
-        slots = [pos]
-        if 0 <= peer < placer.totalSlots:
-            slots.append(peer)
-        return not any(_isDsRead(item[1])
-                       for slot in slots for item in placer._placed[slot])
+        first = (pos // placer.slotsPerInterval) * placer.slotsPerInterval
+        end = min(first + placer.slotsPerInterval, placer.totalSlots)
+        reads = sum(
+            _isDsRead(item[1])
+            for slot in range(first, end)
+            for item in placer._placed[slot])
+        return reads < placer.slotsPerInterval - 1
 
     def noDsReadOrValuInFirstSlot(self, placer, pos, inst):
         """Reserve each p0 interval's first slot from DS reads and VALU."""
@@ -600,8 +645,8 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     """Move p0's full LR drain before its independent younger reads.
 
     Returns the matched order, a pre-MFMA wait/sync prefix, the payload path
-    to spread through four 4-cycle scheduling slots per MXMFMA, and the sync
-    subset that a phase scheduler may defer until after MFMA0.
+    to spread through bounded scheduling slots per MXMFMA, and the sync subset
+    that a phase scheduler may defer until after MFMA0.
     """
     order = _findPartitionZeroPrefetchOrder(
         preMfmaOrders, emittedModules)
@@ -990,14 +1035,16 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
 def instructionSchedule(
         emittedModules, multiDU: bool = False,
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
-        partitionPrefetch: bool = False):
+        partitionPrefetch: bool = False,
+        limitDtlBundlesPerMfma: bool = False):
     """Interleave non-MFMA instructions between MFMAs.
 
     Rules (shared):
       - MFMA order is preserved.
       - The legacy schedule uses 2 placement slots between adjacent MFMAs.
-      - The selected MXFP8 p0 experiment uses 4 4-cycle scheduling slots.
-      - At most one ds_read is placed per two-slot SIMD issue pair.
+      - Strict partition-prefetch scheduling permits a third slot when needed,
+        while capping physical follower instructions at three per MFMA.
+      - DS reads occupy only non-leading placement slots.
       - Before dependencies are respected at module order level.
       - Minimm distance between ds_read and it waitcnt (hardcoded for now)
       - Module-internal instruction order is preserved.
@@ -1047,9 +1094,12 @@ def instructionSchedule(
             p0Payload = reordered
             p0PayloadReordered = True
 
-    slotsPerInterval = (
-        4 if partitionPrefetchPolicy or p0Split is not None else 2
-    )
+    # The strict partition-prefetch policy normally emits two instructions
+    # between adjacent MFMAs.  A third placement slot lets the leading LDS
+    # cohort issue a second read when necessary, so it completes before the
+    # first future-epoch DTL bundle without stacking multiple DTL bundles in
+    # one MFMA interval.
+    slotsPerInterval = 3 if limitDtlBundlesPerMfma else 2
     placementPathOrders = list(pathOrders)
     if p0Split is not None and not p0PayloadReordered:
         placementPathOrders.append(p0Split[2])
@@ -1116,7 +1166,14 @@ def instructionSchedule(
         validators=base_validators,
         adjusters=base_adjusters,
         onPlace=rules.trackPlacement,
-        slotsPerInterval=slotsPerInterval)
+        slotsPerInterval=slotsPerInterval,
+        oneDtlPerInterval=(
+            limitDtlBundlesPerMfma
+            and (partitionPrefetchPolicy or p0Split is not None)),
+        maxInstructionsPerInterval=(
+            3 if limitDtlBundlesPerMfma
+            and (partitionPrefetchPolicy or p0Split is not None)
+            else None))
 
     def _placeRegularPaths():
         for order, hasWaitGR in paths:
@@ -1196,8 +1253,11 @@ def instructionSchedule(
         # independent MFMAs. Reserve holes for DS issue-pair restrictions and
         # m0/load pairing; p0's synchronization remains before MFMA0.
         reserveSlots = (numDsReads + 1) // 2 + numBufferLoads
+        # Each atomic m0/DTL-load pair consumes one abstract placement slot,
+        # not two. Account for that when right-aligning the VMEM tail.
+        estimatedSlots = len(allPhaseItems) - numBufferLoads
         phaseLimit = 0 if p0Split is not None else max(
-            0, placer.totalSlots - len(allPhaseItems) - reserveSlots)
+            0, placer.totalSlots - estimatedSlots - reserveSlots)
 
         def _placePhase(
                 pathInsts, atomicDtl=False,
@@ -1211,7 +1271,7 @@ def instructionSchedule(
                 startLimit=phaseLimit,
                 atomicDtl=atomicDtl,
                 mfmaBetweenWaitAndBarrier=mfmaBetweenWaitAndBarrier)
-            phaseLimit = _nextPlacementSlot(placer)
+            phaseLimit = max(phaseLimit, _nextPlacementSlot(placer))
 
         _placePhase(p0Sync)
         if leading:

@@ -3814,7 +3814,8 @@ class LogicalScheduler:
                         em_list,
                         multiDU=self._is_multi_du(),
                         minGapDsReadToWait=minGapDsReadToWait,
-                        partitionPrefetch=self.config.prefetchNextPartition)
+                        partitionPrefetch=self.config.prefetchNextPartition,
+                        limitDtlBundlesPerMfma=self.config.dualPeriodScale)
                     module.add(scheduled)
                     if use_partial_lr_waits:
                         if first_cell is None:
