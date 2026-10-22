@@ -3737,6 +3737,7 @@ class LogicalScheduler:
         """
         from .InstructionScheduler import (
             instructionSchedule,
+            safeOutstandingLocalReadSuffix,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250,
         )
@@ -3744,7 +3745,8 @@ class LogicalScheduler:
             insertLRSwapRawWaitAlu, setMatrixReuse, insertLRSwapWarWaitAlu)
         from rocisa.code import Module, Label
         from rocisa.container import sgpr
-        from rocisa.instruction import SCmpEQU32, SCBranchSCC0, SCBranchSCC1, SMovB32
+        from rocisa.instruction import (
+            SCmpEQU32, SCBranchSCC0, SCBranchSCC1, SMovB32, SWaitCnt)
 
         # gfx1250 needs a larger ds_read->waitcnt gap.
         isGfx1250 = writer.states.archCaps.get("HasWmmaArbStallBit", False)
@@ -3763,18 +3765,61 @@ class LogicalScheduler:
         pap_merge_label = Label("SubtilePAPPreloopFirstGRMerge", "") if use_pap_preloop_skip else None
         skipping_first_gr_group = False
         first_gr_group_done = False
+        use_partial_lr_waits = (
+            schedule
+            and self.config.prefetchNextPartition
+            and self.config.numSubIterK == 1
+            and label.startswith("MAINLOOP")
+        )
+        previous_schedule = None
+        first_cell = None
+
+        def mfma_count(em_list):
+            return sum(
+                len(em.instructions)
+                for em in em_list
+                if em.opType == "mfma"
+            )
+
+        def set_wait_lr_count(em_list, count):
+            for em in em_list:
+                if em.opType != "wait_lr":
+                    continue
+                for inst in em.instructions:
+                    if isinstance(inst, SWaitCnt) and inst.dscnt >= 0:
+                        inst.dscnt = count
+                        inst.comment = (
+                            "Wait for immediate LR; leave "
+                            f"{count} later-consumer reads in flight"
+                            if count
+                            else "Wait for all immediate LR"
+                        )
+
         for pi, partition_emitted in enumerate(emitted_3d):
             for k, em_list in enumerate(partition_emitted):
                 module.addComment0(f"partition={pi} subIterK={k}")
                 has_mfma = any(em.opType == 'mfma' for em in em_list)
 
                 if schedule and em_list and has_mfma:
+                    current_mfma_count = mfma_count(em_list)
+                    if use_partial_lr_waits and previous_schedule is not None:
+                        previous_scheduled, previous_em_list = previous_schedule
+                        safe_count = safeOutstandingLocalReadSuffix(
+                            previous_scheduled,
+                            previous_em_list,
+                            current_mfma_count,
+                        )
+                        set_wait_lr_count(em_list, safe_count)
                     scheduled = instructionSchedule(
                         em_list,
                         multiDU=self._is_multi_du(),
                         minGapDsReadToWait=minGapDsReadToWait,
                         partitionPrefetch=self.config.prefetchNextPartition)
                     module.add(scheduled)
+                    if use_partial_lr_waits:
+                        if first_cell is None:
+                            first_cell = (em_list, current_mfma_count)
+                        previous_schedule = (scheduled, em_list)
                 else:
                     for em in em_list:
                         if use_pap_preloop_skip and not first_gr_group_done:
@@ -3792,6 +3837,17 @@ class LogicalScheduler:
                                 first_gr_group_done = True
                         for inst in em.instructions:
                             module.add(inst)
+        if (use_partial_lr_waits
+                and previous_schedule is not None
+                and first_cell is not None):
+            previous_scheduled, previous_em_list = previous_schedule
+            first_em_list, first_mfma_count = first_cell
+            safe_count = safeOutstandingLocalReadSuffix(
+                previous_scheduled,
+                previous_em_list,
+                first_mfma_count,
+            )
+            set_wait_lr_count(first_em_list, safe_count)
         if use_pap_preloop_skip and skipping_first_gr_group and not first_gr_group_done:
             module.add(pap_merge_label)
             module.add(SMovB32(dst=sgpr("PersistentPrefetchState"), src=0,

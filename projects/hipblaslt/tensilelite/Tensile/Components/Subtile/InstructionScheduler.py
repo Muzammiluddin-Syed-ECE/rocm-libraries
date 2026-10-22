@@ -283,6 +283,7 @@ class _SlotPlacer:
 # gfx1250 needs a larger gap (8); other archs use 4.
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT = 4
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250 = 8
+_MAX_LGKMCNT = 15
 
 _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
@@ -792,6 +793,47 @@ def _nextPlacementSlot(placer):
         if placer._placed[pos]:
             return pos + 1
     return 0
+
+
+def safeOutstandingLocalReadSuffix(
+        scheduled, emittedModules, immediateMfmaCount):
+    """Count youngest DS reads unused by the immediate consumer partition.
+
+    A nonzero lgkmcnt can only prove completion for the older prefix of the
+    issue stream. Therefore the reads left outstanding must form a suffix in
+    final physical issue order, and every read in that suffix must have its
+    first consumer beyond all MFMAs in the next partition.
+
+    Missing metadata, an unknown consumer, or an unranked read in the suffix
+    conservatively terminates the count.
+    """
+    if immediateMfmaCount <= 0:
+        return 0
+
+    rankByInstruction = {}
+    for em in emittedModules:
+        if em.opType != "lr":
+            continue
+        if len(em.instructionMetadata) != len(em.instructions):
+            continue
+        for inst, metadata in zip(
+                em.instructions, em.instructionMetadata):
+            if _isDsRead(inst):
+                rankByInstruction[id(inst)] = metadata[0]
+
+    issuedRanks = [
+        rankByInstruction.get(id(inst))
+        for inst in scheduled.flatitems()
+        if _isDsRead(inst)
+    ]
+    safe = 0
+    for rank in reversed(issuedRanks):
+        if rank is None or rank < immediateMfmaCount:
+            break
+        safe += 1
+    # gfx9 encodes lgkmcnt in four bits. A smaller count is a stronger wait,
+    # so clamping an unusually large safe suffix remains conservative.
+    return min(safe, _MAX_LGKMCNT)
 
 
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:

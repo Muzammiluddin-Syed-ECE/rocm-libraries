@@ -3420,6 +3420,48 @@ class TestInstructionSchedulerWrapPrefetch:
         # Partition 1 is 4x2. A2 is first consumed after A0/A1 (four MFMAs).
         assert emitter._first_consumer_rank(placement, 2) == 4
 
+    def test_partial_lgkmcnt_uses_only_safe_final_issue_suffix(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.instruction import DSLoadB128
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            safeOutstandingLocalReadSuffix)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        reads = [
+            DSLoadB128(
+                dst=vgpr(8, 4), src=vgpr(1),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"ds{index}")
+            for index in range(4)
+        ]
+        emitted = [
+            EmittedModule(
+                moduleId=0,
+                instructions=reads,
+                instructionMetadata=[
+                    (0, 1), (1, 1), (5, 1), (6, 1)],
+                source=SimpleNamespace(kind="lr")),
+        ]
+        scheduled = Module()
+        for read in reads:
+            scheduled.add(read)
+        assert safeOutstandingLocalReadSuffix(
+            scheduled, emitted, immediateMfmaCount=4) == 2
+
+        unsafe_tail = Module()
+        for read in (reads[0], reads[2], reads[3], reads[1]):
+            unsafe_tail.add(read)
+        assert safeOutstandingLocalReadSuffix(
+            unsafe_tail, emitted, immediateMfmaCount=4) == 0
+
     def test_data_only_partition_zero_prefetch_is_recognized(self):
         import shutil
         from types import SimpleNamespace
