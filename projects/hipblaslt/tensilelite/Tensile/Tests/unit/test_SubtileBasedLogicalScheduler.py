@@ -3517,6 +3517,48 @@ class TestInstructionSchedulerWrapPrefetch:
         # Partition 1 is 4x2. A2 is first consumed after A0/A1 (four MFMAs).
         assert emitter._first_consumer_rank(placement, 2) == 4
 
+    def test_partial_lgkmcnt_uses_only_safe_final_issue_suffix(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.instruction import DSLoadB128
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            safeOutstandingLocalReadSuffix)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        reads = [
+            DSLoadB128(
+                dst=vgpr(8, 4), src=vgpr(1),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"ds{index}")
+            for index in range(4)
+        ]
+        emitted = [
+            EmittedModule(
+                moduleId=0,
+                instructions=reads,
+                instructionMetadata=[
+                    (0, 1), (1, 1), (5, 1), (6, 1)],
+                source=SimpleNamespace(kind="lr")),
+        ]
+        scheduled = Module()
+        for read in reads:
+            scheduled.add(read)
+        assert safeOutstandingLocalReadSuffix(
+            scheduled, emitted, immediateMfmaCount=4) == 2
+
+        unsafe_tail = Module()
+        for read in (reads[0], reads[2], reads[3], reads[1]):
+            unsafe_tail.add(read)
+        assert safeOutstandingLocalReadSuffix(
+            unsafe_tail, emitted, immediateMfmaCount=4) == 0
+
     def test_data_only_partition_zero_prefetch_is_recognized(self):
         import shutil
         from types import SimpleNamespace
@@ -3551,6 +3593,39 @@ class TestInstructionSchedulerWrapPrefetch:
 
         assert _findPartitionZeroPrefetchOrder(
             [[0, 1, 2]], modules) == [0, 1, 2]
+
+    def test_partial_entry_wait_does_not_weaken_internal_lds_drain(self):
+        from types import SimpleNamespace
+        from rocisa.instruction import SWaitCnt
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            _setEntryWaitLrCount)
+
+        entry_wait = SWaitCnt(dscnt=0, comment="entry")
+        overwrite_wait = SWaitCnt(dscnt=0, comment="overwrite")
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=[], before=1,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1, instructions=[entry_wait],
+                source=SimpleNamespace(kind="wait_lr")),
+            EmittedModule(
+                moduleId=2, instructions=[],
+                source=SimpleNamespace(kind="lr")),
+            EmittedModule(
+                moduleId=3, instructions=[overwrite_wait], before=2,
+                source=SimpleNamespace(kind="wait_lr")),
+            EmittedModule(
+                moduleId=4, instructions=[], before=3,
+                source=SimpleNamespace(kind="sync")),
+        ]
+
+        _setEntryWaitLrCount(modules, 4)
+
+        assert entry_wait.dscnt == 4
+        assert "leave 4 later-consumer reads" in entry_wait.comment
+        assert overwrite_wait.dscnt == 0
+        assert overwrite_wait.comment == "overwrite"
 
     def test_partition_without_leading_reads_right_aligns_vmem(self):
         import shutil

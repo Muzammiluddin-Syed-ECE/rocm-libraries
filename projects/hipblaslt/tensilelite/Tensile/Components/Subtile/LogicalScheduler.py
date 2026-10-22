@@ -772,7 +772,6 @@ class EmittedModule:
     def opType(self) -> str:
         return self.source.kind if self.source else ""
 
-
 # ── Main scheduler class ───────────────────────────────────
 
 class LogicalScheduler:
@@ -3745,7 +3744,8 @@ class LogicalScheduler:
             insertLRSwapRawWaitAlu, setMatrixReuse, insertLRSwapWarWaitAlu)
         from rocisa.code import Module, Label
         from rocisa.container import sgpr
-        from rocisa.instruction import SCmpEQU32, SCBranchSCC0, SCBranchSCC1, SMovB32
+        from rocisa.instruction import (
+            SCmpEQU32, SCBranchSCC0, SCBranchSCC1, SMovB32)
 
         # gfx1250 needs a larger ds_read->waitcnt gap.
         isGfx1250 = writer.states.archCaps.get("HasWmmaArbStallBit", False)
@@ -3770,7 +3770,11 @@ class LogicalScheduler:
                 label=label,
                 multiDU=self._is_multi_du(),
                 minGapDsReadToWait=minGapDsReadToWait,
-                partitionPrefetch=self.config.prefetchNextPartition))
+                partitionPrefetch=self.config.prefetchNextPartition,
+                derivePartialLrWaits=(
+                    self.config.prefetchNextPartition
+                    and self.config.numSubIterK == 1
+                    and label.startswith("MAINLOOP"))))
         else:
             for pi, partition_emitted in enumerate(emitted_3d):
                 for k, em_list in enumerate(partition_emitted):
