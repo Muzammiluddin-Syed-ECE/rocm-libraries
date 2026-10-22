@@ -3605,6 +3605,66 @@ class TestInstructionSchedulerWrapPrefetch:
 
         assert mfma_positions[-2] < gr_position < mfma_positions[-1]
 
+    def test_partition_dtl_setup_and_load_share_mfma_interval(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import (
+            MUBUFModifiers, accvgpr, mgpr, sgpr, vgpr)
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MXMFMAInstruction, SAddU32)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8, accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1], acc=accvgpr(0, 4),
+                a=vgpr(0, 8), b=vgpr(8, 8), acc2=accvgpr(0, 4),
+                mxsa=vgpr(16), mxsb=vgpr(17), block=32,
+                comment=f"mfma{index}")
+            for index in range(5)
+        ]
+        dtl = MUBUFModifiers(offen=True, lds=True)
+        gr_instructions = []
+        for index in range(2):
+            gr_instructions.extend([
+                SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"m0-{index}"),
+                BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, mubuf=dtl, comment=f"gr-{index}"),
+            ])
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1, instructions=gr_instructions,
+                source=SimpleNamespace(kind="gr")),
+        ]
+
+        items = list(instructionSchedule(
+            modules, partitionPrefetch=True).flatitems())
+        for index in range(2):
+            setup_position = next(
+                pos for pos, inst in enumerate(items)
+                if inst.comment == f"m0-{index}")
+            load_position = next(
+                pos for pos, inst in enumerate(items)
+                if inst.comment == f"gr-{index}")
+            assert setup_position < load_position
+            assert not any(
+                isinstance(inst, MXMFMAInstruction)
+                for inst in items[setup_position + 1:load_position])
+
     def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
         from rocisa import rocIsa

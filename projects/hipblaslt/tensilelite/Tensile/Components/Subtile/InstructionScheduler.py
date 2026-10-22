@@ -143,9 +143,62 @@ class _SlotPlacer:
         if self._onPlace:
             self._onPlace(self, pos, item[1])
 
+    def _placeAtomicDtlPair(self, setupItem, loadItem, limit: int) -> Optional[int]:
+        """Place final m0 setup and its DTL request before the same MFMA.
+
+        The pair may use any two slots in one MFMA interval.  Keeping it
+        interval-local ensures that moving setup earlier also ages the actual
+        request instead of leaving a matrix instruction between the two.
+        """
+        setupMid, setupInst = setupItem
+        loadMid, loadInst = loadItem
+        setupLo, setupHi = self.bounds(setupMid)
+        loadLo, loadHi = self.bounds(loadMid)
+
+        first = max(limit, setupLo)
+        for setupPos in range(first, setupHi + 1):
+            intervalEnd = min(
+                self.totalSlots - 1,
+                (setupPos // self.slotsPerInterval + 1)
+                * self.slotsPerInterval - 1,
+            )
+            if not self._canPlace(setupPos, setupInst):
+                continue
+            for loadPos in range(
+                    max(setupPos, loadLo),
+                    min(intervalEnd, loadHi) + 1):
+                if (loadPos == setupPos
+                        and len(self._placed[setupPos]) != 0):
+                    continue
+                if not self._canPlace(loadPos, loadInst):
+                    continue
+                self.place(setupPos, setupItem)
+                self.place(loadPos, loadItem)
+                return loadPos
+
+        # Match the placer's normal overflow behavior: preserve the semantic
+        # boundary even when the abstract slot capacity is exhausted.  This
+        # may overfill a slot, but it cannot move the request across an MFMA.
+        firstInterval = max(0, first // self.slotsPerInterval)
+        lastInterval = (self.totalSlots - 1) // self.slotsPerInterval
+        for interval in range(firstInterval, lastInterval + 1):
+            intervalBegin = interval * self.slotsPerInterval
+            intervalEnd = min(
+                self.totalSlots - 1,
+                intervalBegin + self.slotsPerInterval - 1,
+            )
+            setupPos = max(first, intervalBegin)
+            loadPos = max(setupPos, loadLo)
+            if (setupPos <= min(setupHi, intervalEnd)
+                    and loadPos <= min(loadHi, intervalEnd)):
+                self.place(setupPos, setupItem)
+                self.place(loadPos, loadItem)
+                return loadPos
+        return None
+
     def placePath(self, pathInsts: List[Tuple[int, object]], reverse: bool = False,
                   multiDU: bool = False, startLimit: Optional[int] = None,
-                  overflowToTail: bool = False):
+                  overflowToTail: bool = False, atomicDtl: bool = False):
         """Place a sequence of (moduleId, instruction) items into slots.
 
         Walks pathInsts in order, applying adjusters (forward only) and
@@ -161,12 +214,27 @@ class _SlotPlacer:
         overflowToTail preserves forward path order by placing the first
         unplaceable item and the rest of its path after the final MFMA,
         rather than collapsing them into one overfull slot.
+
+        atomicDtl keeps an adjacent final-m0/DTL-load pair inside one MFMA
+        interval. It is used only by the partition-prefetch phase scheduler.
         """
         limit = ((self.totalSlots - 1) if reverse else 0) \
             if startLimit is None else startLimit
         if not multiDU:
-            for idx, item in enumerate(pathInsts):
+            idx = 0
+            while idx < len(pathInsts):
+                item = pathInsts[idx]
                 mid, inst = item
+                if (atomicDtl and not reverse
+                        and idx + 1 < len(pathInsts)
+                        and _isM0Update(inst)
+                        and _isDtlLoad(pathInsts[idx + 1][1])):
+                    pairEnd = self._placeAtomicDtlPair(
+                        item, pathInsts[idx + 1], limit)
+                    if pairEnd is not None:
+                        limit = pairEnd + 1
+                        idx += 2
+                        continue
                 if not reverse:
                     limit = self.adjustLimit(limit, inst)
                 pos = self.findSlot(mid, inst, limit, reverse=reverse)
@@ -177,6 +245,7 @@ class _SlotPlacer:
                     pos = self._forceSlot(mid, limit, reverse)
                 self.place(pos, item, reverse=reverse)
                 limit = (pos - 1) if reverse else (pos + 1)
+                idx += 1
             return
 
         idx = 0
@@ -249,6 +318,10 @@ _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250 = 8
 
 _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
+# Compiled rocisa buffer-load bindings do not expose their MUBUF modifiers.
+# In this policy an immediately preceding m0 write is the semantic DTL marker:
+# ordinary VGPR buffer loads neither consume nor set m0.
+_isDtlLoad = _isBufferLoad
 _isWaitCnt = lambda x: isinstance(x, SWaitCnt)
 _isM0Update = lambda x: isinstance(x, CommonInstruction) and hasattr(x, 'dst') and hasattr(x.dst, 'regType') and x.dst.regType == 'm'
 _isVALU = lambda x: isinstance(x, CommonInstruction) \
@@ -911,7 +984,9 @@ def instructionSchedule(
         totalSlots=(len(mfmas) - 1) * slotsPerInterval,
         minGapDsReadToWait=minGapDsReadToWait)
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
-                       rules.minGapDsReadToWait, rules.noM0WithBufferLoad]
+                       rules.minGapDsReadToWait]
+    if not (partitionPrefetchPolicy or p0Split is not None):
+        base_validators.append(rules.noM0WithBufferLoad)
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
     if partitionPrefetchPolicy or p0Split is not None:
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
@@ -1002,18 +1077,19 @@ def instructionSchedule(
         phaseLimit = 0 if p0Split is not None else max(
             0, placer.totalSlots - len(allPhaseItems) - reserveSlots)
 
-        def _placePhase(pathInsts):
+        def _placePhase(pathInsts, atomicDtl=False):
             nonlocal phaseLimit
             if not pathInsts:
                 return
             rules.resetPath()
-            placer.placePath(pathInsts, startLimit=phaseLimit)
+            placer.placePath(
+                pathInsts, startLimit=phaseLimit, atomicDtl=atomicDtl)
             phaseLimit = _nextPlacementSlot(placer)
 
         if leading:
             _placePhase(leading)
             for pathInsts in grPaths:
-                _placePhase(pathInsts)
+                _placePhase(pathInsts, atomicDtl=True)
             _placePhase(trailing)
             for pathInsts in otherPaths:
                 _placePhase(pathInsts)
@@ -1025,7 +1101,7 @@ def instructionSchedule(
             for pathInsts in otherPaths:
                 _placePhase(pathInsts)
             for pathInsts in grPaths:
-                _placePhase(pathInsts)
+                _placePhase(pathInsts, atomicDtl=True)
     elif p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
         regularHalves = [
             _splitItemsAfterHalf(
