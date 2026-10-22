@@ -3366,6 +3366,7 @@ class TestInstructionSchedulerWrapPrefetch:
             (make_cfg_du128_4wave(), 0, 0, "SB", 2, 18),
             (make_cfg_du128_4wave(), 2, 1, "A", 0, 16),
             (make_cfg_du128_4wave(), 3, 1, "B", 3, 3),
+            (make_cfg_du128_4wave(), 0, 2, "A", 0, 112),
         ],
     )
     def test_first_consumer_rank_uses_partition_geometry(
@@ -3567,6 +3568,76 @@ class TestInstructionSchedulerWrapPrefetch:
             assert not any(
                 isinstance(inst, MXMFMAInstruction)
                 for inst in items[setup_position + 1:load_position])
+
+    def test_vmem_bundles_follow_first_consumer_rank(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import accvgpr, mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MXMFMAInstruction, SAddU32)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8, accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1], acc=accvgpr(0, 4),
+                a=vgpr(0, 8), b=vgpr(8, 8), acc2=accvgpr(0, 4),
+                mxsa=vgpr(16), mxsb=vgpr(17), block=32,
+                comment=f"mfma{index}")
+            for index in range(5)
+        ]
+
+        def request(name):
+            return [
+                SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=0,
+                    comment=f"m0-{name}"),
+                BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"gr-{name}"),
+            ]
+
+        late = request("late")
+        early = request("early")
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1, instructions=late,
+                instructionMetadata=[(8, 2), (8, 2)],
+                source=SimpleNamespace(kind="gr")),
+            EmittedModule(
+                moduleId=2, instructions=early,
+                instructionMetadata=[(2, 2), (2, 2)],
+                source=SimpleNamespace(kind="gr")),
+            EmittedModule(
+                moduleId=3,
+                instructions=[
+                    SAddU32(
+                        dst=sgpr(24), src0=sgpr(24), src1=128,
+                        comment="srd-tail"),
+                ],
+                before=1,
+                source=SimpleNamespace(kind="gr_inc")),
+        ]
+
+        items = list(instructionSchedule(
+            modules, partitionPrefetch=True).flatitems())
+        positions = {
+            inst.comment: index for index, inst in enumerate(items)
+            if inst.comment in ("gr-early", "gr-late", "srd-tail")
+        }
+        assert positions["gr-early"] < positions["gr-late"]
+        assert positions["gr-late"] < positions["srd-tail"]
 
     def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
