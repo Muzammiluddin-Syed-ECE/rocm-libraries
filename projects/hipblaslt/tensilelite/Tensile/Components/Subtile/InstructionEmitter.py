@@ -127,7 +127,7 @@ class InstructionEmitter:
         self._dispatch = {
             'mfma':         lambda em, ui: self.emit_mfma(em.source, ui),
             'lr':           lambda em, ui: self.emit_lr(em.source, ui, em),
-            'gr':           lambda em, ui: self.emit_gr(em.source, ui),
+            'gr':           lambda em, ui: self.emit_gr(em.source, ui, em),
             'wait_gr':      lambda em, ui: self.emit_wait_gr(em.source),
             'wait_lr':      lambda em, ui: self.emit_wait_lr(),
             'sync':         lambda em, ui: self.emit_sync(),
@@ -145,7 +145,7 @@ class InstructionEmitter:
         self._tail_vDiff = None
 
     def _first_consumer_rank(self, placement, tile_id):
-        """Return an LR atom's next MFMA-use ordinal.
+        """Return an LR or GR atom's next MFMA-use ordinal.
 
         Partition-prefetch local reads execute after the current partition's
         MFMA block.  Rank their destination tile by scanning the *actual*
@@ -179,7 +179,14 @@ class InstructionEmitter:
         has_wmma_source_cache = self.writer.states.asmCaps.get(
             "HasWMMA_V3", False)
 
-        for step in range(1, num_partitions + 1):
+        # LR prefetch normally targets the next partition or next MT. PGR2
+        # requests may target two MTs ahead, so scan as many complete
+        # partition traversals as the semantic target epoch requires.
+        max_steps = max(
+            num_partitions,
+            (max(0, target_epoch) + 1) * num_partitions,
+        )
+        for step in range(1, max_steps + 1):
             linear_partition = placement.partition + step
             epoch = linear_partition // num_partitions
             pi = linear_partition % num_partitions
@@ -356,9 +363,12 @@ class InstructionEmitter:
         assert len(instruction_metadata) == len(instructions)
         return instructions
 
-    def emit_gr(self, placement, unroll_iter=0):
+    def emit_gr(self, placement, unroll_iter=0, emitted_module=None):
         """Emit GR (buffer_load) instructions from GRPlacement."""
         module = Module()
+        instruction_metadata = []
+        if emitted_module is not None:
+            emitted_module.instructionMetadata = instruction_metadata
         tensor = placement.tensor
         if tensor in ('A', 'B'):
             ti = self.tileInfoMap[tensor]
@@ -368,8 +378,16 @@ class InstructionEmitter:
             for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, grGran.mn):
                 for k in range(placement.tiles.subIterK_start, placement.tiles.subIterK_end, grGran.k):
                     subtileK = (k - uid_k_base) // subtileShapeK
-                    module.add(emitSingleBufferLoad(ti, self.kernel, tileId, subtileK,
-                                                    writer=self.writer, mt=placement.mtIteration))
+                    request = emitSingleBufferLoad(
+                        ti, self.kernel, tileId, subtileK,
+                        writer=self.writer, mt=placement.mtIteration)
+                    request_instructions = list(request.flatitems())
+                    first_consumer = self._first_consumer_rank(
+                        placement, tileId)
+                    instruction_metadata.extend(
+                        [(first_consumer, len(request_instructions))]
+                        * len(request_instructions))
+                    module.add(request)
         elif tensor in ('SA', 'SB'):
             # Dual-period MXFP8: one scale epoch (256 K) feeds scaleReuse data
             # iterations.  Prefetch the next epoch's scales (SRD advance + DTL
@@ -378,8 +396,15 @@ class InstructionEmitter:
             if getattr(self.config, 'dualPeriodScale', False) and unroll_iter > 0:
                 return []
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
-            module.add(globalReadDoScaleSubtile(
-                tc, self.writer, self.kernel, mt=placement.mtIteration))
+            request = globalReadDoScaleSubtile(
+                tc, self.writer, self.kernel, mt=placement.mtIteration)
+            request_instructions = list(request.flatitems())
+            first_consumer = self._first_consumer_rank(
+                placement, placement.tiles.tileId_start)
+            instruction_metadata.extend(
+                [(first_consumer, len(request_instructions))]
+                * len(request_instructions))
+            module.add(request)
         return list(module.flatitems())
 
     def emit_wait_gr(self, source):

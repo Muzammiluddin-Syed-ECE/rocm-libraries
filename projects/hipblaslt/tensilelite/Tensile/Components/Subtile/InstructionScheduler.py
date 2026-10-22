@@ -713,6 +713,76 @@ def _splitAfterFirstConsumerCohort(pathInsts, emittedModules):
     return pathInsts[:split], pathInsts[split:]
 
 
+def _orderGlobalReadBundlesByFirstConsumer(grPaths, emittedModules):
+    """Order complete GR request bundles by their next MFMA consumer.
+
+    The emitter assigns one metadata rank and span to every instruction in a
+    request atom (address setup, final m0 setup, and DTL load). Only a
+    contiguous GR prefix may move. Any SRD update or other path tail remains
+    after every request, preserving its producer dependencies.
+
+    Return the original flattened order when metadata or topology is
+    incomplete so unrelated schedules remain byte-identical.
+    """
+    original = [item for path in grPaths for item in path]
+    bundles = []
+    tails = []
+    original_index = 0
+    saw_rank = False
+
+    for path in grPaths:
+        module_groups = []
+        for item in path:
+            if not module_groups or module_groups[-1][0] != item[0]:
+                module_groups.append((item[0], [item]))
+            else:
+                module_groups[-1][1].append(item)
+
+        in_tail = False
+        path_tail = []
+        for mid, module_items in module_groups:
+            em = emittedModules[mid]
+            if em.opType != "gr":
+                in_tail = True
+                path_tail.extend(module_items)
+                continue
+            if in_tail:
+                return original
+
+            metadata = em.instructionMetadata
+            if len(metadata) != len(module_items):
+                return original
+            offset = 0
+            while offset < len(module_items):
+                rank, span = metadata[offset]
+                if not isinstance(span, int) or span <= 0:
+                    return original
+                end = offset + span
+                if end > len(module_items):
+                    return original
+                if any(metadata[index] != (rank, span)
+                       for index in range(offset, end)):
+                    return original
+                saw_rank = saw_rank or rank is not None
+                bundles.append((
+                    rank if rank is not None else float("inf"),
+                    original_index,
+                    module_items[offset:end],
+                ))
+                original_index += 1
+                offset = end
+        tails.extend(path_tail)
+
+    if not saw_rank:
+        return original
+    bundles.sort(key=lambda entry: entry[:2])
+    return [
+        item
+        for _rank, _index, bundle in bundles
+        for item in bundle
+    ] + tails
+
+
 def _hasPartitionPrefetchReads(emittedModules):
     """Whether this cell belongs to partition-directed local-read prefetch."""
     return any(
@@ -1054,6 +1124,9 @@ def instructionSchedule(
             else:
                 otherPaths.append(pathInsts)
 
+        orderedGrItems = _orderGlobalReadBundlesByFirstConsumer(
+            grPaths, emittedModules)
+
         if p0Split is not None:
             first, rest = _splitAfterFirstConsumerCohort(
                 p0Payload, emittedModules)
@@ -1062,7 +1135,7 @@ def instructionSchedule(
 
         allPhaseItems = (
             leading
-            + [item for path in grPaths for item in path]
+            + orderedGrItems
             + trailing
             + [item for path in otherPaths for item in path]
         )
@@ -1088,8 +1161,7 @@ def instructionSchedule(
 
         if leading:
             _placePhase(leading)
-            for pathInsts in grPaths:
-                _placePhase(pathInsts, atomicDtl=True)
+            _placePhase(orderedGrItems, atomicDtl=True)
             _placePhase(trailing)
             for pathInsts in otherPaths:
                 _placePhase(pathInsts)
@@ -1100,8 +1172,7 @@ def instructionSchedule(
             _placePhase(trailing)
             for pathInsts in otherPaths:
                 _placePhase(pathInsts)
-            for pathInsts in grPaths:
-                _placePhase(pathInsts, atomicDtl=True)
+            _placePhase(orderedGrItems, atomicDtl=True)
     elif p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
         regularHalves = [
             _splitItemsAfterHalf(
