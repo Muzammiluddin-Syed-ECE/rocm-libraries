@@ -938,7 +938,9 @@ def _scheduleCmsMxfp8LocalSync(
     M17-M18 and share M20, avoiding a separate M31 LDS drain. Data DTL
     requests follow the CMS A-first M8-M25 and B M26-M53 phases. A counted
     M46 VMEM wait leaves the newest 15 requests in flight, makes the two
-    early readiness waits redundant, and permits barriers at M7/M21/M47.
+    early readiness waits redundant, and permits barriers at M7/M47.
+    The former M21 barrier is redundant: M7 releases the low B tiles, while
+    M47 releases the high B tiles before their loop-carried overwrite.
     Loop-carried reads occupy M48-M55 and drain at M61.
     """
     mfmas, prefix, after = _splitCmsGlobalStream(scheduledGroups)
@@ -1076,10 +1078,9 @@ def _scheduleCmsMxfp8LocalSync(
 
     setLocalWait(
         p2WaitLr,
-        "CMS: drain B and p2 scale reads before M21"
-        if hasScaleReads else "CMS: drain B reads before M21")
+        "CMS: drain B and p2 scale reads at M20"
+        if hasScaleReads else "CMS: drain B reads at M20")
     appendModule(p2WaitLr, after[20])
-    appendModule(p1Barrier, after[21])
 
     # The initial preloop instance is drained once outside LoopBeginL. Every
     # subsequent iteration consumes the M48-M55 wrap reads here, under the
@@ -1088,8 +1089,14 @@ def _scheduleCmsMxfp8LocalSync(
     appendModule(p0WaitLr, after[61])
 
     # The former p3-entry LDS drain is redundant in both copies: C0's p2
-    # scales now share M20, while C1 has no scale payload.
-    retiredIds = {id(inst) for inst in p3WaitLr.instructions}
+    # scales now share M20, while C1 has no scale payload. The M21 barrier is
+    # also retired: every wave has completed the high-tile reads at M20, and
+    # all corresponding same-half overwrites occur after the M47 barrier.
+    retiredIds = {
+        id(inst)
+        for em in (p1Barrier, p3WaitLr)
+        for inst in em.instructions
+    }
 
     def requestPairs(emitted):
         insts = [

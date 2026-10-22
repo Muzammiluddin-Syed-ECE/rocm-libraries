@@ -3500,7 +3500,7 @@ class TestIntegration:
                     for inst in bucket
                     if isinstance(inst, SBarrier)
                 ]
-                assert barriers == [7, 21, 47]
+                assert barriers == [7, 47]
 
                 waitGr = [
                     (position, inst.vlcnt)
@@ -3607,7 +3607,7 @@ class TestIntegration:
                 assert sum(
                     isinstance(inst, GlobalReadInstruction)
                     for inst in global_items) == (18 if ui == 0 else 16)
-                assert len(global_items) == (167 if ui == 0 else 145)
+                assert len(global_items) == (166 if ui == 0 else 144)
 
             loopItems = list(sched.emitMainAndExitLoops(
                 writer, kernel).flatitems())
