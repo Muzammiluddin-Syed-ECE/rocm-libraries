@@ -199,7 +199,8 @@ class _SlotPlacer:
 
     def placePath(self, pathInsts: List[Tuple[int, object]], reverse: bool = False,
                   multiDU: bool = False, startLimit: Optional[int] = None,
-                  overflowToTail: bool = False, atomicDtl: bool = False):
+                  overflowToTail: bool = False, atomicDtl: bool = False,
+                  mfmaBetweenWaitAndBarrier: bool = False):
         """Place a sequence of (moduleId, instruction) items into slots.
 
         Walks pathInsts in order, applying adjusters (forward only) and
@@ -218,6 +219,9 @@ class _SlotPlacer:
 
         atomicDtl keeps an adjacent final-m0/DTL-load pair inside one MFMA
         interval. It is used only by the partition-prefetch phase scheduler.
+
+        mfmaBetweenWaitAndBarrier places an adjacent wait_gr/barrier pair on
+        opposite sides of one MFMA whenever another interval is available.
         """
         limit = ((self.totalSlots - 1) if reverse else 0) \
             if startLimit is None else startLimit
@@ -226,6 +230,29 @@ class _SlotPlacer:
             while idx < len(pathInsts):
                 item = pathInsts[idx]
                 mid, inst = item
+                if (mfmaBetweenWaitAndBarrier and not reverse
+                        and idx + 1 < len(pathInsts)
+                        and _isWaitGr(inst)
+                        and _isBarrier(pathInsts[idx + 1][1])):
+                    limit = self.adjustLimit(limit, inst)
+                    waitPos = self.findSlot(mid, inst, limit)
+                    if waitPos is None:
+                        waitPos = self._forceSlot(mid, limit, False)
+                    nextInterval = (
+                        waitPos // self.slotsPerInterval + 1
+                    ) * self.slotsPerInterval
+                    if nextInterval < self.totalSlots:
+                        self.place(waitPos, item)
+                        barrierItem = pathInsts[idx + 1]
+                        barrierPos = self.findSlot(
+                            barrierItem[0], barrierItem[1], nextInterval)
+                        if barrierPos is None:
+                            barrierPos = self._forceSlot(
+                                barrierItem[0], nextInterval, False)
+                        self.place(barrierPos, barrierItem)
+                        limit = barrierPos + 1
+                        idx += 2
+                        continue
                 if (atomicDtl and not reverse
                         and idx + 1 < len(pathInsts)
                         and _isM0Update(inst)
@@ -605,8 +632,9 @@ def _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules):
 def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     """Move p0's full LR drain before its independent younger reads.
 
-    Returns the matched order, a pre-MFMA wait/sync prefix, and the payload
-    path to spread through four 4-cycle scheduling slots per MXMFMA.
+    Returns the matched order, a pre-MFMA wait/sync prefix, the payload path
+    to spread through four 4-cycle scheduling slots per MXMFMA, and the sync
+    subset that a phase scheduler may defer until after MFMA0.
     """
     order = _findPartitionZeroPrefetchOrder(
         preMfmaOrders, emittedModules)
@@ -614,6 +642,7 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
         return None
 
     prefixInsts = []
+    syncInsts = []
     for opType in ("wait_gr", "sync", "wait_lr"):
         for mid in order:
             em = emittedModules[mid]
@@ -623,14 +652,17 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
                 if opType == "wait_lr" and _isWaitCnt(inst):
                     inst.dscnt = 0
                     inst.comment = "Wait for preloop LR before p0 MFMA"
-                prefixInsts.append((mid, inst))
+                item = (mid, inst)
+                prefixInsts.append(item)
+                if opType == "sync":
+                    syncInsts.append(item)
 
     payloadOrder = [
         mid for mid in order
         if emittedModules[mid].opType not in ("wait_gr", "sync", "wait_lr")
     ]
     payloadInsts = _flattenPath(payloadOrder, emittedModules)
-    return order, prefixInsts, payloadOrder, payloadInsts
+    return order, prefixInsts, payloadOrder, payloadInsts, syncInsts
 
 
 def _orderLocalReadsByFirstConsumer(pathInsts, emittedModules):
@@ -1039,6 +1071,7 @@ def instructionSchedule(
     )
 
     p0Payload = p0Split[3] if p0Split is not None else None
+    p0Sync = p0Split[4] if p0Split is not None else []
     p0PayloadReordered = False
     if p0Split is not None:
         reordered = _orderLocalReadsByFirstConsumer(
@@ -1054,10 +1087,15 @@ def instructionSchedule(
     if p0Split is not None and not p0PayloadReordered:
         placementPathOrders.append(p0Split[2])
 
-    def _emitPreMfma(result):
+    def _emitPreMfma(result, deferSync=False):
+        deferredSyncIds = {
+            id(inst) for _, inst in p0Sync
+        } if deferSync else set()
         for order in preMfmaOrders:
             if p0Split is not None and order == p0Split[0]:
                 for _, inst in p0Split[1]:
+                    if id(inst) in deferredSyncIds:
+                        continue
                     result.add(inst)
                 continue
             for mid in order:
@@ -1177,7 +1215,8 @@ def instructionSchedule(
             trailing.extend(rest)
 
         allPhaseItems = (
-            leading
+            p0Sync
+            + leading
             + orderedGrItems
             + trailing
             + [item for path in otherPaths for item in path]
@@ -1193,17 +1232,23 @@ def instructionSchedule(
         phaseLimit = 0 if p0Split is not None else max(
             0, placer.totalSlots - len(allPhaseItems) - reserveSlots)
 
-        def _placePhase(pathInsts, atomicDtl=False):
+        def _placePhase(
+                pathInsts, atomicDtl=False,
+                mfmaBetweenWaitAndBarrier=False):
             nonlocal phaseLimit
             if not pathInsts:
                 return
             rules.resetPath()
             placer.placePath(
-                pathInsts, startLimit=phaseLimit, atomicDtl=atomicDtl)
+                pathInsts,
+                startLimit=phaseLimit,
+                atomicDtl=atomicDtl,
+                mfmaBetweenWaitAndBarrier=mfmaBetweenWaitAndBarrier)
             phaseLimit = _nextPlacementSlot(placer)
 
+        _placePhase(p0Sync)
         if leading:
-            _placePhase(leading)
+            _placePhase(leading, mfmaBetweenWaitAndBarrier=True)
             _placePhase(orderedGrItems, atomicDtl=True)
             _placePhase(trailing)
             for pathInsts in otherPaths:
@@ -1247,7 +1292,7 @@ def instructionSchedule(
             placer.placePath(p0Payload)
 
     scheduled = Module()
-    _emitPreMfma(scheduled)
+    _emitPreMfma(scheduled, deferSync=canUseThreePhase)
     scheduled.add(placer.assemble(mfmas))
 
     # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads

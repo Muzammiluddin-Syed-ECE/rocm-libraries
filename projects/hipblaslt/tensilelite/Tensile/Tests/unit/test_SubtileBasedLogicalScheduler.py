@@ -3407,7 +3407,11 @@ class TestInstructionSchedulerWrapPrefetch:
         )
 
         assert [type(inst) for inst in items[:4]] == [
-            SWaitCntEx, SBarrier, SWaitCnt, MXMFMAInstruction]
+            SWaitCntEx, SWaitCnt, MXMFMAInstruction, SBarrier]
+        barrier_position = next(
+            index for index, inst in enumerate(items)
+            if isinstance(inst, SBarrier))
+        assert mfma_positions[0] < barrier_position < mfma_positions[1]
         assert wait.dscnt == 0
         assert wait.comment == "Wait for preloop LR before p0 MFMA"
         assert not any(
@@ -3417,7 +3421,10 @@ class TestInstructionSchedulerWrapPrefetch:
 
         # The earliest-consumer LR cohort leads, followed by the complete
         # partition VMEM cohort and then the remaining LRs.
-        assert items[mfma_positions[0] + 1].comment == "ds8"
+        assert next(
+            inst.comment for inst in items[mfma_positions[0] + 1:]
+            if isinstance(inst, DSLoadB128)
+        ) == "ds8"
         expected_reads = [
             "ds8", "ds14", "ds0", "ds1", "ds2", "ds3", "ds15", "ds4",
             "ds5", "ds6", "ds7", "ds9", "ds10", "ds12", "ds13", "ds11",
@@ -3810,6 +3817,75 @@ class TestInstructionSchedulerWrapPrefetch:
         }
         assert positions["gr-early"] < positions["gr-late"]
         assert positions["gr-late"] < positions["srd-tail"]
+
+    def test_partition_wait_and_barrier_straddle_independent_mfma(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import (
+            DSModifiers, accvgpr, sgpr, vgpr)
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            DSLoadB128, MXMFMAInstruction, SBarrier)
+        from Tensile.Components.Subtile.InstructionEmitter import SWaitCntEx
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8, accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1], acc=accvgpr(0, 4),
+                a=vgpr(0, 8), b=vgpr(8, 8), acc2=accvgpr(0, 4),
+                mxsa=vgpr(16), mxsb=vgpr(17), block=32,
+                comment=f"mfma{index}")
+            for index in range(5)
+        ]
+        reads = [
+            DSLoadB128(
+                dst=vgpr(8, 4), src=vgpr(1),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"ds{index}")
+            for index in range(2)
+        ]
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1,
+                instructions=[SWaitCntEx(vlcnt=3, dscnt=-1)],
+                source=SimpleNamespace(kind="wait_gr")),
+            EmittedModule(
+                moduleId=2, instructions=[SBarrier(comment="barrier")],
+                before=1, source=SimpleNamespace(kind="sync")),
+            EmittedModule(
+                moduleId=3, instructions=reads,
+                instructionMetadata=[(0, 1), (1, 1)],
+                before=2,
+                source=SimpleNamespace(
+                    kind="lr", partition=1, targetPartition=2,
+                    mtIteration=0)),
+        ]
+
+        items = list(instructionSchedule(
+            modules, partitionPrefetch=True).flatitems())
+        wait_position = next(
+            index for index, inst in enumerate(items)
+            if isinstance(inst, SWaitCntEx))
+        barrier_position = next(
+            index for index, inst in enumerate(items)
+            if isinstance(inst, SBarrier))
+        assert any(
+            isinstance(inst, MXMFMAInstruction)
+            for inst in items[wait_position + 1:barrier_position])
+        assert all(
+            not isinstance(inst, DSLoadB128)
+            for inst in items[:barrier_position])
 
     def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
