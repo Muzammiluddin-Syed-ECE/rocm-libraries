@@ -3415,10 +3415,9 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # Split only after complete m0/buffer-load pairs. Local reads are
-        # ordered by first consumer, with shorter groups winning equal
-        # deadlines, then divided into two equal cohorts.
-        assert items[mfma_positions[0] + 1].comment == "m0-0"
+        # The earliest-consumer LR cohort leads, followed by the complete
+        # partition VMEM cohort and then the remaining LRs.
+        assert items[mfma_positions[0] + 1].comment == "ds8"
         expected_reads = [
             "ds8", "ds14", "ds0", "ds1", "ds2", "ds3", "ds15", "ds4",
             "ds5", "ds6", "ds7", "ds9", "ds10", "ds12", "ds13", "ds11",
@@ -3429,10 +3428,10 @@ class TestInstructionSchedulerWrapPrefetch:
                 ("m0-", "gr-", "ds"))
         ]
         assert clustered == [
+            *expected_reads[:4],
             "m0-0", "gr-0", "m0-1", "gr-1",
-            *expected_reads[:8],
             "m0-2", "gr-2", "m0-3", "gr-3",
-            *expected_reads[8:],
+            *expected_reads[4:],
         ]
         assert [
             inst.comment for inst in items
@@ -3551,6 +3550,60 @@ class TestInstructionSchedulerWrapPrefetch:
 
         assert _findPartitionZeroPrefetchOrder(
             [[0, 1, 2]], modules) == [0, 1, 2]
+
+    def test_partition_without_leading_reads_right_aligns_vmem(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import accvgpr, mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MXMFMAInstruction, SAddU32)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8, accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1], acc=accvgpr(0, 4),
+                a=vgpr(0, 8), b=vgpr(8, 8), acc2=accvgpr(0, 4),
+                mxsa=vgpr(16), mxsb=vgpr(17), block=32,
+                comment=f"mfma{index}")
+            for index in range(4)
+        ]
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1,
+                instructions=[
+                    SAddU32(
+                        dst=mgpr(0), src0=sgpr(20), src1=0,
+                        comment="m0"),
+                    BufferLoadB128(
+                        dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                        soffset=0, comment="gr"),
+                ],
+                source=SimpleNamespace(kind="gr")),
+        ]
+
+        items = list(instructionSchedule(
+            modules, partitionPrefetch=True).flatitems())
+        mfma_positions = [
+            index for index, inst in enumerate(items)
+            if isinstance(inst, MXMFMAInstruction)
+        ]
+        gr_position = next(
+            index for index, inst in enumerate(items)
+            if isinstance(inst, BufferLoadB128))
+
+        assert mfma_positions[-2] < gr_position < mfma_positions[-1]
 
     def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil

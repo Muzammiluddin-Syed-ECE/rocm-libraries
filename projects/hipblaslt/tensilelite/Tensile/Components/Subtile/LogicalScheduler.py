@@ -3769,7 +3769,8 @@ class LogicalScheduler:
                 emitted_3d,
                 label=label,
                 multiDU=self._is_multi_du(),
-                minGapDsReadToWait=minGapDsReadToWait))
+                minGapDsReadToWait=minGapDsReadToWait,
+                partitionPrefetch=self.config.prefetchNextPartition))
         else:
             for pi, partition_emitted in enumerate(emitted_3d):
                 for k, em_list in enumerate(partition_emitted):
@@ -3780,7 +3781,8 @@ class LogicalScheduler:
                         scheduled = instructionSchedule(
                             em_list,
                             multiDU=self._is_multi_du(),
-                            minGapDsReadToWait=minGapDsReadToWait)
+                            minGapDsReadToWait=minGapDsReadToWait,
+                            partitionPrefetch=self.config.prefetchNextPartition)
                         module.add(scheduled)
                     else:
                         for em in em_list:

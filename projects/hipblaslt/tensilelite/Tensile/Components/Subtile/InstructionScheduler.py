@@ -39,6 +39,7 @@ class LoopScheduleContext:
     totalMfmaCount: int
     multiDU: bool
     minGapDsReadToWait: int
+    partitionPrefetch: bool
 
 
 LoopSchedulePolicy = Callable[[LoopScheduleContext], Optional[Module]]
@@ -572,16 +573,19 @@ def _orderLocalReadsByFirstConsumer(pathInsts, emittedModules):
     """
     reads = []
     nonReads = []
-    module_offsets = {}
     for original_index, item in enumerate(pathInsts):
         mid, inst = item
-        instruction_index = module_offsets.get(mid, 0)
-        module_offsets[mid] = instruction_index + 1
         if not _isDsRead(inst):
             nonReads.append(item)
             continue
+        instruction_index = next(
+            (index for index, candidate
+             in enumerate(emittedModules[mid].instructions)
+             if candidate is inst),
+            -1,
+        )
         metadata = emittedModules[mid].instructionMetadata
-        if instruction_index >= len(metadata):
+        if instruction_index < 0 or instruction_index >= len(metadata):
             return None
         rank, span = metadata[instruction_index]
         rank = rank if rank is not None else float("inf")
@@ -591,6 +595,64 @@ def _orderLocalReadsByFirstConsumer(pathInsts, emittedModules):
         return None
     reads.sort(key=lambda entry: entry[:3])
     return [item for _, _, _, item in reads] + nonReads
+
+
+def _splitAfterFirstConsumerCohort(pathInsts, emittedModules):
+    """Split after all consecutive LR groups sharing the earliest deadline.
+
+    ``pathInsts`` may begin with synchronization and address setup. Those
+    instructions stay attached to the leading cohort. Atomic multi-instruction
+    reads share one metadata rank, so the split never bisects a read group.
+    """
+    first_rank = None
+    split = None
+    saw_first_cohort = False
+
+    for index, (mid, inst) in enumerate(pathInsts):
+        if not _isDsRead(inst):
+            continue
+        instruction_index = next(
+            (item_index for item_index, candidate
+             in enumerate(emittedModules[mid].instructions)
+             if candidate is inst),
+            -1,
+        )
+        metadata = emittedModules[mid].instructionMetadata
+        if instruction_index < 0 or instruction_index >= len(metadata):
+            return [], pathInsts
+        rank, _span = metadata[instruction_index]
+        if rank is None:
+            if saw_first_cohort:
+                split = index
+                break
+            continue
+        if first_rank is None:
+            first_rank = rank
+            saw_first_cohort = True
+        elif rank != first_rank:
+            split = index
+            break
+
+    if not saw_first_cohort:
+        return [], pathInsts
+    if split is None:
+        split = len(pathInsts)
+    return pathInsts[:split], pathInsts[split:]
+
+
+def _hasPartitionPrefetchReads(emittedModules):
+    """Whether this cell belongs to partition-directed local-read prefetch."""
+    return any(
+        em.opType == "lr"
+        and any(_isDsRead(inst) for inst in em.instructions)
+        and (
+            getattr(em.source, "targetPartition",
+                    getattr(em.source, "partition", 0))
+            != getattr(em.source, "partition", 0)
+            or getattr(em.source, "mtIteration", 0) > 0
+        )
+        for em in emittedModules
+    )
 
 
 def _splitItemsAfterHalf(pathInsts, predicate):
@@ -740,8 +802,10 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
     return mfmaIdx, regularPaths, preMfmaPaths
 
 
-def instructionSchedule(emittedModules, multiDU: bool = False,
-                      minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT):
+def instructionSchedule(
+        emittedModules, multiDU: bool = False,
+        minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
+        partitionPrefetch: bool = False):
     """Interleave non-MFMA instructions between MFMAs.
 
     Rules (shared):
@@ -773,13 +837,20 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
     mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
     p0Split = None
-    if mfmas and all(
+    isMx8Cycle = bool(mfmas) and all(
             isinstance(inst, MXMFMAInstruction)
-            and inst.getIssueLatency() == 8 for inst in mfmas):
+            and inst.getIssueLatency() == 8 for inst in mfmas)
+    if isMx8Cycle:
         p0Split = _splitPartitionZeroPrefetch(
             preMfmaOrders, emittedModules)
     if p0Split is None:
         _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
+    partitionPrefetchPolicy = (
+        isMx8Cycle
+        and not multiDU
+        and (partitionPrefetch
+             or _hasPartitionPrefetchReads(emittedModules))
+    )
 
     p0Payload = p0Split[3] if p0Split is not None else None
     p0PayloadReordered = False
@@ -790,7 +861,9 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
             p0Payload = reordered
             p0PayloadReordered = True
 
-    slotsPerInterval = 4 if p0Split is not None else 2
+    slotsPerInterval = (
+        4 if partitionPrefetchPolicy or p0Split is not None else 2
+    )
     placementPathOrders = list(pathOrders)
     if p0Split is not None and not p0PayloadReordered:
         placementPathOrders.append(p0Split[2])
@@ -821,13 +894,26 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         return result
 
     paths = _classifyPaths(pathOrders, emittedModules)
+    phasePathInsts = []
+    canUseThreePhase = partitionPrefetchPolicy
+    for order, _hasWaitGR in paths:
+        pathInsts = _flattenPath(order, emittedModules)
+        hasLR = any(_isDsRead(inst) for _, inst in pathInsts)
+        hasGR = any(_isBufferLoad(inst) for _, inst in pathInsts)
+        if hasLR and hasGR:
+            canUseThreePhase = False
+        phasePathInsts.append((order, pathInsts, hasLR, hasGR))
+    if canUseThreePhase:
+        # The phase scheduler below preserves dependencies explicitly.
+        placementPathOrders = []
+
     rules = _SchedulingRules(
         totalSlots=(len(mfmas) - 1) * slotsPerInterval,
         minGapDsReadToWait=minGapDsReadToWait)
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
                        rules.minGapDsReadToWait, rules.noM0WithBufferLoad]
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
-    if p0Split is not None:
+    if partitionPrefetchPolicy or p0Split is not None:
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
@@ -876,7 +962,71 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
             if multiDU and hasWaitGR:
                 rules.setPostWaitGrDsReadFence(placer)
 
-    if p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
+    if canUseThreePhase:
+        leading = []
+        trailing = []
+        grPaths = []
+        otherPaths = []
+
+        for _order, pathInsts, hasLR, hasGR in phasePathInsts:
+            if hasLR:
+                first, rest = _splitAfterFirstConsumerCohort(
+                    pathInsts, emittedModules)
+                leading.extend(first)
+                trailing.extend(rest)
+            elif hasGR:
+                grPaths.append(pathInsts)
+            else:
+                otherPaths.append(pathInsts)
+
+        if p0Split is not None:
+            first, rest = _splitAfterFirstConsumerCohort(
+                p0Payload, emittedModules)
+            leading.extend(first)
+            trailing.extend(rest)
+
+        allPhaseItems = (
+            leading
+            + [item for path in grPaths for item in path]
+            + trailing
+            + [item for path in otherPaths for item in path]
+        )
+        numDsReads = sum(
+            _isDsRead(inst) for _, inst in allPhaseItems)
+        numBufferLoads = sum(
+            _isBufferLoad(inst) for _, inst in allPhaseItems)
+        # Right-align non-p0 work so synchronization remains hidden behind
+        # independent MFMAs. Reserve holes for DS issue-pair restrictions and
+        # m0/load pairing; p0's synchronization remains before MFMA0.
+        reserveSlots = (numDsReads + 1) // 2 + numBufferLoads
+        phaseLimit = 0 if p0Split is not None else max(
+            0, placer.totalSlots - len(allPhaseItems) - reserveSlots)
+
+        def _placePhase(pathInsts):
+            nonlocal phaseLimit
+            if not pathInsts:
+                return
+            rules.resetPath()
+            placer.placePath(pathInsts, startLimit=phaseLimit)
+            phaseLimit = _nextPlacementSlot(placer)
+
+        if leading:
+            _placePhase(leading)
+            for pathInsts in grPaths:
+                _placePhase(pathInsts)
+            _placePhase(trailing)
+            for pathInsts in otherPaths:
+                _placePhase(pathInsts)
+        else:
+            # No immediate consumer can use an LR prefix. Keep independent
+            # work first and right-align the VMEM cohort near the partition
+            # tail, as in the CMS schedule.
+            _placePhase(trailing)
+            for pathInsts in otherPaths:
+                _placePhase(pathInsts)
+            for pathInsts in grPaths:
+                _placePhase(pathInsts)
+    elif p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
         regularHalves = [
             _splitItemsAfterHalf(
                 _flattenPath(order, emittedModules), _isBufferLoad)
@@ -928,7 +1078,8 @@ def buildLoopScheduleContext(
         *,
         label: str,
         multiDU: bool = False,
-        minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT
+        minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
+        partitionPrefetch: bool = False
 ) -> LoopScheduleContext:
     """Build a loop-wide timeline from the geometry that codegen emitted.
 
@@ -962,6 +1113,7 @@ def buildLoopScheduleContext(
         totalMfmaCount=mfmaOrdinal,
         multiDU=multiDU,
         minGapDsReadToWait=minGapDsReadToWait,
+        partitionPrefetch=partitionPrefetch,
     )
 
 
@@ -971,6 +1123,7 @@ def instructionScheduleLoop(
         label: str,
         multiDU: bool = False,
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
+        partitionPrefetch: bool = False,
         policy: Optional[LoopSchedulePolicy] = None
 ) -> Module:
     """Schedule one complete emitted loop with a safe partition-local fallback.
@@ -984,6 +1137,7 @@ def instructionScheduleLoop(
         label=label,
         multiDU=multiDU,
         minGapDsReadToWait=minGapDsReadToWait,
+        partitionPrefetch=partitionPrefetch,
     )
     if policy is not None:
         scheduled = policy(context)
@@ -999,7 +1153,8 @@ def instructionScheduleLoop(
             result.add(instructionSchedule(
                 emittedModules,
                 multiDU=context.multiDU,
-                minGapDsReadToWait=context.minGapDsReadToWait))
+                minGapDsReadToWait=context.minGapDsReadToWait,
+                partitionPrefetch=context.partitionPrefetch))
         else:
             for em in emittedModules:
                 for inst in em.instructions:
