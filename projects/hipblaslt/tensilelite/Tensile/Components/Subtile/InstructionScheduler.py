@@ -9,7 +9,7 @@ with pluggable scheduling rules.
 
 from dataclasses import dataclass
 from typing import Callable, List, Tuple, Optional
-from rocisa.code import Module
+from rocisa.code import Module, TextBlock
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
     LocalReadInstruction, GlobalReadInstruction, CommonInstruction
 
@@ -42,6 +42,7 @@ class LoopScheduleContext:
     partitionPrefetch: bool
     derivePartialLrWaits: bool
     limitDtlBundlesPerMfma: bool
+    uniformPgrEpoch: bool
 
 
 LoopSchedulePolicy = Callable[[LoopScheduleContext], Optional[Module]]
@@ -82,6 +83,7 @@ class _SlotPlacer:
         self._validators = validators or []
         self._adjusters = adjusters or []
         self._onPlace = onPlace
+        self.denseToFit = False
 
         self._placed: List[List[Tuple[int, object]]] = [[] for _ in range(self.totalSlots)]
         self._firstPos: List[Optional[int]] = [None] * numModules
@@ -103,12 +105,42 @@ class _SlotPlacer:
         begin = (pos // self.slotsPerInterval) * self.slotsPerInterval
         end = min(self.totalSlots, begin + self.slotsPerInterval)
         return sum(
-            len(self._placed[slot])
+            sum(
+                not isinstance(item[1], TextBlock)
+                for item in self._placed[slot]
+            )
             for slot in range(begin, end)
         )
 
+    def _remainingCapacityWithIntervalCap(self, pos: int, cap: int) -> int:
+        """Return physical follower capacity from pos under a preferred cap."""
+        firstInterval = max(0, pos // self.slotsPerInterval)
+        lastInterval = (self.totalSlots - 1) // self.slotsPerInterval
+        return sum(
+            max(
+                0,
+                cap - self._intervalInstructionCount(
+                    interval * self.slotsPerInterval),
+            )
+            for interval in range(firstInterval, lastInterval + 1)
+        )
+
+    def _nextForwardLimit(self, pos: int, remainingItems: int) -> int:
+        """Reuse a slot only when a two-follower schedule cannot fit."""
+        if (self.denseToFit
+                and remainingItems
+                > self._remainingCapacityWithIntervalCap(pos, 2)):
+            return pos
+        return pos + 1
+
     def _canPlace(self, pos: int, inst) -> bool:
-        if pos < 0 or pos >= self.totalSlots or len(self._placed[pos]) >= 2:
+        if pos < 0 or pos >= self.totalSlots:
+            return False
+        if isinstance(inst, TextBlock):
+            return True
+        if sum(
+                not isinstance(item[1], TextBlock)
+                for item in self._placed[pos]) >= 2:
             return False
         if (self.maxInstructionsPerInterval is not None
                 and self._intervalInstructionCount(pos)
@@ -206,7 +238,9 @@ class _SlotPlacer:
                     max(setupPos, loadLo),
                     min(intervalEnd, loadHi) + 1):
                 if (loadPos == setupPos
-                        and len(self._placed[setupPos]) != 0):
+                        and any(
+                            not isinstance(item[1], TextBlock)
+                            for item in self._placed[setupPos])):
                     continue
                 if not self._canPlace(loadPos, loadInst):
                     continue
@@ -321,7 +355,15 @@ class _SlotPlacer:
                         return
                     pos = self._forceSlot(mid, limit, reverse)
                 self.place(pos, item, reverse=reverse)
-                limit = (pos - 1) if reverse else (pos + 1)
+                remaining = sum(
+                    not isinstance(nextItem[1], TextBlock)
+                    for nextItem in pathInsts[idx + 1:])
+                if reverse:
+                    limit = pos - 1
+                elif isinstance(inst, TextBlock):
+                    limit = pos
+                else:
+                    limit = self._nextForwardLimit(pos, remaining)
                 idx += 1
             return
 
@@ -463,7 +505,13 @@ class _SchedulingRules:
             _isDsRead(item[1])
             for slot in range(first, end)
             for item in placer._placed[slot])
-        return reads < placer.slotsPerInterval - 1
+        limit = placer.slotsPerInterval \
+            if placer.denseToFit else placer.slotsPerInterval - 1
+        return reads < limit
+
+    def oneDtlLoadPerInterval(self, placer, pos, inst):
+        """Keep every DTL request, including an unpaired first request, isolated."""
+        return not _isDtlLoad(inst) or not placer._intervalHasDtlLoad(pos)
 
     def oneDtlLoadPerInterval(self, placer, pos, inst):
         """Keep every DTL request, including an unpaired request, isolated."""
@@ -1092,7 +1140,8 @@ def instructionSchedule(
         emittedModules, multiDU: bool = False,
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
         partitionPrefetch: bool = False,
-        limitDtlBundlesPerMfma: bool = False):
+        limitDtlBundlesPerMfma: bool = False,
+        uniformPgrEpoch: bool = False):
     """Interleave non-MFMA instructions between MFMAs.
 
     Rules (shared):
@@ -1196,6 +1245,10 @@ def instructionSchedule(
         return result
 
     paths = _classifyPaths(pathOrders, emittedModules)
+    uniformEpochFrontier = (
+        uniformPgrEpoch
+        and any(hasWaitGR for _, hasWaitGR in paths)
+    )
     phasePathInsts = []
     canUseThreePhase = partitionPrefetchPolicy
     for order, _hasWaitGR in paths:
@@ -1319,28 +1372,45 @@ def instructionSchedule(
         # Each atomic m0/DTL-load pair consumes one abstract placement slot,
         # not two. Account for that when right-aligning the VMEM tail.
         estimatedSlots = len(allPhaseItems) - numBufferLoads
-        phaseLimit = 0 if p0Split is not None else max(
-            0, placer.totalSlots - estimatedSlots - reserveSlots)
+        phaseLimit = (
+            0
+            if (p0Split is not None or uniformPgrEpoch)
+            else max(0, placer.totalSlots - estimatedSlots - reserveSlots)
+        )
 
         def _placePhase(
                 pathInsts, atomicDtl=False,
-                mfmaBetweenWaitAndBarrier=False):
+                mfmaBetweenWaitAndBarrier=False, denseToFit=False):
             nonlocal phaseLimit
             if not pathInsts:
                 return
             rules.resetPath()
-            placer.placePath(
-                pathInsts,
-                startLimit=phaseLimit,
-                atomicDtl=atomicDtl,
-                mfmaBetweenWaitAndBarrier=mfmaBetweenWaitAndBarrier)
+            placer.denseToFit = denseToFit
+            try:
+                placer.placePath(
+                    pathInsts,
+                    startLimit=phaseLimit,
+                    atomicDtl=atomicDtl,
+                    mfmaBetweenWaitAndBarrier=mfmaBetweenWaitAndBarrier)
+            finally:
+                placer.denseToFit = False
             phaseLimit = max(phaseLimit, _nextPlacementSlot(placer))
 
         _placePhase(p0Sync)
         if leading:
-            _placePhase(leading, mfmaBetweenWaitAndBarrier=True)
-            _placePhase(orderedGrItems, atomicDtl=True)
-            _placePhase(trailing)
+            if uniformEpochFrontier:
+                # Complete the future epoch first.  The following VMEM wait is
+                # adjusted by the post-pass for every buffer load placed here,
+                # yielding: GR(n+2) → vmcnt → barrier → LR(n+1).
+                _placePhase(orderedGrItems, atomicDtl=True)
+                _placePhase(
+                    leading + trailing,
+                    mfmaBetweenWaitAndBarrier=True,
+                    denseToFit=True)
+            else:
+                _placePhase(leading, mfmaBetweenWaitAndBarrier=True)
+                _placePhase(orderedGrItems, atomicDtl=True)
+                _placePhase(trailing)
             for pathInsts in otherPaths:
                 _placePhase(pathInsts)
         else:
@@ -1406,7 +1476,8 @@ def buildLoopScheduleContext(
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
         partitionPrefetch: bool = False,
         derivePartialLrWaits: bool = False,
-        limitDtlBundlesPerMfma: bool = False
+        limitDtlBundlesPerMfma: bool = False,
+        uniformPgrEpoch: bool = False
 ) -> LoopScheduleContext:
     """Build a loop-wide timeline from the geometry that codegen emitted.
 
@@ -1443,6 +1514,7 @@ def buildLoopScheduleContext(
         partitionPrefetch=partitionPrefetch,
         derivePartialLrWaits=derivePartialLrWaits,
         limitDtlBundlesPerMfma=limitDtlBundlesPerMfma,
+        uniformPgrEpoch=uniformPgrEpoch,
     )
 
 
@@ -1492,6 +1564,7 @@ def instructionScheduleLoop(
         partitionPrefetch: bool = False,
         derivePartialLrWaits: bool = False,
         limitDtlBundlesPerMfma: bool = False,
+        uniformPgrEpoch: bool = False,
         policy: Optional[LoopSchedulePolicy] = None
 ) -> Module:
     """Schedule one complete emitted loop with a safe partition-local fallback.
@@ -1508,6 +1581,7 @@ def instructionScheduleLoop(
         partitionPrefetch=partitionPrefetch,
         derivePartialLrWaits=derivePartialLrWaits,
         limitDtlBundlesPerMfma=limitDtlBundlesPerMfma,
+        uniformPgrEpoch=uniformPgrEpoch,
     )
     if policy is not None:
         scheduled = policy(context)
@@ -1536,7 +1610,8 @@ def instructionScheduleLoop(
                     multiDU=context.multiDU,
                     minGapDsReadToWait=context.minGapDsReadToWait,
                     partitionPrefetch=context.partitionPrefetch,
-                    limitDtlBundlesPerMfma=context.limitDtlBundlesPerMfma)
+                    limitDtlBundlesPerMfma=context.limitDtlBundlesPerMfma,
+                    uniformPgrEpoch=context.uniformPgrEpoch)
             except _DtlIntervalCapacityError:
                 # Dependency windows can make the bundle-count check
                 # optimistic. Fall back to the prior legal density policy for
@@ -1546,7 +1621,8 @@ def instructionScheduleLoop(
                     multiDU=context.multiDU,
                     minGapDsReadToWait=context.minGapDsReadToWait,
                     partitionPrefetch=context.partitionPrefetch,
-                    limitDtlBundlesPerMfma=False)
+                    limitDtlBundlesPerMfma=False,
+                    uniformPgrEpoch=context.uniformPgrEpoch)
             result.add(scheduled)
             if context.derivePartialLrWaits:
                 if firstCell is None:
