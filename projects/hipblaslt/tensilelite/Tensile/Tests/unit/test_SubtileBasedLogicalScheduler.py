@@ -15,6 +15,7 @@ Organized by pass:
   12. Integration    — Full pipeline with real instructions
 """
 import pytest
+from dataclasses import replace
 from Tensile.Components.Subtile.Kernel import (
     TileInfo, AB_B8, AB_B16, AB_B16_W32, AB_B4, MXSA_B4, MXSB_B4, CD_F32, CD_F32_W32,
 )
@@ -29,6 +30,7 @@ from Tensile.Components.Subtile.LogicalScheduler import (
     LRPlacement,
     GRPlacement,
     Dep,
+    WaitGROp,
     WaitGRCounts,
     fmt_mt,
 )
@@ -2309,6 +2311,219 @@ class TestRemoveUnnecessaryWaitLrSync:
                                         'wait_gr', 'wait_gr', 'wait_lr', 'skip')
 
 
+class TestUniformPgrEpoch:
+    """CMS-style complete future epochs with partitioned MFMA scheduling."""
+
+    @staticmethod
+    def _cfg(**changes):
+        return replace(
+            make_cfg_du128_4wave(),
+            uniformPgrEpoch=True,
+            **changes)
+
+    @staticmethod
+    def _grs(sched, tensors=None):
+        result = [
+            gr
+            for partition in sched._partitions
+            for slot in partition
+            for gr in slot.grs
+        ]
+        if tensors is not None:
+            result = [gr for gr in result if gr.tensor in tensors]
+        return result
+
+    @staticmethod
+    def _tile_atoms(grs, tensor, granularity):
+        return [
+            tile
+            for gr in grs if gr.tensor == tensor
+            for tile in range(
+                gr.tiles.tileId_start,
+                gr.tiles.tileId_end,
+                granularity.mn)
+        ]
+
+    def test_complete_n2_epoch_precedes_first_n1_consumer(self):
+        cfg = self._cfg()
+        sched = LogicalScheduler(cfg)
+        sched.build()
+
+        ab_grs = self._grs(sched, ('A', 'B'))
+        assert ab_grs
+        assert all(gr.mtIteration == 2 for gr in ab_grs)
+        assert sorted(self._tile_atoms(ab_grs, 'A', cfg.grA)) == list(range(8))
+        assert sorted(self._tile_atoms(ab_grs, 'B', cfg.grB)) == list(range(8))
+
+        frontier = sched._uniform_epoch_frontier_slot()
+        assert frontier == 3
+        for pi, partition in enumerate(sched._partitions):
+            for slot in partition:
+                if slot.grs:
+                    assert pi * cfg.numSubIterK + slot.subIterK <= frontier
+
+    def test_preloop_seeds_complete_n1_epoch(self):
+        cfg = self._cfg()
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.build_preloop()
+
+        mt1 = [
+            em.source
+            for partition in sched._preloop_emitted
+            for group in partition
+            for em in group
+            if isinstance(em.source, GRPlacement)
+            and em.source.mtIteration == 1
+        ]
+        assert sorted(self._tile_atoms(mt1, 'A', cfg.grA)) == list(range(8))
+        assert sorted(self._tile_atoms(mt1, 'B', cfg.grB)) == list(range(8))
+        assert sum(gr.tensor == 'SA' for gr in mt1) == 1
+        assert sum(gr.tensor == 'SB' for gr in mt1) == 1
+
+    def test_n2_overwrites_depend_on_overlapping_old_buffer_reads(self):
+        sched = LogicalScheduler(self._cfg())
+        sched.build(stop_after=Pass.DEPS)
+
+        for gr in self._grs(sched, ('A', 'B')):
+            lr_deps = [
+                dep for dep in gr.deps
+                if isinstance(dep.ref, LRPlacement)
+                and dep.ref.tensor == gr.tensor
+                and dep.ref.tiles.tileId_start < gr.tiles.tileId_end
+                and gr.tiles.tileId_start < dep.ref.tiles.tileId_end
+            ]
+            assert lr_deps, f"{gr} has no overlapping read-before-overwrite dep"
+            assert all(
+                dep.ref.mtIteration + dep.mt_offset == gr.mtIteration - 2
+                for dep in lr_deps)
+
+    def test_one_epoch_wait_has_exact_c0_c1_younger_request_counts(self):
+        sched = LogicalScheduler(self._cfg())
+        sched.build()
+        waits = [
+            op
+            for partition in sched._partitions
+            for slot in partition
+            for lr in slot.lrs
+            for op in lr.preOps
+            if isinstance(op, WaitGROp)
+        ]
+
+        assert len(waits) == 1
+        counts = waits[0].wait_gr_counts_by_unroll
+        assert counts is not None and len(counts) == 2
+        frontier = sched._uniform_epoch_frontier_slot()
+        frontier_grs = [
+            gr
+            for pi, partition in enumerate(sched._partitions)
+            for slot in partition
+            if pi * sched.config.numSubIterK + slot.subIterK == frontier
+            for gr in slot.grs
+        ]
+        adjusted = []
+        for body, base in enumerate(counts):
+            values = [base.A, base.B, base.SA, base.SB]
+            for gr in frontier_grs:
+                if gr.tensor in ('SA', 'SB') and body % 2:
+                    continue
+                values[('A', 'B', 'SA', 'SB').index(gr.tensor)] \
+                    += sched._count_gr_atoms(gr)
+            adjusted.append(tuple(values))
+        assert adjusted[0] \
+            == (8, 8, 1, 1)
+        assert adjusted[1] \
+            == (8, 8, 0, 0)
+
+    def test_eight_body_c0_c1_fifo_ledger_has_no_unsafe_ab_consumer(self):
+        """The frontier wait publishes each complete A/B producer epoch."""
+        sched = LogicalScheduler(self._cfg())
+        sched.build()
+        grs = self._grs(sched)
+        wait = next(
+            op
+            for partition in sched._partitions
+            for slot in partition
+            for lr in slot.lrs
+            for op in lr.preOps
+            if isinstance(op, WaitGROp))
+        frontier = sched._uniform_epoch_frontier_slot()
+        frontier_grs = [
+            gr
+            for pi, partition in enumerate(sched._partitions)
+            for slot in partition
+            if pi * sched.config.numSubIterK + slot.subIterK == frontier
+            for gr in slot.grs
+        ]
+
+        # The preloop wait publishes epoch 0 and leaves complete epoch 1
+        # requests in flight.  Model VMEM completion as an ordered request
+        # ledger; vmcnt(N) retires every request older than the youngest N.
+        queue = [(1, gr.tensor)
+                 for gr in grs
+                 if not (gr.tensor in ('SA', 'SB') and gr.mtIteration < 2)
+                 for _ in range(sched._count_gr_atoms(gr))]
+        guaranteed_ab_epochs = {0}
+        for body in range(8):
+            # Prefix consumers read body n, published by the prior frontier.
+            assert body in guaranteed_ab_epochs
+
+            for gr in grs:
+                if gr.tensor in ('SA', 'SB') and body % 2:
+                    continue
+                queue.extend(
+                    [(body + gr.mtIteration, gr.tensor)]
+                    * sched._count_gr_atoms(gr))
+
+            counts = wait.wait_gr_counts_by_unroll[body % 2]
+            target = counts.A + counts.B + counts.SA + counts.SB
+            target += sum(
+                sched._count_gr_atoms(gr)
+                for gr in frontier_grs
+                if not (gr.tensor in ('SA', 'SB') and body % 2))
+            del queue[:max(0, len(queue) - target)]
+
+            consumed_epoch = body + 1
+            assert not any(
+                epoch == consumed_epoch and tensor in ('A', 'B')
+                for epoch, tensor in queue)
+            guaranteed_ab_epochs.add(consumed_epoch)
+
+    @pytest.mark.parametrize(
+        "m,n,pm,pn",
+        [(8, 4, 4, 2), (6, 8, 4, 4), (4, 4, 2, 2), (4, 2, 2, 2)])
+    def test_representative_partition_geometries(self, m, n, pm, pn):
+        cfg = self._cfg(
+            numMFMATilesM=m,
+            numMFMATilesN=n,
+            partitionSizeM=pm,
+            partitionSizeN=pn)
+        sched = LogicalScheduler(cfg)
+        sched.build()
+
+        ab_grs = self._grs(sched, ('A', 'B'))
+        assert sorted(self._tile_atoms(ab_grs, 'A', cfg.grA)) == list(range(m))
+        assert sorted(self._tile_atoms(ab_grs, 'B', cfg.grB)) == list(range(n))
+        assert all(gr.mtIteration == 2 for gr in ab_grs)
+        assert sum(
+            isinstance(op, WaitGROp)
+            for partition in sched._partitions
+            for slot in partition
+            for lr in slot.lrs
+            for op in lr.preOps) == 1
+
+    def test_legacy_policy_and_pgr1_default_remain_unchanged(self):
+        legacy = make_cfg_du128_4wave()
+        assert not legacy.uniformPgrEpoch
+        sched = LogicalScheduler(legacy)
+        sched.build()
+        assert {gr.mtIteration for gr in self._grs(sched, ('A', 'B'))} == {1, 2}
+
+        pgr1 = make_cfg_fp8(256, 256, [4, 1], pgr=1)
+        assert not pgr1.uniformPgrEpoch
+        LogicalScheduler(pgr1).build()
+
+
 # ══════════════════════════════════════════════════════════════
 # Step 10: Emit
 # ══════════════════════════════════════════════════════════════
@@ -3202,6 +3417,59 @@ class TestInstructionSchedulerWrapPrefetch:
             if isinstance(inst, LocalReadInstruction)
         ] == [f"ds{i}" for i in range(16)]
         assert sum(len(em.instructions) for em in modules) == len(items)
+
+    def test_dense_epoch_frontier_ignores_text_and_caps_followers_at_three(self):
+        from rocisa.code import TextBlock
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.instruction import DSLoadB128, SBarrier, VXorB32
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            _SchedulingRules, _SlotPlacer)
+
+        # Initialize rocISA through the shared fixture helper.
+        self._schedule()
+
+        rules = _SchedulingRules(totalSlots=7 * 3)
+        placer = _SlotPlacer(
+            intervals=7,
+            numModules=1,
+            pathOrders=[],
+            validators=[
+                rules.oneDsReadPerInterval,
+                rules.noDsReadOrValuInFirstSlot,
+            ],
+            onPlace=rules.trackPlacement,
+            slotsPerInterval=3,
+            maxInstructionsPerInterval=3)
+        placer.place(0, (0, SBarrier(comment="barrier")))
+
+        payload = [
+            (0, TextBlock("// zero-width marker\n")),
+            *[
+                (0, VXorB32(dst=vgpr(index), src0=vgpr(index),
+                            src1=vgpr(index + 1)))
+                for index in range(4)
+            ],
+            *[
+                (0, DSLoadB128(
+                    dst=vgpr(8, 4),
+                    src=vgpr(1),
+                    ds=DSModifiers(offset=index * 16),
+                    comment=f"ds{index}"))
+                for index in range(16)
+            ],
+        ]
+        placer.denseToFit = True
+        placer.placePath(payload, startLimit=1)
+
+        physical_counts = [
+            sum(
+                not isinstance(item[1], TextBlock)
+                for slot in placer._placed[begin:begin + 3]
+                for item in slot)
+            for begin in range(0, placer.totalSlots, 3)
+        ]
+        assert physical_counts == [3] * 7
+        assert not placer.leftovers
 
     def test_partition_zero_wait_precedes_interleaved_prefetch_reads(self):
         import shutil
