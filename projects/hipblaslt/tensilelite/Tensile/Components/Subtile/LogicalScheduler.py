@@ -3774,7 +3774,8 @@ class LogicalScheduler:
                 derivePartialLrWaits=(
                     self.config.prefetchNextPartition
                     and self.config.numSubIterK == 1
-                    and label.startswith("MAINLOOP"))))
+                    and label.startswith("MAINLOOP")),
+                limitDtlBundlesPerMfma=self.config.dualPeriodScale))
         else:
             for pi, partition_emitted in enumerate(emitted_3d):
                 for k, em_list in enumerate(partition_emitted):
@@ -3786,7 +3787,8 @@ class LogicalScheduler:
                             em_list,
                             multiDU=self._is_multi_du(),
                             minGapDsReadToWait=minGapDsReadToWait,
-                            partitionPrefetch=self.config.prefetchNextPartition)
+                            partitionPrefetch=self.config.prefetchNextPartition,
+                            limitDtlBundlesPerMfma=self.config.dualPeriodScale)
                         module.add(scheduled)
                     else:
                         for em in em_list:

@@ -3396,7 +3396,8 @@ class TestInstructionSchedulerWrapPrefetch:
                 em.instructionMetadata.append(
                     (rank_by_index[index], 2 if index < 8 else 1))
 
-        items = list(instructionSchedule(modules).flatitems())
+        items = list(instructionSchedule(
+            modules, limitDtlBundlesPerMfma=True).flatitems())
         mfma_positions = [
             i for i, inst in enumerate(items)
             if isinstance(inst, MXMFMAInstruction)
@@ -3419,8 +3420,9 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # The earliest-consumer LR cohort leads, followed by the complete
-        # partition VMEM cohort and then the remaining LRs.
+        # Finish the earliest-consumer LDS cohort before writing the future
+        # LDS epoch.  Then issue exactly one m0/load bundle per MFMA interval;
+        # remaining LDS reads follow.
         assert next(
             inst.comment for inst in items[mfma_positions[0] + 1:]
             if isinstance(inst, DSLoadB128)
@@ -3436,8 +3438,10 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         assert clustered == [
             *expected_reads[:4],
-            "m0-0", "gr-0", "m0-1", "gr-1",
-            "m0-2", "gr-2", "m0-3", "gr-3",
+            "m0-0", "gr-0",
+            "m0-1", "gr-1",
+            "m0-2", "gr-2",
+            "m0-3", "gr-3",
             *expected_reads[4:],
         ]
         assert [
@@ -3453,8 +3457,19 @@ class TestInstructionSchedulerWrapPrefetch:
                 for inst in items[begin + 1:end])
             for begin, end in zip(mfma_positions, mfma_positions[1:])
         ]
+        global_reads_per_interval = [
+            sum(isinstance(inst, BufferLoadB128)
+                for inst in items[begin + 1:end])
+            for begin, end in zip(mfma_positions, mfma_positions[1:])
+        ]
+        instructions_per_interval = [
+            end - begin - 1
+            for begin, end in zip(mfma_positions, mfma_positions[1:])
+        ]
         assert sum(count > 0 for count in reads_per_interval) >= 8
         assert max(reads_per_interval) <= 2
+        assert max(global_reads_per_interval) <= 1
+        assert max(instructions_per_interval) <= 3
         assert next(
             i for i, inst in reversed(list(enumerate(items)))
             if isinstance(inst, DSLoadB128)
@@ -3887,7 +3902,7 @@ class TestInstructionSchedulerWrapPrefetch:
             not isinstance(inst, DSLoadB128)
             for inst in items[:barrier_position])
 
-    def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
+    def test_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
         from rocisa import rocIsa
         from rocisa.container import DSModifiers, vgpr
@@ -3905,13 +3920,13 @@ class TestInstructionSchedulerWrapPrefetch:
             ds=DSModifiers(offset=0))
         valu = VXorB32(
             dst=vgpr(2), src0=vgpr(2), src1=vgpr(3))
-        rules = _SchedulingRules(totalSlots=8)
+        rules = _SchedulingRules(totalSlots=4)
         placer = _SlotPlacer(
             intervals=2,
             numModules=2,
             pathOrders=[[0], [1]],
             validators=[rules.noDsReadOrValuInFirstSlot],
-            slotsPerInterval=4)
+            slotsPerInterval=2)
 
         placer.placePath([(0, ds_read)])
         placer.placePath([(1, valu)])
@@ -3921,8 +3936,8 @@ class TestInstructionSchedulerWrapPrefetch:
             for pos, slot in enumerate(placer._placed)
             for _, inst in slot
         }
-        assert positions[id(ds_read)] % 4 != 0
-        assert positions[id(valu)] % 4 != 0
+        assert positions[id(ds_read)] % 2 != 0
+        assert positions[id(valu)] % 2 != 0
 
 
 class TestIntegration:
