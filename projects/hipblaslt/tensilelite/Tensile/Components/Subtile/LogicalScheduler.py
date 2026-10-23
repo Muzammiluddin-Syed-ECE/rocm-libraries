@@ -4075,6 +4075,7 @@ class LogicalScheduler:
             _ADVANCE_FINAL_PARTITION_FOLLOWERS,
             _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT,
             _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
+            _FINAL_PARTITION_SYNC_ADVANCE_MFMAS,
             _MAX_PREVIOUS_PARTITION_DTL_LOADS,
             _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX,
             advancePartitionInterleave,
@@ -4163,7 +4164,9 @@ class LogicalScheduler:
                             dropRedundantFinalLgkm=(
                                 _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT),
                             advanceFinalFollowers=(
-                                _ADVANCE_FINAL_PARTITION_FOLLOWERS))
+                                _ADVANCE_FINAL_PARTITION_FOLLOWERS),
+                            finalSyncAdvanceMfmas=(
+                                _FINAL_PARTITION_SYNC_ADVANCE_MFMAS))
                     module.add(scheduled)
                     if use_partial_lr_waits:
                         if first_cell is None:
