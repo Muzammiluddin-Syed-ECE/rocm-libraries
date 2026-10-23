@@ -481,6 +481,9 @@ class _SchedulingRules:
         self.earliestWaitCntPos = totalSlots
         self.waitGrBarrierPos: Optional[int] = None
         self.maxDsReadAfterWaitGr = -1
+        self.p0OverwritePrerequisiteIds = set()
+        self.youngerP0OverwriteIds = set()
+        self.partialP0OverwriteWaitIds = set()
         self.minGap = minGapDsReadToWait
         # Per-path state
         self._resetPath()
@@ -526,6 +529,8 @@ class _SchedulingRules:
     def minGapDsReadBeforeWait(self, placer, pos, inst):
         """Reject ds_read too close to an already-placed waitcnt ahead."""
         if not _isDsRead(inst):
+            return True
+        if id(inst) in self.youngerP0OverwriteIds:
             return True
         if pos >= self.earliestWaitCntPos:
             return True
@@ -600,7 +605,8 @@ class _SchedulingRules:
 
     def trackPlacement(self, placer, pos, inst):
         """Update rule state after a successful placement."""
-        if _isDsRead(inst):
+        if (_isDsRead(inst)
+                and id(inst) not in self.youngerP0OverwriteIds):
             self.lastDsReadPos = max(self.lastDsReadPos, pos)
         if _isWaitCnt(inst):
             self.earliestWaitCntPos = min(self.earliestWaitCntPos, pos)
@@ -1347,11 +1353,33 @@ def instructionSchedule(
         orderedGrItems = _orderGlobalReadBundlesByFirstConsumer(
             grPaths, emittedModules)
 
+        overwriteReads = []
         if p0Split is not None:
+            overwriteReads = [
+                item for item in p0Payload
+                if getattr(
+                    emittedModules[item[0]].source,
+                    "mustPrecedeP0Overwrite",
+                    False)
+            ]
+            regularP0Payload = [
+                item for item in p0Payload
+                if not getattr(
+                    emittedModules[item[0]].source,
+                    "mustPrecedeP0Overwrite",
+                    False)
+            ]
             first, rest = _splitAfterFirstConsumerCohort(
-                p0Payload, emittedModules)
+                regularP0Payload, emittedModules)
             leading.extend(first)
+            # These current-epoch reads overlap the p0 future-write cohort.
+            # Keep the normal next-partition LR prefix first, but issue every
+            # overwrite prerequisite before the GR path's lgkmcnt+barrier.
+            leading.extend(overwriteReads)
             trailing.extend(rest)
+            for _, inst in overwriteReads:
+                if _isDsRead(inst):
+                    rules.p0OverwritePrerequisiteIds.add(id(inst))
 
         allPhaseItems = (
             p0Sync
@@ -1379,7 +1407,8 @@ def instructionSchedule(
 
         def _placePhase(
                 pathInsts, atomicDtl=False,
-                mfmaBetweenWaitAndBarrier=False, denseToFit=False):
+                mfmaBetweenWaitAndBarrier=False, denseToFit=False,
+                startOverride=None, overflowToTail=False):
             nonlocal phaseLimit
             if not pathInsts:
                 return
@@ -1388,7 +1417,11 @@ def instructionSchedule(
             try:
                 placer.placePath(
                     pathInsts,
-                    startLimit=phaseLimit,
+                    startLimit=(
+                        phaseLimit
+                        if startOverride is None
+                        else startOverride),
+                    overflowToTail=overflowToTail,
                     atomicDtl=atomicDtl,
                     mfmaBetweenWaitAndBarrier=mfmaBetweenWaitAndBarrier)
             finally:
@@ -1408,8 +1441,91 @@ def instructionSchedule(
                     denseToFit=True)
             else:
                 _placePhase(leading, mfmaBetweenWaitAndBarrier=True)
+                if overwriteReads and trailing and orderedGrItems:
+                    # Fill the MFMA intervals needed to age the prerequisite
+                    # read with unrelated, younger LDS reads.  The overwrite
+                    # wait is converted to lgkmcnt(N) below, so these requests
+                    # may remain pending while the older overlapping read is
+                    # guaranteed complete.
+                    budget = max(
+                        0,
+                        (rules.minGap - 1)
+                        * (slotsPerInterval - 1))
+                    preWaitTail = []
+                    postWaitTail = []
+                    used = 0
+                    index = 0
+                    while index < len(trailing):
+                        moduleId = trailing[index][0]
+                        inst = trailing[index][1]
+                        instructionIndex = next(
+                            (itemIndex for itemIndex, candidate
+                             in enumerate(
+                                 emittedModules[moduleId].instructions)
+                             if candidate is inst),
+                            -1)
+                        metadata = emittedModules[moduleId].instructionMetadata
+                        atomRank = (
+                            metadata[instructionIndex][0]
+                            if (instructionIndex >= 0
+                                and instructionIndex < len(metadata))
+                            else None)
+                        end = index + 1
+                        while (end < len(trailing)
+                               and trailing[end][0] == moduleId):
+                            nextInst = trailing[end][1]
+                            nextIndex = next(
+                                (itemIndex for itemIndex, candidate
+                                 in enumerate(
+                                     emittedModules[moduleId].instructions)
+                                 if candidate is nextInst),
+                                -1)
+                            nextRank = (
+                                metadata[nextIndex][0]
+                                if (nextIndex >= 0
+                                    and nextIndex < len(metadata))
+                                else None)
+                            if nextRank != atomRank:
+                                break
+                            end += 1
+                        group = trailing[index:end]
+                        if (all(_isDsRead(item[1]) for item in group)
+                                and used + len(group) <= budget):
+                            preWaitTail.extend(group)
+                            used += len(group)
+                        else:
+                            postWaitTail.extend(group)
+                        index = end
+
+                    for _, inst in preWaitTail:
+                        if _isDsRead(inst):
+                            rules.youngerP0OverwriteIds.add(id(inst))
+                    for _, inst in orderedGrItems:
+                        if _isWaitCnt(inst) and inst.dscnt >= 0:
+                            rules.partialP0OverwriteWaitIds.add(id(inst))
+                            break
+
+                    _placePhase(preWaitTail)
+                    trailing = postWaitTail
                 _placePhase(orderedGrItems, atomicDtl=True)
-                _placePhase(trailing)
+                if overwriteReads and trailing:
+                    # The five-request p0 cohort leaves one physical follower
+                    # slot in most MFMA intervals.  Reuse those holes for the
+                    # independent LR tail instead of stacking it after the
+                    # penultimate MFMA.  Dependencies still prevent any item
+                    # from crossing its producer; this only relaxes the
+                    # artificial phase frontier.
+                    grSlots = [
+                        pos
+                        for pos, slot in enumerate(placer._placed)
+                        if any(_isBufferLoad(inst) for _, inst in slot)
+                    ]
+                    _placePhase(
+                        trailing,
+                        startOverride=min(grSlots) if grSlots else None,
+                        overflowToTail=True)
+                else:
+                    _placePhase(trailing)
             for pathInsts in otherPaths:
                 _placePhase(pathInsts)
         else:
@@ -1457,7 +1573,24 @@ def instructionSchedule(
     # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
     # that the scheduler placed before it within this subIterK.
     bufLoadCount = 0
+    sawOverwritePrerequisite = False
+    youngerOverwriteReads = 0
     for inst in scheduled.flatitems():
+        if id(inst) in rules.p0OverwritePrerequisiteIds:
+            sawOverwritePrerequisite = True
+            youngerOverwriteReads = 0
+        elif (sawOverwritePrerequisite
+              and id(inst) in rules.youngerP0OverwriteIds
+              and _isDsRead(inst)):
+            youngerOverwriteReads += 1
+        elif id(inst) in rules.partialP0OverwriteWaitIds:
+            inst.dscnt = youngerOverwriteReads
+            inst.comment = (
+                "Wait for p0 overwrite prerequisite; "
+                f"leave {youngerOverwriteReads} younger LR requests in flight")
+            sawOverwritePrerequisite = False
+            youngerOverwriteReads = 0
+
         if _isBufferLoad(inst):
             bufLoadCount += 1
         elif _isWaitCnt(inst) and inst.vlcnt >= 0:

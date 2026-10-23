@@ -2321,6 +2321,63 @@ class TestUniformPgrEpoch:
                 if slot.grs:
                     assert pi * cfg.numSubIterK + slot.subIterK <= frontier
 
+    def test_partition_zero_gets_five_writes_and_only_required_hoisted_read(self):
+        cfg = self._cfg()
+        sched = LogicalScheduler(cfg)
+        sched.build(stop_after=Pass.LR)
+
+        hoisted = [
+            lr
+            for slot in sched._partitions[0]
+            for lr in slot.lrs
+            if lr.mustPrecedeP0Overwrite
+        ]
+        assert len(hoisted) == 1
+        assert hoisted[0].tensor == "A"
+        assert (
+            hoisted[0].tiles.tileId_start,
+            hoisted[0].tiles.tileId_end,
+        ) == (4, 5)
+
+        remaining = [
+            lr
+            for partition in sched._partitions[1:]
+            for slot in partition
+            for lr in slot.lrs
+            if (lr.tensor == "A"
+                and lr.mtIteration == 0
+                and lr.tiles.tileId_start <= 5 < lr.tiles.tileId_end)
+        ]
+        assert len(remaining) == 1
+        assert (
+            remaining[0].tiles.tileId_start,
+            remaining[0].tiles.tileId_end,
+        ) == (5, 8)
+
+        sched = LogicalScheduler(cfg)
+        sched.build(stop_after=Pass.GR)
+        counts = []
+        for partition in sched._partitions:
+            counts.append(sum(
+                sched._count_gr_atoms(gr)
+                for slot in partition
+                for gr in slot.grs
+                if gr.tensor in ("A", "B")
+            ))
+        assert counts == [5, 5, 5, 1]
+
+        p0_atoms = [
+            (gr.tensor, tile)
+            for slot in sched._partitions[0]
+            for gr in slot.grs
+            if gr.tensor in ("A", "B")
+            for tile in range(
+                gr.tiles.tileId_start,
+                gr.tiles.tileId_end,
+                getattr(cfg, f"gr{gr.tensor}").mn)
+        ]
+        assert p0_atoms == [("A", tile) for tile in range(5)]
+
     def test_preloop_seeds_complete_n1_epoch(self):
         cfg = self._cfg()
         sched = LogicalScheduler(cfg)
