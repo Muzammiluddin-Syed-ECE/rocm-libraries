@@ -65,10 +65,11 @@ _MAX_PREVIOUS_PARTITION_DTL_LOADS = 5
 # LGKM-producing instruction.  Keep its former placement as a seam anchor so
 # the retained P2 DTL cohort does not otherwise move.
 _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
-# Experiment 36 isolates the final-partition phase reorder from the following
-# seam-advance experiment.  Keep every real P3 follower in P3 for this
-# checkpoint; the removed LGKM wait still supplies the empty seam anchor.
-_ADVANCE_FINAL_PARTITION_FOLLOWERS = False
+# Experiment 37 advances the P3 synchronization prefix into the empty P2 tail.
+# The wait/barrier prefix can use the M44 slot freed by Experiment 35, while
+# the normal three-MFMA stream advance keeps every wrap DS read in P3.
+_ADVANCE_FINAL_PARTITION_FOLLOWERS = True
+_FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 4
 
 
 class _SlotPlacer:
@@ -1109,7 +1110,8 @@ def _endsWithDrainedLgkm(schedule) -> bool:
 def advancePartitionInterleave(
         previousSchedule, finalSchedule, advanceMfmas,
         rightAlignPreviousDtl=False, maxPreviousDtlLoads=None,
-        dropRedundantFinalLgkm=False, advanceFinalFollowers=True):
+        dropRedundantFinalLgkm=False, advanceFinalFollowers=True,
+        finalSyncAdvanceMfmas=None):
     """Move a final partition's interleaving stream earlier by whole MFMAs.
 
     The entry prefix is the interval immediately before the final partition's
@@ -1133,6 +1135,10 @@ def advancePartitionInterleave(
     When advanceFinalFollowers is False, retain every post-MFMA follower in
     the final partition.  The entry prefix still provides the seam anchor used
     by the independent P2 DTL right-alignment policy.
+
+    finalSyncAdvanceMfmas may advance the leading wait/barrier/address-swap
+    groups farther than the remaining stream.  The first group containing an
+    LDS read or DTL request and every younger group still use advanceMfmas.
 
     Returns True and mutates both Modules when the complete shift is legal.
     Returns False without changing either Module when it is not.
@@ -1193,10 +1199,21 @@ def advancePartitionInterleave(
     if finalPrefix:
         moves.append((prefixTarget, finalPrefix))
     holdFinalSuffix = False
+    inFinalSyncPrefix = True
     for index, group in enumerate(finalFollowers):
         if group:
+            if any(
+                    isinstance(inst, LocalReadInstruction) or _isDtlLoad(inst)
+                    for inst in group):
+                inFinalSyncPrefix = False
+            groupAdvanceMfmas = (
+                finalSyncAdvanceMfmas
+                if (inFinalSyncPrefix
+                    and finalSyncAdvanceMfmas is not None)
+                else advanceMfmas
+            )
             shiftedTarget = (
-                boundary + index - advanceMfmas
+                boundary + index - groupAdvanceMfmas
                 if advanceFinalFollowers
                 else boundary + index
             )
@@ -2032,7 +2049,9 @@ def instructionScheduleLoop(
                     dropRedundantFinalLgkm=(
                         _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT),
                     advanceFinalFollowers=(
-                        _ADVANCE_FINAL_PARTITION_FOLLOWERS))
+                        _ADVANCE_FINAL_PARTITION_FOLLOWERS),
+                    finalSyncAdvanceMfmas=(
+                        _FINAL_PARTITION_SYNC_ADVANCE_MFMAS))
             result.add(scheduled)
             if context.derivePartialLrWaits:
                 if firstCell is None:
