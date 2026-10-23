@@ -17,7 +17,7 @@ from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstru
 # into otherwise-empty intervals at the end of the preceding partition.  Each
 # experiment changes only this distance, while the relocation mechanism and
 # its safety checks remain fixed.
-_FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 2
+_FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 3
 
 
 class _SlotPlacer:
