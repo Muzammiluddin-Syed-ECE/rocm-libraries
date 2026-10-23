@@ -56,6 +56,10 @@ _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 3
 # Experiment 33: move the preceding partition's native DTL bundles as late as
 # possible without colliding with the advanced final-partition suffix.
 _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX = True
+# Experiment 34: retain at most the CMS-sized five-load cohort in the
+# preceding partition.  Once advancing another DTL load would exceed the cap,
+# keep that complete load group and the ordered suffix in the final partition.
+_MAX_PREVIOUS_PARTITION_DTL_LOADS = 5
 
 
 class _SlotPlacer:
@@ -1059,7 +1063,7 @@ def _rightAlignDtlBundlesBefore(followers, endExclusive):
 
 def advancePartitionInterleave(
         previousSchedule, finalSchedule, advanceMfmas,
-        rightAlignPreviousDtl=False):
+        rightAlignPreviousDtl=False, maxPreviousDtlLoads=None):
     """Move a final partition's interleaving stream earlier by whole MFMAs.
 
     The entry prefix is the interval immediately before the final partition's
@@ -1069,6 +1073,11 @@ def advancePartitionInterleave(
     partition-local transform: only empty intervals in the preceding partition
     may receive work, no local read may cross the partition boundary, and each
     destination keeps the strict three-follower cap.
+
+    When maxPreviousDtlLoads is set, stop advancing at the first complete
+    follower group that would exceed that DTL-load count.  Keep that group and
+    every younger group in the final partition so their dependency order is
+    unchanged.
 
     Returns True and mutates both Modules when the complete shift is legal.
     Returns False without changing either Module when it is not.
@@ -1104,12 +1113,37 @@ def advancePartitionInterleave(
     if prefixTarget < 0:
         return False
 
+    previousDtlLoads = sum(
+        _isDtlLoad(inst)
+        for group in previousFollowers
+        for inst in group)
+    if (
+            maxPreviousDtlLoads is not None
+            and previousDtlLoads > maxPreviousDtlLoads):
+        return False
+
     moves = []
     if finalPrefix:
         moves.append((prefixTarget, finalPrefix))
+    holdFinalSuffix = False
     for index, group in enumerate(finalFollowers):
         if group:
-            moves.append((boundary + index - advanceMfmas, group))
+            shiftedTarget = boundary + index - advanceMfmas
+            groupDtlLoads = sum(_isDtlLoad(inst) for inst in group)
+            if (
+                    maxPreviousDtlLoads is not None
+                    and not holdFinalSuffix
+                    and shiftedTarget < boundary
+                    and previousDtlLoads + groupDtlLoads
+                    > maxPreviousDtlLoads):
+                holdFinalSuffix = True
+            if holdFinalSuffix:
+                target = boundary + index
+            else:
+                target = shiftedTarget
+                if target < boundary:
+                    previousDtlLoads += groupDtlLoads
+            moves.append((target, group))
 
     # This prototype only borrows genuinely empty MFMA intervals from the
     # preceding partition.  Avoid inventing a new merge order at the seam.
@@ -1900,7 +1934,9 @@ def instructionScheduleLoop(
                     scheduled,
                     _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
                     rightAlignPreviousDtl=(
-                        _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX))
+                        _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX),
+                    maxPreviousDtlLoads=(
+                        _MAX_PREVIOUS_PARTITION_DTL_LOADS))
             result.add(scheduled)
             if context.derivePartialLrWaits:
                 if firstCell is None:
