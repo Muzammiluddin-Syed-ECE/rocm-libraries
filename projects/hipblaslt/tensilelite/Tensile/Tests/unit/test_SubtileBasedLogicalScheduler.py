@@ -4017,6 +4017,96 @@ class TestInstructionSchedulerWrapPrefetch:
         assert preceding_mfma["cohort0"] == "p6"
         assert preceding_mfma["cohort1"] == "p7"
 
+    def test_final_partition_advance_caps_previous_dtl_loads(self):
+        from rocisa.code import Module
+        from rocisa.container import mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MFMAInstruction, SAddU32, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            advancePartitionInterleave)
+
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        previous = Module()
+        for index in range(10):
+            previous.add(mfma(f"p{index}"))
+            if index < 5:
+                previous.add(SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"previous-m0-{index}"))
+                previous.add(BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"previous-gr-{index}"))
+
+        final = Module()
+        final.add(SWaitCnt(dscnt=0, comment="entry"))
+        for index in range(4):
+            final.add(mfma(f"f{index}"))
+            if index == 0:
+                final.add(SAddU32(
+                    dst=mgpr(0), src0=sgpr(28), src1=0,
+                    comment="final-m0"))
+                final.add(BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(32, 4),
+                    soffset=0, comment="final-gr"))
+            elif index == 1:
+                final.add(SBarrier(comment="suffix"))
+
+        assert advancePartitionInterleave(
+            previous,
+            final,
+            3,
+            rightAlignPreviousDtl=True,
+            maxPreviousDtlLoads=5)
+
+        previous_items = [*previous.flatitems()]
+        final_items = [*final.flatitems()]
+        assert sum(
+            isinstance(inst, BufferLoadB128)
+            for inst in previous_items
+        ) == 5
+        assert sum(
+            isinstance(inst, BufferLoadB128)
+            for inst in final_items
+        ) == 1
+
+        items = previous_items + final_items
+        preceding_mfma = {}
+        current_mfma = None
+        for inst in items:
+            if isinstance(inst, MFMAInstruction):
+                current_mfma = inst.comment
+            else:
+                preceding_mfma[inst.comment] = current_mfma
+
+        assert preceding_mfma["entry"] == "p6"
+        assert [
+            preceding_mfma[f"previous-gr-{index}"] for index in range(5)
+        ] == ["p1", "p2", "p3", "p4", "p5"]
+        assert preceding_mfma["final-gr"] == "f0"
+        assert preceding_mfma["suffix"] == "f1"
+
+        for prefix in ("previous", "final"):
+            indices = (
+                range(5) if prefix == "previous" else (None,)
+            )
+            for index in indices:
+                suffix = f"-{index}" if index is not None else ""
+                setup = next(
+                    pos for pos, inst in enumerate(items)
+                    if inst.comment == f"{prefix}-m0{suffix}")
+                load = next(
+                    pos for pos, inst in enumerate(items)
+                    if inst.comment == f"{prefix}-gr{suffix}")
+                assert load == setup + 1
+
     def test_data_only_partition_zero_prefetch_is_recognized(self):
         import shutil
         from types import SimpleNamespace
