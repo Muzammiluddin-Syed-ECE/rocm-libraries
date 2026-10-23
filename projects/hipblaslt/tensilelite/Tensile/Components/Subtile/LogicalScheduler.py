@@ -4073,6 +4073,7 @@ class LogicalScheduler:
         """
         from .InstructionScheduler import (
             _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
+            _MAX_PREVIOUS_PARTITION_DTL_LOADS,
             _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX,
             advancePartitionInterleave,
             instructionSchedule,
@@ -4154,7 +4155,9 @@ class LogicalScheduler:
                             scheduled,
                             _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
                             rightAlignPreviousDtl=(
-                                _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX))
+                                _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX),
+                            maxPreviousDtlLoads=(
+                                _MAX_PREVIOUS_PARTITION_DTL_LOADS))
                     module.add(scheduled)
                     if use_partial_lr_waits:
                         if first_cell is None:
