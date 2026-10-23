@@ -64,6 +64,11 @@ _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX = True
 # preceding partition.  Once advancing another DTL load would exceed the cap,
 # keep that complete load group and the ordered suffix in the final partition.
 _MAX_PREVIOUS_PARTITION_DTL_LOADS = 5
+# Experiment 35: the final-partition entry LDS drain is redundant when the
+# preceding partition already completed a full drain and issued no younger
+# LGKM-producing instruction.  Keep its former placement as a seam anchor so
+# the retained P2 DTL cohort does not otherwise move.
+_DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
 
 
 class _SlotPlacer:
@@ -1083,9 +1088,46 @@ def _rightAlignDtlBundlesBefore(followers, endExclusive):
     return rewritten
 
 
+def _isLgkmOnlyDrain(inst) -> bool:
+    """Whether inst is a full LDS/SMEM drain with no other counter effect."""
+    return (
+        isinstance(inst, SWaitCnt)
+        and inst.dscnt == 0
+        and inst.vlcnt < 0
+        and inst.vscnt < 0
+        and inst.kmcnt < 0
+        and not getattr(inst, "waitAll", False)
+    )
+
+
+def _isLgkmProducer(inst) -> bool:
+    """Conservatively recognize instructions that can make LGKM outstanding."""
+    return any(
+        cls.__name__ in {
+            "LocalReadInstruction",
+            "LocalWriteInstruction",
+            "SMemLoadInstruction",
+            "SMemStoreInstruction",
+        }
+        for cls in type(inst).__mro__
+    )
+
+
+def _endsWithDrainedLgkm(schedule) -> bool:
+    """Prove that no LGKM request remains after the schedule completes."""
+    drained = False
+    for inst in schedule.flatitems():
+        if _isLgkmOnlyDrain(inst):
+            drained = True
+        elif _isLgkmProducer(inst):
+            drained = False
+    return drained
+
+
 def advancePartitionInterleave(
         previousSchedule, finalSchedule, advanceMfmas,
-        rightAlignPreviousDtl=False, maxPreviousDtlLoads=None):
+        rightAlignPreviousDtl=False, maxPreviousDtlLoads=None,
+        dropRedundantFinalLgkm=False):
     """Move a final partition's interleaving stream earlier by whole MFMAs.
 
     The entry prefix is the interval immediately before the final partition's
@@ -1100,6 +1142,11 @@ def advancePartitionInterleave(
     follower group that would exceed that DTL-load count.  Keep that group and
     every younger group in the final partition so their dependency order is
     unchanged.
+
+    When dropRedundantFinalLgkm is set, remove an LGKM-only final-partition
+    entry drain only if the preceding schedule already ends in a proven
+    drained state.  Its unfiltered move remains a seam-placement anchor so
+    this narrow removal cannot perturb the surrounding DTL schedule.
 
     Returns True and mutates both Modules when the complete shift is legal.
     Returns False without changing either Module when it is not.
@@ -1129,6 +1176,18 @@ def advancePartitionInterleave(
     finalPrefix, finalMfmas, finalFollowers = split(finalSchedule)
     if not previousMfmas or not finalMfmas:
         return False
+
+    droppedInstructionIds = set()
+    finalPrefixInstructions = [
+        inst for inst in finalPrefix
+        if not isinstance(inst, TextBlock)
+    ]
+    if (
+            dropRedundantFinalLgkm
+            and len(finalPrefixInstructions) == 1
+            and _isLgkmOnlyDrain(finalPrefixInstructions[0])
+            and _endsWithDrainedLgkm(previousSchedule)):
+        droppedInstructionIds.add(id(finalPrefixInstructions[0]))
 
     boundary = len(previousMfmas)
     prefixTarget = boundary - 1 - advanceMfmas
@@ -1199,7 +1258,9 @@ def advancePartitionInterleave(
     for target, group in moves:
         if target < 0 or target >= len(combinedFollowers):
             return False
-        combinedFollowers[target].extend(group)
+        combinedFollowers[target].extend(
+            inst for inst in group
+            if id(inst) not in droppedInstructionIds)
 
     def physicalCount(group):
         return sum(not isinstance(inst, TextBlock) for inst in group)
@@ -1975,7 +2036,9 @@ def instructionScheduleLoop(
                     rightAlignPreviousDtl=(
                         _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX),
                     maxPreviousDtlLoads=(
-                        _MAX_PREVIOUS_PARTITION_DTL_LOADS))
+                        _MAX_PREVIOUS_PARTITION_DTL_LOADS),
+                    dropRedundantFinalLgkm=(
+                        _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT))
             result.add(scheduled)
             if context.derivePartialLrWaits:
                 if firstCell is None:
