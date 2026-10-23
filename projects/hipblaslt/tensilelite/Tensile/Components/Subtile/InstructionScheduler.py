@@ -7,10 +7,41 @@ Interleaves non-MFMA instructions between MFMAs using a slot-based placer
 with pluggable scheduling rules.
 """
 
-from typing import List, Tuple, Optional
+from dataclasses import dataclass
+from typing import Callable, List, Tuple, Optional
 from rocisa.code import Module
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
     LocalReadInstruction, GlobalReadInstruction, CommonInstruction
+
+
+@dataclass(frozen=True)
+class LoopScheduleGroup:
+    """One generated partition/sub-iteration cell in a loop-wide timeline."""
+
+    partition: int
+    subIterK: int
+    emittedModules: Tuple[object, ...]
+    mfmaBegin: int
+    mfmaCount: int
+    hasMfmaModule: bool
+
+    @property
+    def mfmaEnd(self) -> int:
+        return self.mfmaBegin + self.mfmaCount
+
+
+@dataclass(frozen=True)
+class LoopScheduleContext:
+    """Geometry-derived view of every scheduling cell in one emitted loop."""
+
+    label: str
+    groups: Tuple[LoopScheduleGroup, ...]
+    totalMfmaCount: int
+    multiDU: bool
+    minGapDsReadToWait: int
+
+
+LoopSchedulePolicy = Callable[[LoopScheduleContext], Optional[Module]]
 
 
 class _SlotPlacer:
@@ -845,3 +876,87 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
                 inst.vlcnt += bufLoadCount
 
     return scheduled
+
+
+def buildLoopScheduleContext(
+        emitted3d,
+        *,
+        label: str,
+        multiDU: bool = False,
+        minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT
+) -> LoopScheduleContext:
+    """Build a loop-wide timeline from the geometry that codegen emitted.
+
+    Partition and sub-iteration boundaries are retained as diagnostics, while
+    ``mfmaBegin``/``mfmaEnd`` provide stable global ordinals without assuming a
+    partition count or a fixed number of MFMAs per partition.
+    """
+    groups = []
+    mfmaOrdinal = 0
+    for partition, partitionEmitted in enumerate(emitted3d):
+        for subIterK, emittedModules in enumerate(partitionEmitted):
+            modules = tuple(emittedModules)
+            mfmaCount = sum(
+                isinstance(inst, (MFMAInstruction, MXMFMAInstruction))
+                for em in modules
+                for inst in em.instructions
+            )
+            groups.append(LoopScheduleGroup(
+                partition=partition,
+                subIterK=subIterK,
+                emittedModules=modules,
+                mfmaBegin=mfmaOrdinal,
+                mfmaCount=mfmaCount,
+                hasMfmaModule=any(em.opType == "mfma" for em in modules),
+            ))
+            mfmaOrdinal += mfmaCount
+
+    return LoopScheduleContext(
+        label=label,
+        groups=tuple(groups),
+        totalMfmaCount=mfmaOrdinal,
+        multiDU=multiDU,
+        minGapDsReadToWait=minGapDsReadToWait,
+    )
+
+
+def instructionScheduleLoop(
+        emitted3d,
+        *,
+        label: str,
+        multiDU: bool = False,
+        minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
+        policy: Optional[LoopSchedulePolicy] = None
+) -> Module:
+    """Schedule one complete emitted loop with a safe partition-local fallback.
+
+    A policy receives the complete geometry-derived context. Returning ``None``
+    delegates every cell to the existing scheduler, preserving the historical
+    output exactly. Returning a module opts into loop-wide placement.
+    """
+    context = buildLoopScheduleContext(
+        emitted3d,
+        label=label,
+        multiDU=multiDU,
+        minGapDsReadToWait=minGapDsReadToWait,
+    )
+    if policy is not None:
+        scheduled = policy(context)
+        if scheduled is not None:
+            return scheduled
+
+    result = Module()
+    for group in context.groups:
+        result.addComment0(
+            f"partition={group.partition} subIterK={group.subIterK}")
+        emittedModules = list(group.emittedModules)
+        if emittedModules and group.hasMfmaModule:
+            result.add(instructionSchedule(
+                emittedModules,
+                multiDU=context.multiDU,
+                minGapDsReadToWait=context.minGapDsReadToWait))
+        else:
+            for em in emittedModules:
+                for inst in em.instructions:
+                    result.add(inst)
+    return result
