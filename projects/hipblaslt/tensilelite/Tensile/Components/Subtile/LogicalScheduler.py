@@ -4072,6 +4072,7 @@ class LogicalScheduler:
         for interleaving. When schedule=False, emits instructions sequentially.
         """
         from .InstructionScheduler import (
+            _ADVANCE_FINAL_PARTITION_FOLLOWERS,
             _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT,
             _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
             _MAX_PREVIOUS_PARTITION_DTL_LOADS,
@@ -4160,7 +4161,9 @@ class LogicalScheduler:
                             maxPreviousDtlLoads=(
                                 _MAX_PREVIOUS_PARTITION_DTL_LOADS),
                             dropRedundantFinalLgkm=(
-                                _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT))
+                                _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT),
+                            advanceFinalFollowers=(
+                                _ADVANCE_FINAL_PARTITION_FOLLOWERS))
                     module.add(scheduled)
                     if use_partial_lr_waits:
                         if first_cell is None:
