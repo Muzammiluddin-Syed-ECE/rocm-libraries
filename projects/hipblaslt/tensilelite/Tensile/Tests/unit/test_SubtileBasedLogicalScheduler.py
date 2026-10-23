@@ -3867,6 +3867,90 @@ class TestInstructionSchedulerWrapPrefetch:
         assert _findPartitionZeroPrefetchOrder(
             [[0, 1, 2]], modules) == [0, 1, 2]
 
+    def test_uniform_epoch_partition_zero_reads_interleave_without_wait_gr(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import DSModifiers, accvgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            DSLoadB128, MXMFMAInstruction, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8,
+                accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1],
+                acc=accvgpr(0, 4),
+                a=vgpr(0, 8),
+                b=vgpr(8, 8),
+                acc2=accvgpr(0, 4),
+                mxsa=vgpr(16),
+                mxsb=vgpr(17),
+                block=32,
+                comment=f"mfma{index}")
+            for index in range(4)
+        ]
+        reads = [
+            DSLoadB128(
+                dst=vgpr(24, 4),
+                src=vgpr(1),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"p0-prefetch-{index}")
+            for index in range(4)
+        ]
+        modules = [
+            EmittedModule(
+                moduleId=0,
+                instructions=mfmas,
+                before=2,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1,
+                instructions=reads,
+                instructionMetadata=[
+                    (0, 2), (0, 2), (1, 2), (1, 2)],
+                source=SimpleNamespace(
+                    kind="lr", tensor="B", partition=0,
+                    targetPartition=1, mtIteration=0)),
+            EmittedModule(
+                moduleId=2,
+                instructions=[SWaitCnt(dscnt=0, comment="wait_lr")],
+                before=1,
+                source=SimpleNamespace(kind="wait_lr")),
+        ]
+
+        items = list(instructionSchedule(
+            modules,
+            partitionPrefetch=True,
+            limitDtlBundlesPerMfma=True,
+            uniformPgrEpoch=True,
+        ).flatitems())
+        first_mfma = next(
+            index for index, inst in enumerate(items)
+            if isinstance(inst, MXMFMAInstruction)
+        )
+        read_positions = [
+            index for index, inst in enumerate(items)
+            if isinstance(inst, DSLoadB128)
+        ]
+
+        assert first_mfma == 1
+        assert isinstance(items[0], SWaitCnt)
+        assert items[0].comment == "Wait for preloop LR before p0 MFMA"
+        assert all(position > first_mfma for position in read_positions)
+        assert read_positions[-1] < next(
+            index for index, inst in reversed(list(enumerate(items)))
+            if isinstance(inst, MXMFMAInstruction)
+        )
+
     def test_partial_entry_wait_does_not_weaken_internal_lds_drain(self):
         from types import SimpleNamespace
         from rocisa.instruction import SWaitCnt
