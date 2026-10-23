@@ -52,7 +52,7 @@ LoopSchedulePolicy = Callable[[LoopScheduleContext], Optional[Module]]
 # into otherwise-empty intervals at the end of the preceding partition.  Each
 # experiment changes only this distance, while the relocation mechanism and
 # its safety checks remain fixed.
-_FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 1
+_FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 2
 
 
 class _SlotPlacer:
