@@ -637,13 +637,12 @@ def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
     C0 contains data and scale reads while scale-reuse bodies contain only
     data reads. The read count and tensor mix vary with the macrotile, so the
     invariant is instead that at least one emitted A/B LR in partition 0 feeds
-    a later partition in the current MT.
+    a later partition in the current MT. Do not use wait/sync operations as a
+    recognition signature: uniform-epoch scheduling deliberately consolidates
+    those operations at a later frontier while leaving this LR payload intact.
     """
     for order in preMfmaOrders:
         modules = [emittedModules[mid] for mid in order]
-        if not (any(em.opType == "wait_gr" for em in modules)
-                and any(em.opType == "sync" for em in modules)):
-            continue
 
         readModules = [em for em in modules if em.opType == "lr"]
         if not readModules:

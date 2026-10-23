@@ -795,6 +795,45 @@ class EmittedModule:
         return self.source.kind if self.source else ""
 
 
+def _set_entry_wait_lr_count(em_list, count):
+    """Apply a prior-partition suffix only to each MFMA entry wait.
+
+    A cell can also contain an internal wait_lr that drains local reads before
+    an LDS overwrite barrier. Weakening that wait with the prior cell's safe
+    suffix would leave the youngest current-cell reads outstanding at the
+    overwrite boundary.
+    """
+    from rocisa.instruction import SWaitCnt
+
+    by_id = {em.moduleId: em for em in em_list}
+    entry_wait_ids = set()
+    for mfma_em in (em for em in em_list if em.opType == "mfma"):
+        current = mfma_em.before
+        seen = set()
+        while current is not None and current not in seen:
+            seen.add(current)
+            predecessor = by_id.get(current)
+            if predecessor is None:
+                break
+            if predecessor.opType == "wait_lr":
+                entry_wait_ids.add(predecessor.moduleId)
+                break
+            current = predecessor.before
+
+    for em in em_list:
+        if em.opType != "wait_lr" or em.moduleId not in entry_wait_ids:
+            continue
+        for inst in em.instructions:
+            if isinstance(inst, SWaitCnt) and inst.dscnt >= 0:
+                inst.dscnt = count
+                inst.comment = (
+                    "Wait for immediate LR; leave "
+                    f"{count} later-consumer reads in flight"
+                    if count
+                    else "Wait for all immediate LR"
+                )
+
+
 # ── Main scheduler class ───────────────────────────────────
 
 class LogicalScheduler:
@@ -3999,20 +4038,6 @@ class LogicalScheduler:
                 if em.opType == "mfma"
             )
 
-        def set_wait_lr_count(em_list, count):
-            for em in em_list:
-                if em.opType != "wait_lr":
-                    continue
-                for inst in em.instructions:
-                    if isinstance(inst, SWaitCnt) and inst.dscnt >= 0:
-                        inst.dscnt = count
-                        inst.comment = (
-                            "Wait for immediate LR; leave "
-                            f"{count} later-consumer reads in flight"
-                            if count
-                            else "Wait for all immediate LR"
-                        )
-
         for pi, partition_emitted in enumerate(emitted_3d):
             for k, em_list in enumerate(partition_emitted):
                 module.addComment0(f"partition={pi} subIterK={k}")
@@ -4027,7 +4052,7 @@ class LogicalScheduler:
                             previous_em_list,
                             current_mfma_count,
                         )
-                        set_wait_lr_count(em_list, safe_count)
+                        _set_entry_wait_lr_count(em_list, safe_count)
                     scheduled = instructionSchedule(
                         em_list,
                         multiDU=self._is_multi_du(),
@@ -4067,7 +4092,7 @@ class LogicalScheduler:
                 previous_em_list,
                 first_mfma_count,
             )
-            set_wait_lr_count(first_em_list, safe_count)
+            _set_entry_wait_lr_count(first_em_list, safe_count)
         if use_pap_preloop_skip and skipping_first_gr_group and not first_gr_group_done:
             module.add(pap_merge_label)
             module.add(SMovB32(dst=sgpr("PersistentPrefetchState"), src=0,
