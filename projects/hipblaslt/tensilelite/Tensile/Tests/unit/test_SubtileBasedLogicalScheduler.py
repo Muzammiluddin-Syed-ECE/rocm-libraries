@@ -3907,8 +3907,9 @@ class TestInstructionSchedulerWrapPrefetch:
             unsafe_tail, emitted, immediateMfmaCount=4) == 0
 
     @pytest.mark.parametrize("advance", [1, 2, 3])
+    @pytest.mark.parametrize("advance_followers", [True, False])
     def test_final_partition_interleave_advances_across_empty_seam(
-            self, advance):
+            self, advance, advance_followers):
         from rocisa.code import Module
         from rocisa.container import vgpr
         from rocisa.enum import InstType
@@ -3941,7 +3942,11 @@ class TestInstructionSchedulerWrapPrefetch:
             if index < len(cohorts):
                 final.add(cohorts[index])
 
-        assert advancePartitionInterleave(previous, final, advance)
+        assert advancePartitionInterleave(
+            previous,
+            final,
+            advance,
+            advanceFinalFollowers=advance_followers)
         items = [
             *previous.flatitems(),
             *final.flatitems(),
@@ -3960,9 +3965,13 @@ class TestInstructionSchedulerWrapPrefetch:
         assert preceding_mfma["entry"] == target_name(3 - advance)
         assert [
             preceding_mfma[f"cohort{index}"] for index in range(3)
-        ] == [
-            target_name(4 + index - advance) for index in range(3)
-        ]
+        ] == (
+            [
+                target_name(4 + index - advance) for index in range(3)
+            ]
+            if advance_followers
+            else [f"f{index}" for index in range(3)]
+        )
         assert [
             inst.comment for inst in items
             if not isinstance(inst, MFMAInstruction)
