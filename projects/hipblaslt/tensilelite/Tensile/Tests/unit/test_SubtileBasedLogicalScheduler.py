@@ -3871,6 +3871,72 @@ class TestInstructionSchedulerWrapPrefetch:
             if not isinstance(inst, MFMAInstruction)
         ] == ["entry", "cohort0", "cohort1", "cohort2"]
 
+    def test_final_partition_advance_right_aligns_previous_dtl_bundles(self):
+        from rocisa.code import Module
+        from rocisa.container import mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MFMAInstruction, SAddU32, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            advancePartitionInterleave)
+
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        previous = Module()
+        for index in range(8):
+            previous.add(mfma(f"p{index}"))
+            if index < 3:
+                previous.add(SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"m0-{index}"))
+                previous.add(BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"gr-{index}"))
+            elif index in (3, 4):
+                previous.add(SAddU32(
+                    dst=sgpr(40 + index), src0=sgpr(40 + index), src1=1,
+                    comment=f"residual-{index}"))
+
+        final = Module()
+        final.add(SWaitCnt(dscnt=0, comment="entry"))
+        for index in range(4):
+            final.add(mfma(f"f{index}"))
+            if index < 2:
+                final.add(SBarrier(comment=f"cohort{index}"))
+
+        assert advancePartitionInterleave(
+            previous, final, 2, rightAlignPreviousDtl=True)
+
+        items = [*previous.flatitems(), *final.flatitems()]
+        preceding_mfma = {}
+        current_mfma = None
+        for inst in items:
+            if isinstance(inst, MFMAInstruction):
+                current_mfma = inst.comment
+            else:
+                preceding_mfma[inst.comment] = current_mfma
+
+        assert [
+            preceding_mfma[f"gr-{index}"] for index in range(3)
+        ] == ["p2", "p3", "p4"]
+        for index in range(3):
+            setup = next(
+                pos for pos, inst in enumerate(items)
+                if inst.comment == f"m0-{index}")
+            load = next(
+                pos for pos, inst in enumerate(items)
+                if inst.comment == f"gr-{index}")
+            assert load == setup + 1
+        assert preceding_mfma["entry"] == "p5"
+        assert preceding_mfma["cohort0"] == "p6"
+        assert preceding_mfma["cohort1"] == "p7"
+
     def test_data_only_partition_zero_prefetch_is_recognized(self):
         import shutil
         from types import SimpleNamespace

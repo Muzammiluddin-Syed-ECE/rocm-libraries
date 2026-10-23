@@ -18,6 +18,9 @@ from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstru
 # experiment changes only this distance, while the relocation mechanism and
 # its safety checks remain fixed.
 _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 3
+# Experiment 33: move the preceding partition's native DTL bundles as late as
+# possible without colliding with the advanced final-partition suffix.
+_RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX = True
 
 
 class _SlotPlacer:
@@ -972,8 +975,56 @@ def safeOutstandingLocalReadSuffix(
     return min(safe, _MAX_LGKMCNT)
 
 
+def _rightAlignDtlBundlesBefore(followers, endExclusive):
+    """Right-align complete m0/DTL pairs before a reserved MFMA suffix.
+
+    Operate on the already scheduled physical stream so the policy adapts to
+    any partition width.  Non-DTL followers stay in place; complete DTL
+    bundles retain request order and are moved only into intervals with room
+    for both physical instructions.
+
+    Return a rewritten follower list, or None when every bundle cannot be
+    moved atomically.
+    """
+    rewritten = []
+    bundles = []
+    for group in followers:
+        residual = []
+        index = 0
+        while index < len(group):
+            if (
+                    index + 1 < len(group)
+                    and _isM0Update(group[index])
+                    and _isDtlLoad(group[index + 1])):
+                bundles.append([group[index], group[index + 1]])
+                index += 2
+                continue
+            residual.append(group[index])
+            index += 1
+        rewritten.append(residual)
+
+    if not bundles:
+        return rewritten
+
+    def physicalCount(group):
+        return sum(not isinstance(inst, TextBlock) for inst in group)
+
+    candidates = [
+        index for index in range(min(endExclusive, len(rewritten)))
+        if physicalCount(rewritten[index]) <= 1
+        and not any(_isDtlLoad(inst) for inst in rewritten[index])
+    ]
+    if len(candidates) < len(bundles):
+        return None
+
+    for target, bundle in zip(candidates[-len(bundles):], bundles):
+        rewritten[target].extend(bundle)
+    return rewritten
+
+
 def advancePartitionInterleave(
-        previousSchedule, finalSchedule, advanceMfmas):
+        previousSchedule, finalSchedule, advanceMfmas,
+        rightAlignPreviousDtl=False):
     """Move a final partition's interleaving stream earlier by whole MFMAs.
 
     The entry prefix is the interval immediately before the final partition's
@@ -1042,6 +1093,12 @@ def advancePartitionInterleave(
             for target, group in moves if target < boundary
             for inst in group):
         return False
+
+    if rightAlignPreviousDtl and previousTargets:
+        previousFollowers = _rightAlignDtlBundlesBefore(
+            previousFollowers, min(previousTargets))
+        if previousFollowers is None:
+            return False
 
     combinedFollowers = [
         list(group) for group in previousFollowers + finalFollowers
