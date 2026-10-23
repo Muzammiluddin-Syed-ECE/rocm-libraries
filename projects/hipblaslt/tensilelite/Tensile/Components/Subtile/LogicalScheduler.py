@@ -526,6 +526,7 @@ class LRPlacement(Emittable):
     subIterK_slot: int         # which subIterK this LR is placed in
     partition: int = 0         # which partition this LR belongs to
     targetPartition: int = 0   # partition that consumes the loaded operands
+    mustPrecedeP0Overwrite: bool = False  # hoisted read protecting p0 future write
     deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     postOps: List['BaseOp'] = field(default_factory=list)    # populated by insert_gr_lr_inc()
@@ -937,8 +938,93 @@ class LogicalScheduler:
         if cfg.dualPeriodScale:
             self._place_scale_LRs_epoch(partitions)
 
+        if cfg.uniformPgrEpoch:
+            self._move_uniform_epoch_p0_overwrite_reads(partitions)
+
         self._partitions = partitions
         return partitions
+
+    def _move_uniform_epoch_p0_overwrite_reads(self, partitions):
+        """Make the first five future writes legal in partition zero.
+
+        Uniform epochs are ordered canonically as A then B.  The first
+        CMS-sized cohort is therefore the first five atomic A/B requests.
+        Pull any current-epoch local-read placement overlapping that cohort
+        into partition zero.  The instruction scheduler can then issue those
+        reads, drain LDS, and place the overwrite barrier before the five
+        global reads instead of deferring the whole cohort to partition one.
+
+        A logical LR may cover more than one atomic GR tile.  Split at the
+        selected GR boundaries and hoist only the overlapping segment.  VGPR
+        tiles have not been assigned at this pass, so the split is lossless;
+        moving the whole placement would issue unrelated reads too early and
+        can exhaust partition-zero scheduling capacity.
+        """
+        cfg = self.config
+        if len(partitions) < 2:
+            return
+
+        first_atoms = []
+        for tensor, gran, num_tiles in (
+                ('A', cfg.grA, cfg.numMFMATilesM),
+                ('B', cfg.grB, cfg.numMFMATilesN)):
+            for tile in range(0, num_tiles, gran.mn):
+                first_atoms.append((tensor, tile, tile + gran.mn))
+                if len(first_atoms) == 5:
+                    break
+            if len(first_atoms) == 5:
+                break
+
+        selected = {}
+        for tensor, tile_start, tile_end in first_atoms:
+            selected.setdefault(tensor, []).append((tile_start, tile_end))
+
+        p0 = partitions[0][0]
+        for partition in partitions[1:]:
+            for slot in partition:
+                for index in range(len(slot.lrs) - 1, -1, -1):
+                    lr = slot.lrs[index]
+                    if lr.mtIteration != 0 or lr.tensor not in ('A', 'B'):
+                        continue
+                    target_ranges = selected.get(lr.tensor, [])
+                    if not any(
+                            lr.tiles.tileId_start < tile_end
+                            and tile_start < lr.tiles.tileId_end
+                            for tile_start, tile_end in target_ranges):
+                        continue
+
+                    cuts = {lr.tiles.tileId_start, lr.tiles.tileId_end}
+                    for tile_start, tile_end in target_ranges:
+                        if lr.tiles.tileId_start < tile_start < lr.tiles.tileId_end:
+                            cuts.add(tile_start)
+                        if lr.tiles.tileId_start < tile_end < lr.tiles.tileId_end:
+                            cuts.add(tile_end)
+
+                    remaining = []
+                    boundaries = sorted(cuts)
+                    for tile_start, tile_end in zip(boundaries, boundaries[1:]):
+                        segment = copy.copy(lr)
+                        segment.deps = []
+                        segment.preOps = []
+                        segment.postOps = []
+                        segment.vgpr_tile_map = []
+                        segment.tiles = MFMATileRange(
+                            lr.tiles.subIterK_start,
+                            lr.tiles.subIterK_end,
+                            tile_start,
+                            tile_end)
+                        is_selected = any(
+                            tile_start < target_end
+                            and target_start < tile_end
+                            for target_start, target_end in target_ranges)
+                        if is_selected:
+                            segment.partition = 0
+                            segment.subIterK_slot = 0
+                            segment.mustPrecedeP0Overwrite = True
+                            p0.lrs.append(segment)
+                        else:
+                            remaining.append(segment)
+                    slot.lrs[index:index + 1] = remaining
 
     def _place_scale_LRs_epoch(self, partitions):
         """Place the per-epoch scale LRs for the dual-period MXFP8 path.
@@ -1822,18 +1908,11 @@ class LogicalScheduler:
             # post-adjustment accounts for those same-slot requests.  This is
             # the CMS ordering: final future loads, vmcnt+barrier, then the
             # first next-epoch LDS reads.
-            # Start at the final slot that still reads epoch n.  Its LR→GR
-            # order creates one natural read-before-overwrite boundary and
-            # avoids introducing an additional overwrite barrier into every
-            # earlier partition.
-            current_lr_slots = [
-                pi * numK + slot.subIterK
-                for pi, partition_slots in enumerate(self._partitions)
-                for slot in partition_slots
-                for lr in slot.lrs
-                if lr.tensor in ('A', 'B') and lr.mtIteration == 0
-            ]
-            epoch_start = max(current_lr_slots, default=0)
+            # The first five future writes and every overlapping current read
+            # are now co-located in partition zero.  Include that slot so its
+            # LR→GR dependency emits the overwrite barrier there, then retain
+            # CMS-sized five-request cohorts in the later partitions.
+            epoch_start = 0
             uniform_slots = list(range(epoch_start, frontier + 1))
         last_uid_slot = None
         if maxUnroll > 1 and pgr == 1:
