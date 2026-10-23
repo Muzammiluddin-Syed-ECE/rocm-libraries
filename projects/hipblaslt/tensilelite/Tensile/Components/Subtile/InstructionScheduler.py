@@ -69,6 +69,10 @@ _MAX_PREVIOUS_PARTITION_DTL_LOADS = 5
 # LGKM-producing instruction.  Keep its former placement as a seam anchor so
 # the retained P2 DTL cohort does not otherwise move.
 _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
+# Experiment 36 isolates the final-partition phase reorder from the following
+# seam-advance experiment.  Keep every real P3 follower in P3 for this
+# checkpoint; the removed LGKM wait still supplies the empty seam anchor.
+_ADVANCE_FINAL_PARTITION_FOLLOWERS = False
 
 
 class _SlotPlacer:
@@ -1127,7 +1131,7 @@ def _endsWithDrainedLgkm(schedule) -> bool:
 def advancePartitionInterleave(
         previousSchedule, finalSchedule, advanceMfmas,
         rightAlignPreviousDtl=False, maxPreviousDtlLoads=None,
-        dropRedundantFinalLgkm=False):
+        dropRedundantFinalLgkm=False, advanceFinalFollowers=True):
     """Move a final partition's interleaving stream earlier by whole MFMAs.
 
     The entry prefix is the interval immediately before the final partition's
@@ -1147,6 +1151,10 @@ def advancePartitionInterleave(
     entry drain only if the preceding schedule already ends in a proven
     drained state.  Its unfiltered move remains a seam-placement anchor so
     this narrow removal cannot perturb the surrounding DTL schedule.
+
+    When advanceFinalFollowers is False, retain every post-MFMA follower in
+    the final partition.  The entry prefix still provides the seam anchor used
+    by the independent P2 DTL right-alignment policy.
 
     Returns True and mutates both Modules when the complete shift is legal.
     Returns False without changing either Module when it is not.
@@ -1209,7 +1217,11 @@ def advancePartitionInterleave(
     holdFinalSuffix = False
     for index, group in enumerate(finalFollowers):
         if group:
-            shiftedTarget = boundary + index - advanceMfmas
+            shiftedTarget = (
+                boundary + index - advanceMfmas
+                if advanceFinalFollowers
+                else boundary + index
+            )
             groupDtlLoads = sum(_isDtlLoad(inst) for inst in group)
             if (
                     maxPreviousDtlLoads is not None
@@ -1518,6 +1530,13 @@ def instructionSchedule(
         uniformPgrEpoch
         and any(hasWaitGR for _, hasWaitGR in paths)
     )
+    wrapUniformEpochFrontier = (
+        uniformEpochFrontier
+        and any(
+            _isWrapPrefetchPath(order, emittedModules)
+            for order, _hasWaitGR in paths
+        )
+    )
     phasePathInsts = []
     canUseThreePhase = partitionPrefetchPolicy
     for order, _hasWaitGR in paths:
@@ -1695,14 +1714,26 @@ def instructionSchedule(
         _placePhase(p0Sync)
         if leading:
             if uniformEpochFrontier:
-                # Complete the future epoch first.  The following VMEM wait is
-                # adjusted by the post-pass for every buffer load placed here,
-                # yielding: GR(n+2) → vmcnt → barrier → LR(n+1).
-                _placePhase(orderedGrItems, atomicDtl=True)
-                _placePhase(
-                    leading + trailing,
-                    mfmaBetweenWaitAndBarrier=True,
-                    denseToFit=True)
+                if wrapUniformEpochFrontier:
+                    # At the cyclic frontier, prioritize the LDS reads that
+                    # feed the next body's first MFMAs.  Future-epoch DTL
+                    # requests target the alternate LDS half, so they remain
+                    # legal after vmcnt -> barrier -> LR and are deferred as
+                    # complete m0/load bundles.
+                    _placePhase(
+                        leading + trailing,
+                        mfmaBetweenWaitAndBarrier=True,
+                        denseToFit=True)
+                    _placePhase(orderedGrItems, atomicDtl=True)
+                else:
+                    # Complete the future epoch first.  The following VMEM
+                    # wait is adjusted by the post-pass for every buffer load
+                    # placed here.
+                    _placePhase(orderedGrItems, atomicDtl=True)
+                    _placePhase(
+                        leading + trailing,
+                        mfmaBetweenWaitAndBarrier=True,
+                        denseToFit=True)
             else:
                 _placePhase(leading, mfmaBetweenWaitAndBarrier=True)
                 if overwriteReads and trailing and orderedGrItems:
@@ -2038,7 +2069,9 @@ def instructionScheduleLoop(
                     maxPreviousDtlLoads=(
                         _MAX_PREVIOUS_PARTITION_DTL_LOADS),
                     dropRedundantFinalLgkm=(
-                        _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT))
+                        _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT),
+                    advanceFinalFollowers=(
+                        _ADVANCE_FINAL_PARTITION_FOLLOWERS))
             result.add(scheduled)
             if context.derivePartialLrWaits:
                 if firstCell is None:
