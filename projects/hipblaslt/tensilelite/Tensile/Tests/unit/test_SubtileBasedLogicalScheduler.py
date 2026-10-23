@@ -3906,6 +3906,68 @@ class TestInstructionSchedulerWrapPrefetch:
         assert safeOutstandingLocalReadSuffix(
             unsafe_tail, emitted, immediateMfmaCount=4) == 0
 
+    @pytest.mark.parametrize("advance", [1, 2, 3])
+    def test_final_partition_interleave_advances_across_empty_seam(
+            self, advance):
+        from rocisa.code import Module
+        from rocisa.container import vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            MFMAInstruction, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            advancePartitionInterleave)
+
+        # Initialize rocISA through the shared fixture helper.
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        previous = Module()
+        previous_mfmas = [mfma(f"p{index}") for index in range(4)]
+        previous.addItems(previous_mfmas)
+
+        final = Module()
+        final.add(SWaitCnt(dscnt=0, comment="entry"))
+        final_mfmas = [mfma(f"f{index}") for index in range(4)]
+        cohorts = [
+            SBarrier(comment=f"cohort{index}") for index in range(3)
+        ]
+        for index, inst in enumerate(final_mfmas):
+            final.add(inst)
+            if index < len(cohorts):
+                final.add(cohorts[index])
+
+        assert advancePartitionInterleave(previous, final, advance)
+        items = [
+            *previous.flatitems(),
+            *final.flatitems(),
+        ]
+        preceding_mfma = {}
+        current_mfma = None
+        for inst in items:
+            if isinstance(inst, MFMAInstruction):
+                current_mfma = inst.comment
+            else:
+                preceding_mfma[inst.comment] = current_mfma
+
+        def target_name(index):
+            return f"p{index}" if index < 4 else f"f{index - 4}"
+
+        assert preceding_mfma["entry"] == target_name(3 - advance)
+        assert [
+            preceding_mfma[f"cohort{index}"] for index in range(3)
+        ] == [
+            target_name(4 + index - advance) for index in range(3)
+        ]
+        assert [
+            inst.comment for inst in items
+            if not isinstance(inst, MFMAInstruction)
+        ] == ["entry", "cohort0", "cohort1", "cohort2"]
+
     def test_data_only_partition_zero_prefetch_is_recognized(self):
         import shutil
         from types import SimpleNamespace
