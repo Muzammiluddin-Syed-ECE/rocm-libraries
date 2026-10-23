@@ -13,6 +13,13 @@ from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstru
     LocalReadInstruction, GlobalReadInstruction, CommonInstruction
 
 
+# Prototype policy: advance the final partition's complete interleaving stream
+# into otherwise-empty intervals at the end of the preceding partition.  Each
+# experiment changes only this distance, while the relocation mechanism and
+# its safety checks remain fixed.
+_FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 1
+
+
 class _SlotPlacer:
     """Generic slot placement engine for interleaving instructions between MFMAs.
 
@@ -963,6 +970,111 @@ def safeOutstandingLocalReadSuffix(
     # gfx9 encodes lgkmcnt in four bits. A smaller count is a stronger wait,
     # so clamping an unusually large safe suffix remains conservative.
     return min(safe, _MAX_LGKMCNT)
+
+
+def advancePartitionInterleave(
+        previousSchedule, finalSchedule, advanceMfmas):
+    """Move a final partition's interleaving stream earlier by whole MFMAs.
+
+    The entry prefix is the interval immediately before the final partition's
+    first MFMA.  Treating it as part of the stream preserves the physical order
+    of entry wait -> VMEM -> wait/barrier -> LDS reads while moving every item
+    by the same number of MFMA intervals.  This is deliberately a narrow,
+    partition-local transform: only empty intervals in the preceding partition
+    may receive work, no local read may cross the partition boundary, and each
+    destination keeps the strict three-follower cap.
+
+    Returns True and mutates both Modules when the complete shift is legal.
+    Returns False without changing either Module when it is not.
+    """
+    if advanceMfmas <= 0:
+        return False
+
+    isMfma = lambda inst: isinstance(
+        inst, (MFMAInstruction, MXMFMAInstruction))
+
+    def split(schedule):
+        prefix = []
+        mfmas = []
+        followers = []
+        for inst in schedule.flatitems():
+            if isMfma(inst):
+                mfmas.append(inst)
+                followers.append([])
+            elif not mfmas:
+                prefix.append(inst)
+            else:
+                followers[-1].append(inst)
+        return prefix, mfmas, followers
+
+    previousPrefix, previousMfmas, previousFollowers = split(
+        previousSchedule)
+    finalPrefix, finalMfmas, finalFollowers = split(finalSchedule)
+    if not previousMfmas or not finalMfmas:
+        return False
+
+    boundary = len(previousMfmas)
+    prefixTarget = boundary - 1 - advanceMfmas
+    if prefixTarget < 0:
+        return False
+
+    moves = []
+    if finalPrefix:
+        moves.append((prefixTarget, finalPrefix))
+    for index, group in enumerate(finalFollowers):
+        if group:
+            moves.append((boundary + index - advanceMfmas, group))
+
+    # This prototype only borrows genuinely empty MFMA intervals from the
+    # preceding partition.  Avoid inventing a new merge order at the seam.
+    previousTargets = {
+        target for target, group in moves
+        if group and target < boundary
+    }
+    if any(previousFollowers[target] for target in previousTargets):
+        return False
+
+    # Keep LR accounting partition-local.  The tested one-to-three-MFMA
+    # advances move waits/VMEM/barriers/offset swaps across the seam, but leave
+    # the first wrap read in the final partition.
+    if any(
+            isinstance(inst, LocalReadInstruction)
+            for target, group in moves if target < boundary
+            for inst in group):
+        return False
+
+    combinedFollowers = [
+        list(group) for group in previousFollowers + finalFollowers
+    ]
+    for index in range(boundary, len(combinedFollowers)):
+        combinedFollowers[index] = []
+    for target, group in moves:
+        if target < 0 or target >= len(combinedFollowers):
+            return False
+        combinedFollowers[target].extend(group)
+
+    def physicalCount(group):
+        return sum(not isinstance(inst, TextBlock) for inst in group)
+
+    if any(physicalCount(group) > 3 for group in combinedFollowers):
+        return False
+
+    def assemble(prefix, mfmas, followers):
+        items = list(prefix)
+        for mfma, group in zip(mfmas, followers):
+            items.append(mfma)
+            items.extend(group)
+        return items
+
+    previousSchedule.setItems(assemble(
+        previousPrefix,
+        previousMfmas,
+        combinedFollowers[:boundary]))
+    finalSchedule.setItems(assemble(
+        [],
+        finalMfmas,
+        combinedFollowers[boundary:]))
+    return True
 
 
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:

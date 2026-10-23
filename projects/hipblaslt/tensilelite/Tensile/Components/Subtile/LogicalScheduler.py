@@ -4072,6 +4072,8 @@ class LogicalScheduler:
         for interleaving. When schedule=False, emits instructions sequentially.
         """
         from .InstructionScheduler import (
+            _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
+            advancePartitionInterleave,
             instructionSchedule,
             safeOutstandingLocalReadSuffix,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
@@ -4139,6 +4141,17 @@ class LogicalScheduler:
                         partitionPrefetch=self.config.prefetchNextPartition,
                         limitDtlBundlesPerMfma=self.config.dualPeriodScale,
                         uniformPgrEpoch=self.config.uniformPgrEpoch)
+                    if (
+                            self.config.uniformPgrEpoch
+                            and self.config.numSubIterK == 1
+                            and label.startswith("MAINLOOP")
+                            and pi == len(emitted_3d) - 1
+                            and k == 0
+                            and previous_schedule is not None):
+                        advancePartitionInterleave(
+                            previous_schedule[0],
+                            scheduled,
+                            _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS)
                     module.add(scheduled)
                     if use_partial_lr_waits:
                         if first_cell is None:
