@@ -4026,6 +4026,65 @@ class TestInstructionSchedulerWrapPrefetch:
         assert preceding_mfma["cohort0"] == "p6"
         assert preceding_mfma["cohort1"] == "p7"
 
+    def test_final_sync_prefix_advances_farther_without_crossing_wrap_reads(
+            self):
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            DSLoadB128, MFMAInstruction, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            advancePartitionInterleave)
+
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        previous = Module()
+        previous.add(SWaitCnt(dscnt=0, comment="previous-drain"))
+        for index in range(8):
+            previous.add(mfma(f"p{index}"))
+
+        final = Module()
+        final.add(SWaitCnt(dscnt=0, comment="redundant-entry"))
+        for index in range(5):
+            final.add(mfma(f"f{index}"))
+            if index == 0:
+                final.add(SWaitCnt(vlcnt=15, comment="vmem-frontier"))
+            elif index == 1:
+                final.add(SBarrier(comment="barrier"))
+            elif index == 2:
+                final.add(SBarrier(comment="lr-swap-standin"))
+            elif index == 3:
+                final.add(DSLoadB128(
+                    dst=vgpr(8, 4), src=vgpr(1),
+                    ds=DSModifiers(offset=0), comment="wrap-read"))
+
+        assert advancePartitionInterleave(
+            previous,
+            final,
+            3,
+            dropRedundantFinalLgkm=True,
+            finalSyncAdvanceMfmas=4)
+
+        preceding_mfma = {}
+        current_mfma = None
+        for inst in [*previous.flatitems(), *final.flatitems()]:
+            if isinstance(inst, MFMAInstruction):
+                current_mfma = inst.comment
+            else:
+                preceding_mfma[inst.comment] = current_mfma
+
+        assert "redundant-entry" not in preceding_mfma
+        assert preceding_mfma["vmem-frontier"] == "p4"
+        assert preceding_mfma["barrier"] == "p5"
+        assert preceding_mfma["lr-swap-standin"] == "p6"
+        assert preceding_mfma["wrap-read"] == "f0"
+
     def test_final_partition_advance_caps_previous_dtl_loads(self):
         from rocisa.code import Module
         from rocisa.container import mgpr, sgpr, vgpr
