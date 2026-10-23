@@ -4052,6 +4052,7 @@ class TestInstructionSchedulerWrapPrefetch:
                 comment=name)
 
         previous = Module()
+        previous.add(SWaitCnt(dscnt=0, comment="previous-drain"))
         for index in range(10):
             previous.add(mfma(f"p{index}"))
             if index < 5:
@@ -4081,10 +4082,13 @@ class TestInstructionSchedulerWrapPrefetch:
             final,
             3,
             rightAlignPreviousDtl=True,
-            maxPreviousDtlLoads=5)
+            maxPreviousDtlLoads=5,
+            dropRedundantFinalLgkm=True)
 
         previous_items = [*previous.flatitems()]
         final_items = [*final.flatitems()]
+        assert all(inst.comment != "entry" for inst in previous_items)
+        assert all(inst.comment != "entry" for inst in final_items)
         assert sum(
             isinstance(inst, BufferLoadB128)
             for inst in previous_items
@@ -4103,7 +4107,7 @@ class TestInstructionSchedulerWrapPrefetch:
             else:
                 preceding_mfma[inst.comment] = current_mfma
 
-        assert preceding_mfma["entry"] == "p6"
+        assert preceding_mfma["previous-drain"] is None
         assert [
             preceding_mfma[f"previous-gr-{index}"] for index in range(5)
         ] == ["p1", "p2", "p3", "p4", "p5"]
