@@ -16,7 +16,8 @@ from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstru
 class _SlotPlacer:
     """Generic slot placement engine for interleaving instructions between MFMAs.
 
-    Each interval (pair of adjacent MFMAs) has 2 placement slots.
+    Each interval (pair of adjacent MFMAs) has a configurable number of
+    4-cycle placement slots.
     Rules are injected via callbacks:
       - validators: (placer, pos, inst) -> bool — reject invalid slots
       - adjusters:  (placer, limit, inst) -> limit — shift search start
@@ -25,8 +26,10 @@ class _SlotPlacer:
 
     def __init__(self, intervals: int, numModules: int,
                  pathOrders: List[List[int]],
-                 validators=None, adjusters=None, onPlace=None):
-        self.totalSlots = intervals * 2
+                 validators=None, adjusters=None, onPlace=None,
+                 slotsPerInterval: int = 2):
+        self.slotsPerInterval = slotsPerInterval
+        self.totalSlots = intervals * slotsPerInterval
         self._n = numModules
         self._prevInPath: List[int] = [-1] * numModules
         self._nextInPath: List[int] = [-1] * numModules
@@ -109,7 +112,8 @@ class _SlotPlacer:
             self._onPlace(self, pos, item[1])
 
     def placePath(self, pathInsts: List[Tuple[int, object]], reverse: bool = False,
-                  multiDU: bool = False):
+                  multiDU: bool = False, startLimit: Optional[int] = None,
+                  overflowToTail: bool = False):
         """Place a sequence of (moduleId, instruction) items into slots.
 
         Walks pathInsts in order, applying adjusters (forward only) and
@@ -120,15 +124,24 @@ class _SlotPlacer:
         When multiDU is True, wait_gr immediately followed by barrier is
         placed as an atomic pair in the same slot so other paths cannot
         insert m0 setup between them.
+
+        startLimit can reserve leading slots for an already-placed prefix.
+        overflowToTail preserves forward path order by placing the first
+        unplaceable item and the rest of its path after the final MFMA,
+        rather than collapsing them into one overfull slot.
         """
-        limit = (self.totalSlots - 1) if reverse else 0
+        limit = ((self.totalSlots - 1) if reverse else 0) \
+            if startLimit is None else startLimit
         if not multiDU:
-            for item in pathInsts:
+            for idx, item in enumerate(pathInsts):
                 mid, inst = item
                 if not reverse:
                     limit = self.adjustLimit(limit, inst)
                 pos = self.findSlot(mid, inst, limit, reverse=reverse)
                 if pos is None:
+                    if overflowToTail and not reverse:
+                        self.leftovers.extend(pathInsts[idx:])
+                        return
                     pos = self._forceSlot(mid, limit, reverse)
                 self.place(pos, item, reverse=reverse)
                 limit = (pos - 1) if reverse else (pos + 1)
@@ -144,6 +157,9 @@ class _SlotPlacer:
                     limit = self.adjustLimit(limit, inst)
                 pos = self.findSlot(mid, inst, limit, reverse=reverse)
                 if pos is None:
+                    if overflowToTail:
+                        self.leftovers.extend(pathInsts[idx:])
+                        return
                     pos = self._forceSlot(mid, limit, reverse)
                 self.place(pos, item, reverse=reverse)
                 sync_item = pathInsts[idx + 1]
@@ -153,6 +169,9 @@ class _SlotPlacer:
                     sync_pos = self.findSlot(sync_item[0], sync_item[1],
                                              pos + 1, reverse=reverse)
                     if sync_pos is None:
+                        if overflowToTail:
+                            self.leftovers.extend(pathInsts[idx + 1:])
+                            return
                         sync_pos = self._forceSlot(sync_item[0], pos + 1, reverse)
                     self.place(sync_pos, sync_item, reverse=reverse)
                     pos = sync_pos
@@ -163,6 +182,9 @@ class _SlotPlacer:
                 limit = self.adjustLimit(limit, inst)
             pos = self.findSlot(mid, inst, limit, reverse=reverse)
             if pos is None:
+                if overflowToTail and not reverse:
+                    self.leftovers.extend(pathInsts[idx:])
+                    return
                 pos = self._forceSlot(mid, limit, reverse)
             self.place(pos, item, reverse=reverse)
             limit = (pos - 1) if reverse else (pos + 1)
@@ -175,7 +197,9 @@ class _SlotPlacer:
         result = Module()
         result.add(mfmas[0])
         for i in range(intervals):
-            for slot in (2 * i, 2 * i + 1):
+            slotBegin = self.slotsPerInterval * i
+            slotEnd = slotBegin + self.slotsPerInterval
+            for slot in range(slotBegin, slotEnd):
                 for item in self._placed[slot]:
                     result.add(item[1])
             result.add(mfmas[i + 1])
@@ -195,6 +219,10 @@ _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
 _isWaitCnt = lambda x: isinstance(x, SWaitCnt)
 _isM0Update = lambda x: isinstance(x, CommonInstruction) and hasattr(x, 'dst') and hasattr(x.dst, 'regType') and x.dst.regType == 'm'
+_isVALU = lambda x: isinstance(x, CommonInstruction) \
+    and not isinstance(x, (GlobalReadInstruction, LocalReadInstruction)) \
+    and hasattr(x, 'dst') and hasattr(x.dst, 'regType') \
+    and x.dst.regType == 'v'
 # Typed op detection (see SWaitCntEx.isWaitGr / SBarrier) rather than matching
 # substrings in the instruction comment, which is brittle to comment edits.
 _isWaitGr = lambda x: _isWaitCnt(x) and getattr(x, "isWaitGr", False)
@@ -223,29 +251,44 @@ class _SchedulingRules:
         self.bufLoadIdx = 0
         self.bufLoadMaxSlot = 0
         self.numBufLoads = 0
+        self.localReadIdx = 0
+        self.numLocalReads = 0
 
     # ── Validators: (placer, pos, inst) -> bool ──
 
     def oneDsReadPerInterval(self, placer, pos, inst):
-        """At most one ds_read per interval (pair of slots) to avoid same SIMD pair stalls as we have a single codepath"""
+        """At most one ds_read per two-slot SIMD issue pair."""
         if not _isDsRead(inst):
             return True
         peer = pos ^ 1
-        return not (0 <= peer < placer.totalSlots
-                    and any(_isDsRead(item[1]) for item in placer._placed[peer]))
+        slots = [pos]
+        if 0 <= peer < placer.totalSlots:
+            slots.append(peer)
+        return not any(_isDsRead(item[1])
+                       for slot in slots for item in placer._placed[slot])
+
+    def noDsReadOrValuInFirstSlot(self, placer, pos, inst):
+        """Reserve each p0 interval's first slot from DS reads and VALU."""
+        if pos % placer.slotsPerInterval != 0:
+            return True
+        return not (_isDsRead(inst) or _isVALU(inst))
 
     def minGapDsReadBeforeWait(self, placer, pos, inst):
         """Reject ds_read too close to an already-placed waitcnt ahead."""
         if not _isDsRead(inst):
             return True
-        gap = self.minGap * 2
+        if pos >= self.earliestWaitCntPos:
+            return True
+        gap = self.minGap * placer.slotsPerInterval
         return self.earliestWaitCntPos - pos >= gap
 
     def minGapDsReadToWait(self, placer, pos, inst):
         """Reject waitcnt too close to the last placed ds_read."""
         if not _isWaitCnt(inst) or self.lastDsReadPos < 0:
             return True
-        gap = self.minGap * 2
+        if pos <= self.lastDsReadPos:
+            return True
+        gap = self.minGap * placer.slotsPerInterval
         return pos - self.lastDsReadPos >= gap
 
     def noM0WithBufferLoad(self, placer, pos, inst):
@@ -294,6 +337,15 @@ class _SchedulingRules:
         self.bufLoadIdx += 1
         return limit
 
+    def spreadLocalReads(self, placer, limit, inst):
+        """Spread a selected LR path across all available 4-cycle slots."""
+        if not _isDsRead(inst) or self.numLocalReads <= 1:
+            return limit
+        target = self.localReadIdx * (placer.totalSlots - 1) \
+            // (self.numLocalReads - 1)
+        self.localReadIdx += 1
+        return max(limit, target)
+
     # ── Placement hook: (placer, pos, inst) -> None ──
 
     def trackPlacement(self, placer, pos, inst):
@@ -325,6 +377,12 @@ class _SchedulingRules:
             numTailInsts = sum(1 for mid, _ in pathInsts if mid in tailModuleIds)
             # this is an approximation as we don't know exactly how many slots will be use by modules after the GR yet (in this codepath)
             self.bufLoadMaxSlot = max(0, rawMax - numTailInsts)
+
+    def setupLocalReadSpreading(self, pathInsts):
+        """Enable full-range spreading for the current local-read path."""
+        self.numLocalReads = sum(
+            1 for _, inst in pathInsts if _isDsRead(inst)
+        )
 
     def setPostWaitGrDsReadFence(self, placer) -> None:
         """After the wait_gr path is placed, record ds_read coverage for GR deferral."""
@@ -364,6 +422,136 @@ def _flattenPath(order, emittedModules, reverse=False):
     if reverse:
         pathInsts.reverse()
     return pathInsts
+
+
+def _isWrapPrefetchPath(order, emittedModules):
+    """Return True for a wait path that reads operands for the next MT.
+
+    Partition-directed PLR marks the final partition's wrap local reads with
+    mtIteration > 0. Those reads feed the next partition-0, not the current
+    partition's MFMAs, so their payload can be scheduled after an early MFMA.
+    """
+    return any(
+        emittedModules[mid].opType == "lr"
+        and getattr(emittedModules[mid].source, "mtIteration", 0) > 0
+        for mid in order
+    )
+
+
+def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
+    """Find the exact 16-read p0 dual-period prefetch path."""
+    for order in preMfmaOrders:
+        modules = [emittedModules[mid] for mid in order]
+        if not (any(em.opType == "wait_gr" for em in modules)
+                and any(em.opType == "sync" for em in modules)):
+            continue
+
+        readModules = [em for em in modules if em.opType == "lr"]
+        if not readModules:
+            continue
+        partitions = {
+            getattr(em.source, "partition", None) for em in readModules
+        }
+        if partitions != {0}:
+            continue
+
+        hasNextPartitionData = any(
+            getattr(em.source, "tensor", None) in ("A", "B")
+            and getattr(em.source, "targetPartition", 0) == 1
+            and getattr(em.source, "mtIteration", 0) == 0
+            for em in readModules
+        )
+        scaleTensors = {
+            getattr(em.source, "tensor", None)
+            for em in readModules
+            if any(_isDsRead(inst) for inst in em.instructions)
+        } & {"SA", "SB"}
+        readCount = sum(
+            _isDsRead(inst)
+            for em in readModules
+            for inst in em.instructions
+        )
+        if not hasNextPartitionData or scaleTensors != {"SA", "SB"} \
+                or readCount != 16:
+            continue
+        return order
+    return None
+
+
+def _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules):
+    """Leave up to 15 current-partition reads outstanding at p0's wait."""
+    order = _findPartitionZeroPrefetchOrder(
+        preMfmaOrders, emittedModules)
+    if order is None:
+        return
+    for mid in order:
+        em = emittedModules[mid]
+        if em.opType != "wait_lr":
+            continue
+        for inst in em.instructions:
+            if _isWaitCnt(inst) and getattr(inst, "dscnt", -1) == 0:
+                inst.dscnt = 15
+                inst.comment = \
+                    "Wait for prior LR; leave p0 prefetch reads in flight"
+
+
+def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
+    """Move p0's full LR drain before its 16 independent younger reads.
+
+    Returns the matched order, a pre-MFMA wait/sync prefix, and the payload
+    path to spread through four 4-cycle scheduling slots per MXMFMA.
+    """
+    order = _findPartitionZeroPrefetchOrder(
+        preMfmaOrders, emittedModules)
+    if order is None:
+        return None
+
+    prefixInsts = []
+    for opType in ("wait_gr", "sync", "wait_lr"):
+        for mid in order:
+            em = emittedModules[mid]
+            if em.opType != opType:
+                continue
+            for inst in em.instructions:
+                if opType == "wait_lr" and _isWaitCnt(inst):
+                    inst.dscnt = 0
+                    inst.comment = "Wait for preloop LR before p0 MFMA"
+                prefixInsts.append((mid, inst))
+
+    payloadOrder = [
+        mid for mid in order
+        if emittedModules[mid].opType not in ("wait_gr", "sync", "wait_lr")
+    ]
+    payloadInsts = _flattenPath(payloadOrder, emittedModules)
+    return order, prefixInsts, payloadOrder, payloadInsts
+
+
+def _splitItemsAfterHalf(pathInsts, predicate):
+    """Split an instruction path after half its matching instructions."""
+    if not pathInsts:
+        return [], []
+
+    total = sum(predicate(inst) for _, inst in pathInsts)
+    if total == 0:
+        split = (len(pathInsts) + 1) // 2
+        return pathInsts[:split], pathInsts[split:]
+
+    target = (total + 1) // 2
+    count = 0
+    for index, (_, inst) in enumerate(pathInsts):
+        count += predicate(inst)
+        if count >= target:
+            split = index + 1
+            return pathInsts[:split], pathInsts[split:]
+    return pathInsts, []
+
+
+def _nextPlacementSlot(placer):
+    """Return the first slot after all instructions placed so far."""
+    for pos in range(placer.totalSlots - 1, -1, -1):
+        if placer._placed[pos]:
+            return pos + 1
+    return 0
 
 
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
@@ -487,12 +675,13 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
 
 def instructionSchedule(emittedModules, multiDU: bool = False,
                       minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT):
-    """Interleave non-MFMA instructions between MFMAs using 2 slots/interval.
+    """Interleave non-MFMA instructions between MFMAs.
 
     Rules (shared):
       - MFMA order is preserved.
-      - Between two adjacent MFMAs there are 2 placement slots.
-      - At most one ds_read (LocalReadInstruction) per interval.
+      - The legacy schedule uses 2 placement slots between adjacent MFMAs.
+      - The selected MXFP8 p0 experiment uses 4 4-cycle scheduling slots.
+      - At most one ds_read is placed per two-slot SIMD issue pair.
       - Before dependencies are respected at module order level.
       - Minimm distance between ds_read and it waitcnt (hardcoded for now)
       - Module-internal instruction order is preserved.
@@ -516,9 +705,26 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
 
     mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
     mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
+    p0Split = None
+    if mfmas and all(
+            isinstance(inst, MXMFMAInstruction)
+            and inst.getIssueLatency() == 8 for inst in mfmas):
+        p0Split = _splitPartitionZeroPrefetch(
+            preMfmaOrders, emittedModules)
+    if p0Split is None:
+        _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
+
+    slotsPerInterval = 4 if p0Split is not None else 2
+    placementPathOrders = list(pathOrders)
+    if p0Split is not None:
+        placementPathOrders.append(p0Split[2])
 
     def _emitPreMfma(result):
         for order in preMfmaOrders:
+            if p0Split is not None and order == p0Split[0]:
+                for _, inst in p0Split[1]:
+                    result.add(inst)
+                continue
             for mid in order:
                 for inst in emittedModules[mid].instructions:
                     result.add(inst)
@@ -529,6 +735,9 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         _emitPreMfma(result)
         for m in mfmas:
             result.add(m)
+        if p0Split is not None:
+            for _, inst in p0Split[3]:
+                result.add(inst)
         for order in pathOrders:
             for mid in order:
                 for inst in emittedModules[mid].instructions:
@@ -536,31 +745,90 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         return result
 
     paths = _classifyPaths(pathOrders, emittedModules)
-    rules = _SchedulingRules(totalSlots=(len(mfmas) - 1) * 2,
-                             minGapDsReadToWait=minGapDsReadToWait)
+    rules = _SchedulingRules(
+        totalSlots=(len(mfmas) - 1) * slotsPerInterval,
+        minGapDsReadToWait=minGapDsReadToWait)
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
                        rules.minGapDsReadToWait, rules.noM0WithBufferLoad]
-    base_adjusters = [rules.spreadBufferLoads]
+    base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
+    if p0Split is not None:
+        base_validators.append(rules.noDsReadOrValuInFirstSlot)
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
         base_adjusters.insert(0, rules.deferGrAfterWaitGrDsReads)
     placer = _SlotPlacer(
-        len(mfmas) - 1, n, pathOrders,
+        len(mfmas) - 1, n, placementPathOrders,
         validators=base_validators,
         adjusters=base_adjusters,
-        onPlace=rules.trackPlacement)
+        onPlace=rules.trackPlacement,
+        slotsPerInterval=slotsPerInterval)
 
-    for order, hasWaitGR in paths:
-        if not order:
-            continue
-        reverse = (not multiDU) and hasWaitGR
-        pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
-        rules.resetPath()
-        if not hasWaitGR:
-            rules.setupBufLoadSpreading(placer, pathInsts, order)
-        placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
-        if multiDU and hasWaitGR:
-            rules.setPostWaitGrDsReadFence(placer)
+    def _placeRegularPaths():
+        for order, hasWaitGR in paths:
+            if not order:
+                continue
+            wrapPrefetch = (not multiDU) and hasWaitGR \
+                and _isWrapPrefetchPath(order, emittedModules)
+            if wrapPrefetch:
+                # The final partition wraps its local-read prefetch to partition 0
+                # of the next MT. Legacy reverse packing runs out of valid slots and
+                # force-stacks wait+barrier, LR swaps, and several ds_reads before
+                # MFMA #1. Keep only the synchronization in the first interval;
+                # current-partition MFMAs do not consume the wrapped LR payload.
+                pathInsts = _flattenPath(order, emittedModules)
+                syncEnd = next(
+                    (idx + 1 for idx, (_, inst) in enumerate(pathInsts)
+                     if _isBarrier(inst)),
+                    0)
+                if syncEnd:
+                    rules.resetPath()
+                    placer.placePath(
+                        pathInsts[:syncEnd],
+                        multiDU=True)
+                    placer.placePath(
+                        pathInsts[syncEnd:],
+                        startLimit=2,
+                        overflowToTail=True)
+                    continue
+
+            reverse = (not multiDU) and hasWaitGR
+            pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
+            rules.resetPath()
+            if not hasWaitGR:
+                rules.setupBufLoadSpreading(placer, pathInsts, order)
+            placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
+            if multiDU and hasWaitGR:
+                rules.setPostWaitGrDsReadFence(placer)
+
+    if p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
+        regularHalves = [
+            _splitItemsAfterHalf(
+                _flattenPath(order, emittedModules), _isBufferLoad)
+            for order, _ in paths
+        ]
+        p0Halves = _splitItemsAfterHalf(p0Split[3], _isDsRead)
+
+        def _placePacked(pathInsts):
+            if not pathInsts:
+                return
+            rules.resetPath()
+            placer.placePath(
+                pathInsts,
+                startLimit=_nextPlacementSlot(placer))
+
+        # Split after complete m0/buffer-load pairs: first half of each
+        # SALU/global stream, first eight DS reads, then the remaining halves.
+        for first, _ in regularHalves:
+            _placePacked(first)
+        _placePacked(p0Halves[0])
+        for _, second in regularHalves:
+            _placePacked(second)
+        _placePacked(p0Halves[1])
+    else:
+        _placeRegularPaths()
+        if p0Split is not None:
+            rules.resetPath()
+            placer.placePath(p0Split[3])
 
     scheduled = Module()
     _emitPreMfma(scheduled)
