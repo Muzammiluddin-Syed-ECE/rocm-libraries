@@ -40,6 +40,7 @@ class LoopScheduleContext:
     multiDU: bool
     minGapDsReadToWait: int
     partitionPrefetch: bool
+    derivePartialLrWaits: bool
 
 
 LoopSchedulePolicy = Callable[[LoopScheduleContext], Optional[Module]]
@@ -315,6 +316,7 @@ class _SlotPlacer:
 # gfx1250 needs a larger gap (8); other archs use 4.
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT = 4
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250 = 8
+_MAX_LGKMCNT = 15
 
 _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
@@ -826,6 +828,47 @@ def _nextPlacementSlot(placer):
     return 0
 
 
+def safeOutstandingLocalReadSuffix(
+        scheduled, emittedModules, immediateMfmaCount):
+    """Count youngest DS reads unused by the immediate consumer partition.
+
+    A nonzero lgkmcnt can only prove completion for the older prefix of the
+    issue stream. Therefore the reads left outstanding must form a suffix in
+    final physical issue order, and every read in that suffix must have its
+    first consumer beyond all MFMAs in the next partition.
+
+    Missing metadata, an unknown consumer, or an unranked read in the suffix
+    conservatively terminates the count.
+    """
+    if immediateMfmaCount <= 0:
+        return 0
+
+    rankByInstruction = {}
+    for em in emittedModules:
+        if em.opType != "lr":
+            continue
+        if len(em.instructionMetadata) != len(em.instructions):
+            continue
+        for inst, metadata in zip(
+                em.instructions, em.instructionMetadata):
+            if _isDsRead(inst):
+                rankByInstruction[id(inst)] = metadata[0]
+
+    issuedRanks = [
+        rankByInstruction.get(id(inst))
+        for inst in scheduled.flatitems()
+        if _isDsRead(inst)
+    ]
+    safe = 0
+    for rank in reversed(issuedRanks):
+        if rank is None or rank < immediateMfmaCount:
+            break
+        safe += 1
+    # gfx9 encodes lgkmcnt in four bits. A smaller count is a stronger wait,
+    # so clamping an unusually large safe suffix remains conservative.
+    return min(safe, _MAX_LGKMCNT)
+
+
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
     """Extract non-MFMA dependency paths using only EmittedModule.before links.
 
@@ -1226,7 +1269,8 @@ def buildLoopScheduleContext(
         label: str,
         multiDU: bool = False,
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
-        partitionPrefetch: bool = False
+        partitionPrefetch: bool = False,
+        derivePartialLrWaits: bool = False
 ) -> LoopScheduleContext:
     """Build a loop-wide timeline from the geometry that codegen emitted.
 
@@ -1261,7 +1305,45 @@ def buildLoopScheduleContext(
         multiDU=multiDU,
         minGapDsReadToWait=minGapDsReadToWait,
         partitionPrefetch=partitionPrefetch,
+        derivePartialLrWaits=derivePartialLrWaits,
     )
+
+
+def _setEntryWaitLrCount(emittedModules, count):
+    """Apply a prior-cell suffix only to MFMA-entry LDS waits.
+
+    A cell may also contain an internal wait_lr that drains local reads before
+    an LDS overwrite barrier. Weakening that wait with the prior cell's safe
+    suffix would leave current-cell reads outstanding at the overwrite.
+    """
+    byId = {em.moduleId: em for em in emittedModules}
+    entryWaitIds = set()
+    for mfmaModule in (
+            em for em in emittedModules if em.opType == "mfma"):
+        current = mfmaModule.before
+        seen = set()
+        while current is not None and current not in seen:
+            seen.add(current)
+            predecessor = byId.get(current)
+            if predecessor is None:
+                break
+            if predecessor.opType == "wait_lr":
+                entryWaitIds.add(predecessor.moduleId)
+                break
+            current = predecessor.before
+
+    for em in emittedModules:
+        if em.opType != "wait_lr" or em.moduleId not in entryWaitIds:
+            continue
+        for inst in em.instructions:
+            if _isWaitCnt(inst) and inst.dscnt >= 0:
+                inst.dscnt = count
+                inst.comment = (
+                    "Wait for immediate LR; leave "
+                    f"{count} later-consumer reads in flight"
+                    if count
+                    else "Wait for all immediate LR"
+                )
 
 
 def instructionScheduleLoop(
@@ -1271,6 +1353,7 @@ def instructionScheduleLoop(
         multiDU: bool = False,
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
         partitionPrefetch: bool = False,
+        derivePartialLrWaits: bool = False,
         policy: Optional[LoopSchedulePolicy] = None
 ) -> Module:
     """Schedule one complete emitted loop with a safe partition-local fallback.
@@ -1285,6 +1368,7 @@ def instructionScheduleLoop(
         multiDU=multiDU,
         minGapDsReadToWait=minGapDsReadToWait,
         partitionPrefetch=partitionPrefetch,
+        derivePartialLrWaits=derivePartialLrWaits,
     )
     if policy is not None:
         scheduled = policy(context)
@@ -1292,18 +1376,44 @@ def instructionScheduleLoop(
             return scheduled
 
     result = Module()
+    previousSchedule = None
+    firstCell = None
     for group in context.groups:
         result.addComment0(
             f"partition={group.partition} subIterK={group.subIterK}")
         emittedModules = list(group.emittedModules)
         if emittedModules and group.hasMfmaModule:
-            result.add(instructionSchedule(
+            if context.derivePartialLrWaits and previousSchedule is not None:
+                previousScheduled, previousModules = previousSchedule
+                safeCount = safeOutstandingLocalReadSuffix(
+                    previousScheduled,
+                    previousModules,
+                    group.mfmaCount,
+                )
+                _setEntryWaitLrCount(emittedModules, safeCount)
+            scheduled = instructionSchedule(
                 emittedModules,
                 multiDU=context.multiDU,
                 minGapDsReadToWait=context.minGapDsReadToWait,
-                partitionPrefetch=context.partitionPrefetch))
+                partitionPrefetch=context.partitionPrefetch)
+            result.add(scheduled)
+            if context.derivePartialLrWaits:
+                if firstCell is None:
+                    firstCell = (emittedModules, group.mfmaCount)
+                previousSchedule = (scheduled, emittedModules)
         else:
             for em in emittedModules:
                 for inst in em.instructions:
                     result.add(inst)
+    if (context.derivePartialLrWaits
+            and previousSchedule is not None
+            and firstCell is not None):
+        previousScheduled, previousModules = previousSchedule
+        firstModules, firstMfmaCount = firstCell
+        safeCount = safeOutstandingLocalReadSuffix(
+            previousScheduled,
+            previousModules,
+            firstMfmaCount,
+        )
+        _setEntryWaitLrCount(firstModules, safeCount)
     return result
