@@ -9,7 +9,7 @@ with pluggable scheduling rules.
 
 from dataclasses import dataclass
 from typing import Callable, List, Tuple, Optional
-from rocisa.code import Module
+from rocisa.code import Module, TextBlock
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
     LocalReadInstruction, GlobalReadInstruction, CommonInstruction
 
@@ -42,6 +42,7 @@ class LoopScheduleContext:
     partitionPrefetch: bool
     derivePartialLrWaits: bool
     limitDtlBundlesPerMfma: bool
+    uniformPgrEpoch: bool
 
 
 LoopSchedulePolicy = Callable[[LoopScheduleContext], Optional[Module]]
@@ -82,6 +83,7 @@ class _SlotPlacer:
         self._validators = validators or []
         self._adjusters = adjusters or []
         self._onPlace = onPlace
+        self.denseToFit = False
 
         self._placed: List[List[Tuple[int, object]]] = [[] for _ in range(self.totalSlots)]
         self._firstPos: List[Optional[int]] = [None] * numModules
@@ -103,12 +105,42 @@ class _SlotPlacer:
         begin = (pos // self.slotsPerInterval) * self.slotsPerInterval
         end = min(self.totalSlots, begin + self.slotsPerInterval)
         return sum(
-            len(self._placed[slot])
+            sum(
+                not isinstance(item[1], TextBlock)
+                for item in self._placed[slot]
+            )
             for slot in range(begin, end)
         )
 
+    def _remainingCapacityWithIntervalCap(self, pos: int, cap: int) -> int:
+        """Return physical follower capacity from pos under a preferred cap."""
+        firstInterval = max(0, pos // self.slotsPerInterval)
+        lastInterval = (self.totalSlots - 1) // self.slotsPerInterval
+        return sum(
+            max(
+                0,
+                cap - self._intervalInstructionCount(
+                    interval * self.slotsPerInterval),
+            )
+            for interval in range(firstInterval, lastInterval + 1)
+        )
+
+    def _nextForwardLimit(self, pos: int, remainingItems: int) -> int:
+        """Reuse a slot only when a two-follower schedule cannot fit."""
+        if (self.denseToFit
+                and remainingItems
+                > self._remainingCapacityWithIntervalCap(pos, 2)):
+            return pos
+        return pos + 1
+
     def _canPlace(self, pos: int, inst) -> bool:
-        if pos < 0 or pos >= self.totalSlots or len(self._placed[pos]) >= 2:
+        if pos < 0 or pos >= self.totalSlots:
+            return False
+        if isinstance(inst, TextBlock):
+            return True
+        if sum(
+                not isinstance(item[1], TextBlock)
+                for item in self._placed[pos]) >= 2:
             return False
         if (self.maxInstructionsPerInterval is not None
                 and self._intervalInstructionCount(pos)
@@ -206,7 +238,9 @@ class _SlotPlacer:
                     max(setupPos, loadLo),
                     min(intervalEnd, loadHi) + 1):
                 if (loadPos == setupPos
-                        and len(self._placed[setupPos]) != 0):
+                        and any(
+                            not isinstance(item[1], TextBlock)
+                            for item in self._placed[setupPos])):
                     continue
                 if not self._canPlace(loadPos, loadInst):
                     continue
@@ -321,7 +355,15 @@ class _SlotPlacer:
                         return
                     pos = self._forceSlot(mid, limit, reverse)
                 self.place(pos, item, reverse=reverse)
-                limit = (pos - 1) if reverse else (pos + 1)
+                remaining = sum(
+                    not isinstance(nextItem[1], TextBlock)
+                    for nextItem in pathInsts[idx + 1:])
+                if reverse:
+                    limit = pos - 1
+                elif isinstance(inst, TextBlock):
+                    limit = pos
+                else:
+                    limit = self._nextForwardLimit(pos, remaining)
                 idx += 1
             return
 
@@ -443,6 +485,9 @@ class _SchedulingRules:
         self.earliestWaitCntPos = totalSlots
         self.waitGrBarrierPos: Optional[int] = None
         self.maxDsReadAfterWaitGr = -1
+        self.p0OverwritePrerequisiteIds = set()
+        self.youngerP0OverwriteIds = set()
+        self.partialP0OverwriteWaitIds = set()
         self.minGap = minGapDsReadToWait
         # Per-path state
         self._resetPath()
@@ -467,7 +512,13 @@ class _SchedulingRules:
             _isDsRead(item[1])
             for slot in range(first, end)
             for item in placer._placed[slot])
-        return reads < placer.slotsPerInterval - 1
+        limit = placer.slotsPerInterval \
+            if placer.denseToFit else placer.slotsPerInterval - 1
+        return reads < limit
+
+    def oneDtlLoadPerInterval(self, placer, pos, inst):
+        """Keep every DTL request, including an unpaired first request, isolated."""
+        return not _isDtlLoad(inst) or not placer._intervalHasDtlLoad(pos)
 
     def noDsReadOrValuInFirstSlot(self, placer, pos, inst):
         """Reserve each p0 interval's first slot from DS reads and VALU."""
@@ -478,6 +529,8 @@ class _SchedulingRules:
     def minGapDsReadBeforeWait(self, placer, pos, inst):
         """Reject ds_read too close to an already-placed waitcnt ahead."""
         if not _isDsRead(inst):
+            return True
+        if id(inst) in self.youngerP0OverwriteIds:
             return True
         if pos >= self.earliestWaitCntPos:
             return True
@@ -552,7 +605,8 @@ class _SchedulingRules:
 
     def trackPlacement(self, placer, pos, inst):
         """Update rule state after a successful placement."""
-        if _isDsRead(inst):
+        if (_isDsRead(inst)
+                and id(inst) not in self.youngerP0OverwriteIds):
             self.lastDsReadPos = max(self.lastDsReadPos, pos)
         if _isWaitCnt(inst):
             self.earliestWaitCntPos = min(self.earliestWaitCntPos, pos)
@@ -646,13 +700,12 @@ def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
     C0 contains data and scale reads while scale-reuse bodies contain only
     data reads. The read count and tensor mix vary with the macrotile, so the
     invariant is instead that at least one emitted A/B LR in partition 0 feeds
-    a later partition in the current MT.
+    a later partition in the current MT. Do not use wait/sync operations as a
+    recognition signature: uniform-epoch scheduling deliberately consolidates
+    those operations at a later frontier while leaving this LR payload intact.
     """
     for order in preMfmaOrders:
         modules = [emittedModules[mid] for mid in order]
-        if not (any(em.opType == "wait_gr" for em in modules)
-                and any(em.opType == "sync" for em in modules)):
-            continue
 
         readModules = [em for em in modules if em.opType == "lr"]
         if not readModules:
@@ -1092,7 +1145,8 @@ def instructionSchedule(
         emittedModules, multiDU: bool = False,
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
         partitionPrefetch: bool = False,
-        limitDtlBundlesPerMfma: bool = False):
+        limitDtlBundlesPerMfma: bool = False,
+        uniformPgrEpoch: bool = False):
     """Interleave non-MFMA instructions between MFMAs.
 
     Rules (shared):
@@ -1196,6 +1250,10 @@ def instructionSchedule(
         return result
 
     paths = _classifyPaths(pathOrders, emittedModules)
+    uniformEpochFrontier = (
+        uniformPgrEpoch
+        and any(hasWaitGR for _, hasWaitGR in paths)
+    )
     phasePathInsts = []
     canUseThreePhase = partitionPrefetchPolicy
     for order, _hasWaitGR in paths:
@@ -1219,6 +1277,8 @@ def instructionSchedule(
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
     if partitionPrefetchPolicy or p0Split is not None:
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
+        if limitDtlBundlesPerMfma:
+            base_validators.append(rules.oneDtlLoadPerInterval)
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
         base_adjusters.insert(0, rules.deferGrAfterWaitGrDsReads)
@@ -1293,11 +1353,33 @@ def instructionSchedule(
         orderedGrItems = _orderGlobalReadBundlesByFirstConsumer(
             grPaths, emittedModules)
 
+        overwriteReads = []
         if p0Split is not None:
+            overwriteReads = [
+                item for item in p0Payload
+                if getattr(
+                    emittedModules[item[0]].source,
+                    "mustPrecedeP0Overwrite",
+                    False)
+            ]
+            regularP0Payload = [
+                item for item in p0Payload
+                if not getattr(
+                    emittedModules[item[0]].source,
+                    "mustPrecedeP0Overwrite",
+                    False)
+            ]
             first, rest = _splitAfterFirstConsumerCohort(
-                p0Payload, emittedModules)
+                regularP0Payload, emittedModules)
             leading.extend(first)
+            # These current-epoch reads overlap the p0 future-write cohort.
+            # Keep the normal next-partition LR prefix first, but issue every
+            # overwrite prerequisite before the GR path's lgkmcnt+barrier.
+            leading.extend(overwriteReads)
             trailing.extend(rest)
+            for _, inst in overwriteReads:
+                if _isDsRead(inst):
+                    rules.p0OverwritePrerequisiteIds.add(id(inst))
 
         allPhaseItems = (
             p0Sync
@@ -1317,28 +1399,133 @@ def instructionSchedule(
         # Each atomic m0/DTL-load pair consumes one abstract placement slot,
         # not two. Account for that when right-aligning the VMEM tail.
         estimatedSlots = len(allPhaseItems) - numBufferLoads
-        phaseLimit = 0 if p0Split is not None else max(
-            0, placer.totalSlots - estimatedSlots - reserveSlots)
+        phaseLimit = (
+            0
+            if (p0Split is not None or uniformPgrEpoch)
+            else max(0, placer.totalSlots - estimatedSlots - reserveSlots)
+        )
 
         def _placePhase(
                 pathInsts, atomicDtl=False,
-                mfmaBetweenWaitAndBarrier=False):
+                mfmaBetweenWaitAndBarrier=False, denseToFit=False,
+                startOverride=None, overflowToTail=False):
             nonlocal phaseLimit
             if not pathInsts:
                 return
             rules.resetPath()
-            placer.placePath(
-                pathInsts,
-                startLimit=phaseLimit,
-                atomicDtl=atomicDtl,
-                mfmaBetweenWaitAndBarrier=mfmaBetweenWaitAndBarrier)
+            placer.denseToFit = denseToFit
+            try:
+                placer.placePath(
+                    pathInsts,
+                    startLimit=(
+                        phaseLimit
+                        if startOverride is None
+                        else startOverride),
+                    overflowToTail=overflowToTail,
+                    atomicDtl=atomicDtl,
+                    mfmaBetweenWaitAndBarrier=mfmaBetweenWaitAndBarrier)
+            finally:
+                placer.denseToFit = False
             phaseLimit = max(phaseLimit, _nextPlacementSlot(placer))
 
         _placePhase(p0Sync)
         if leading:
-            _placePhase(leading, mfmaBetweenWaitAndBarrier=True)
-            _placePhase(orderedGrItems, atomicDtl=True)
-            _placePhase(trailing)
+            if uniformEpochFrontier:
+                # Complete the future epoch first.  The following VMEM wait is
+                # adjusted by the post-pass for every buffer load placed here,
+                # yielding: GR(n+2) → vmcnt → barrier → LR(n+1).
+                _placePhase(orderedGrItems, atomicDtl=True)
+                _placePhase(
+                    leading + trailing,
+                    mfmaBetweenWaitAndBarrier=True,
+                    denseToFit=True)
+            else:
+                _placePhase(leading, mfmaBetweenWaitAndBarrier=True)
+                if overwriteReads and trailing and orderedGrItems:
+                    # Fill the MFMA intervals needed to age the prerequisite
+                    # read with unrelated, younger LDS reads.  The overwrite
+                    # wait is converted to lgkmcnt(N) below, so these requests
+                    # may remain pending while the older overlapping read is
+                    # guaranteed complete.
+                    budget = max(
+                        0,
+                        (rules.minGap - 1)
+                        * (slotsPerInterval - 1))
+                    preWaitTail = []
+                    postWaitTail = []
+                    used = 0
+                    index = 0
+                    while index < len(trailing):
+                        moduleId = trailing[index][0]
+                        inst = trailing[index][1]
+                        instructionIndex = next(
+                            (itemIndex for itemIndex, candidate
+                             in enumerate(
+                                 emittedModules[moduleId].instructions)
+                             if candidate is inst),
+                            -1)
+                        metadata = emittedModules[moduleId].instructionMetadata
+                        atomRank = (
+                            metadata[instructionIndex][0]
+                            if (instructionIndex >= 0
+                                and instructionIndex < len(metadata))
+                            else None)
+                        end = index + 1
+                        while (end < len(trailing)
+                               and trailing[end][0] == moduleId):
+                            nextInst = trailing[end][1]
+                            nextIndex = next(
+                                (itemIndex for itemIndex, candidate
+                                 in enumerate(
+                                     emittedModules[moduleId].instructions)
+                                 if candidate is nextInst),
+                                -1)
+                            nextRank = (
+                                metadata[nextIndex][0]
+                                if (nextIndex >= 0
+                                    and nextIndex < len(metadata))
+                                else None)
+                            if nextRank != atomRank:
+                                break
+                            end += 1
+                        group = trailing[index:end]
+                        if (all(_isDsRead(item[1]) for item in group)
+                                and used + len(group) <= budget):
+                            preWaitTail.extend(group)
+                            used += len(group)
+                        else:
+                            postWaitTail.extend(group)
+                        index = end
+
+                    for _, inst in preWaitTail:
+                        if _isDsRead(inst):
+                            rules.youngerP0OverwriteIds.add(id(inst))
+                    for _, inst in orderedGrItems:
+                        if _isWaitCnt(inst) and inst.dscnt >= 0:
+                            rules.partialP0OverwriteWaitIds.add(id(inst))
+                            break
+
+                    _placePhase(preWaitTail)
+                    trailing = postWaitTail
+                _placePhase(orderedGrItems, atomicDtl=True)
+                if overwriteReads and trailing:
+                    # The five-request p0 cohort leaves one physical follower
+                    # slot in most MFMA intervals.  Reuse those holes for the
+                    # independent LR tail instead of stacking it after the
+                    # penultimate MFMA.  Dependencies still prevent any item
+                    # from crossing its producer; this only relaxes the
+                    # artificial phase frontier.
+                    grSlots = [
+                        pos
+                        for pos, slot in enumerate(placer._placed)
+                        if any(_isBufferLoad(inst) for _, inst in slot)
+                    ]
+                    _placePhase(
+                        trailing,
+                        startOverride=min(grSlots) if grSlots else None,
+                        overflowToTail=True)
+                else:
+                    _placePhase(trailing)
             for pathInsts in otherPaths:
                 _placePhase(pathInsts)
         else:
@@ -1386,7 +1573,24 @@ def instructionSchedule(
     # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
     # that the scheduler placed before it within this subIterK.
     bufLoadCount = 0
+    sawOverwritePrerequisite = False
+    youngerOverwriteReads = 0
     for inst in scheduled.flatitems():
+        if id(inst) in rules.p0OverwritePrerequisiteIds:
+            sawOverwritePrerequisite = True
+            youngerOverwriteReads = 0
+        elif (sawOverwritePrerequisite
+              and id(inst) in rules.youngerP0OverwriteIds
+              and _isDsRead(inst)):
+            youngerOverwriteReads += 1
+        elif id(inst) in rules.partialP0OverwriteWaitIds:
+            inst.dscnt = youngerOverwriteReads
+            inst.comment = (
+                "Wait for p0 overwrite prerequisite; "
+                f"leave {youngerOverwriteReads} younger LR requests in flight")
+            sawOverwritePrerequisite = False
+            youngerOverwriteReads = 0
+
         if _isBufferLoad(inst):
             bufLoadCount += 1
         elif _isWaitCnt(inst) and inst.vlcnt >= 0:
@@ -1404,7 +1608,8 @@ def buildLoopScheduleContext(
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
         partitionPrefetch: bool = False,
         derivePartialLrWaits: bool = False,
-        limitDtlBundlesPerMfma: bool = False
+        limitDtlBundlesPerMfma: bool = False,
+        uniformPgrEpoch: bool = False
 ) -> LoopScheduleContext:
     """Build a loop-wide timeline from the geometry that codegen emitted.
 
@@ -1441,6 +1646,7 @@ def buildLoopScheduleContext(
         partitionPrefetch=partitionPrefetch,
         derivePartialLrWaits=derivePartialLrWaits,
         limitDtlBundlesPerMfma=limitDtlBundlesPerMfma,
+        uniformPgrEpoch=uniformPgrEpoch,
     )
 
 
@@ -1490,6 +1696,7 @@ def instructionScheduleLoop(
         partitionPrefetch: bool = False,
         derivePartialLrWaits: bool = False,
         limitDtlBundlesPerMfma: bool = False,
+        uniformPgrEpoch: bool = False,
         policy: Optional[LoopSchedulePolicy] = None
 ) -> Module:
     """Schedule one complete emitted loop with a safe partition-local fallback.
@@ -1506,6 +1713,7 @@ def instructionScheduleLoop(
         partitionPrefetch=partitionPrefetch,
         derivePartialLrWaits=derivePartialLrWaits,
         limitDtlBundlesPerMfma=limitDtlBundlesPerMfma,
+        uniformPgrEpoch=uniformPgrEpoch,
     )
     if policy is not None:
         scheduled = policy(context)
@@ -1534,7 +1742,8 @@ def instructionScheduleLoop(
                     multiDU=context.multiDU,
                     minGapDsReadToWait=context.minGapDsReadToWait,
                     partitionPrefetch=context.partitionPrefetch,
-                    limitDtlBundlesPerMfma=context.limitDtlBundlesPerMfma)
+                    limitDtlBundlesPerMfma=context.limitDtlBundlesPerMfma,
+                    uniformPgrEpoch=context.uniformPgrEpoch)
             except _DtlIntervalCapacityError:
                 # Dependency windows can make the simple bundle-count capacity
                 # check optimistic. Retry this generated cell with the prior
@@ -1544,7 +1753,8 @@ def instructionScheduleLoop(
                     multiDU=context.multiDU,
                     minGapDsReadToWait=context.minGapDsReadToWait,
                     partitionPrefetch=context.partitionPrefetch,
-                    limitDtlBundlesPerMfma=False)
+                    limitDtlBundlesPerMfma=False,
+                    uniformPgrEpoch=context.uniformPgrEpoch)
             result.add(scheduled)
             if context.derivePartialLrWaits:
                 if firstCell is None:
