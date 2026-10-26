@@ -265,6 +265,10 @@ class SchedulerConfig:
     # scale cadence.  The preloop correspondingly seeds a complete n+1 A/B
     # epoch so the first steady-state wrap has a producer.
     uniformPgrEpoch: bool = False
+    # Maximum contiguous A/B request cohort moved across a uniform-epoch
+    # frontier.  Five matches the CMS schedule while remaining independent of
+    # partition count and macrotile geometry.
+    uniformPgrCohortSize: int = 5
     # Physical traversal of the 2-D partition grid.  "m-major" preserves the
     # legacy order (M varies fastest).  "n-major" matches FlyDSL's
     # c00,c01,c10,c11 order (N varies fastest).
@@ -338,6 +342,8 @@ class SchedulerConfig:
                 "uniformPgrEpoch currently requires PrefetchGlobalRead=2"
             assert self.prefetchNextPartition, \
                 "uniformPgrEpoch requires partition-directed prefetch"
+            assert self.uniformPgrCohortSize >= 1, \
+                "uniformPgrCohortSize must be positive"
 
         assert self.scaleReuse >= 1, f"scaleReuse must be >= 1, got {self.scaleReuse}"
         # Dual-period MXFP8: the scale epoch (256 K) spans scaleReuse data
@@ -905,13 +911,13 @@ class LogicalScheduler:
         return partitions
 
     def _move_uniform_epoch_p0_overwrite_reads(self, partitions):
-        """Make the first five future writes legal in partition zero.
+        """Make the leading future-write cohort legal in partition zero.
 
         Uniform epochs are ordered canonically as A then B.  The first
-        CMS-sized cohort is therefore the first five atomic A/B requests.
-        Pull any current-epoch local-read placement overlapping that cohort
-        into partition zero.  The instruction scheduler can then issue those
-        reads, drain LDS, and place the overwrite barrier before the five
+        configured request cohort is selected independently of partition
+        geometry. Pull any current-epoch local-read placement overlapping that
+        cohort into partition zero.  The instruction scheduler can then issue
+        those reads, drain LDS, and place the overwrite barrier before the
         global reads instead of deferring the whole cohort to partition one.
 
         A logical LR may cover more than one atomic GR tile.  Split at the
@@ -930,9 +936,9 @@ class LogicalScheduler:
                 ('B', cfg.grB, cfg.numMFMATilesN)):
             for tile in range(0, num_tiles, gran.mn):
                 first_atoms.append((tensor, tile, tile + gran.mn))
-                if len(first_atoms) == 5:
+                if len(first_atoms) == cfg.uniformPgrCohortSize:
                     break
-            if len(first_atoms) == 5:
+            if len(first_atoms) == cfg.uniformPgrCohortSize:
                 break
 
         selected = {}
@@ -1832,10 +1838,10 @@ class LogicalScheduler:
             # post-adjustment accounts for those same-slot requests.  This is
             # the CMS ordering: final future loads, vmcnt+barrier, then the
             # first next-epoch LDS reads.
-            # The first five future writes and every overlapping current read
+            # The leading future-write cohort and every overlapping current read
             # are now co-located in partition zero.  Include that slot so its
             # LR→GR dependency emits the overwrite barrier there, then retain
-            # CMS-sized five-request cohorts in the later partitions.
+            # equally sized request cohorts in the later partitions.
             epoch_start = 0
             uniform_slots = list(range(epoch_start, frontier + 1))
         last_uid_slot = None
@@ -4035,7 +4041,8 @@ class LogicalScheduler:
                     and self.config.numSubIterK == 1
                     and label.startswith("MAINLOOP")),
                 limitDtlBundlesPerMfma=self.config.dualPeriodScale,
-                uniformPgrEpoch=self.config.uniformPgrEpoch))
+                uniformPgrEpoch=self.config.uniformPgrEpoch,
+                uniformPgrCohortSize=self.config.uniformPgrCohortSize))
         else:
             for pi, partition_emitted in enumerate(emitted_3d):
                 for k, em_list in enumerate(partition_emitted):

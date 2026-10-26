@@ -3340,8 +3340,8 @@ class TestGetNumVgpr:
 # Integration tests
 # ══════════════════════════════════════════════════════════════
 
-class TestWholeLoopScheduleSeam:
-    """The loop-wide view must preserve the historical per-cell schedule."""
+class TestLoopScheduleCells:
+    """Loop scheduling must derive cells from emitted geometry."""
 
     @staticmethod
     def _emitted_geometry():
@@ -3382,7 +3382,7 @@ class TestWholeLoopScheduleSeam:
             [group(2)],
         ]
 
-    def test_context_uses_emitted_geometry_for_global_mfma_ordinals(self):
+    def test_context_uses_emitted_geometry(self):
         from Tensile.Components.Subtile.InstructionScheduler import \
             buildLoopScheduleContext
 
@@ -3394,20 +3394,18 @@ class TestWholeLoopScheduleSeam:
         )
 
         assert context.label == "MAINLOOP_C0"
-        assert context.totalMfmaCount == 6
         assert context.multiDU is True
         assert context.minGapDsReadToWait == 7
         assert [
-            (group.partition, group.subIterK,
-             group.mfmaBegin, group.mfmaEnd)
-            for group in context.groups
+            (cell.partition, cell.subIterK, cell.mfmaCount)
+            for cell in context.cells
         ] == [
-            (0, 0, 0, 3),
-            (0, 1, 3, 4),
-            (1, 0, 4, 6),
+            (0, 0, 3),
+            (0, 1, 1),
+            (1, 0, 2),
         ]
 
-    def test_none_policy_is_byte_identical_to_previous_cell_loop(self):
+    def test_loop_scheduler_matches_direct_cell_loop(self):
         from rocisa.code import Module
         from Tensile.Components.Subtile.InstructionScheduler import (
             instructionSchedule, instructionScheduleLoop)
@@ -3420,20 +3418,11 @@ class TestWholeLoopScheduleSeam:
                     f"partition={partition} subIterK={sub_iter_k}")
                 previous.add(instructionSchedule(emitted))
 
-        seen = []
-
-        def observe_and_fallback(context):
-            seen.append(context)
-            return None
-
         through_seam = instructionScheduleLoop(
             emitted3d,
             label="MAINLOOP_C0",
-            policy=observe_and_fallback,
         )
 
-        assert len(seen) == 1
-        assert len(seen[0].groups) == 3
         assert str(through_seam) == str(previous)
 
     def test_dependency_capacity_failure_retries_prior_density(
@@ -3890,16 +3879,15 @@ class TestInstructionSchedulerWrapPrefetch:
             unsafe_tail, emitted, immediateMfmaCount=4) == 0
 
     @pytest.mark.parametrize("advance", [1, 2, 3])
-    @pytest.mark.parametrize("advance_followers", [True, False])
     def test_final_partition_interleave_advances_across_empty_seam(
-            self, advance, advance_followers):
+            self, advance):
         from rocisa.code import Module
         from rocisa.container import vgpr
         from rocisa.enum import InstType
         from rocisa.instruction import (
             MFMAInstruction, SBarrier, SWaitCnt)
         from Tensile.Components.Subtile.InstructionScheduler import (
-            advancePartitionInterleave)
+            compactWrapSeam, WrapSeamPolicy)
 
         # Initialize rocISA through the shared fixture helper.
         self._schedule()
@@ -3925,11 +3913,15 @@ class TestInstructionSchedulerWrapPrefetch:
             if index < len(cohorts):
                 final.add(cohorts[index])
 
-        assert advancePartitionInterleave(
+        assert compactWrapSeam(
             previous,
             final,
-            advance,
-            advanceFinalFollowers=advance_followers)
+            WrapSeamPolicy(
+                streamAdvanceMfmas=advance,
+                syncAdvanceMfmas=advance,
+                maxPrecedingDtlLoads=None,
+                rightAlignPrecedingDtl=False,
+                dropRedundantEntryLgkm=False))
         items = [
             *previous.flatitems(),
             *final.flatitems(),
@@ -3948,13 +3940,9 @@ class TestInstructionSchedulerWrapPrefetch:
         assert preceding_mfma["entry"] == target_name(3 - advance)
         assert [
             preceding_mfma[f"cohort{index}"] for index in range(3)
-        ] == (
-            [
-                target_name(4 + index - advance) for index in range(3)
-            ]
-            if advance_followers
-            else [f"f{index}" for index in range(3)]
-        )
+        ] == [
+            target_name(4 + index - advance) for index in range(3)
+        ]
         assert [
             inst.comment for inst in items
             if not isinstance(inst, MFMAInstruction)
@@ -3967,7 +3955,7 @@ class TestInstructionSchedulerWrapPrefetch:
         from rocisa.instruction import (
             BufferLoadB128, MFMAInstruction, SAddU32, SBarrier, SWaitCnt)
         from Tensile.Components.Subtile.InstructionScheduler import (
-            advancePartitionInterleave)
+            compactWrapSeam, WrapSeamPolicy)
 
         self._schedule()
 
@@ -3999,8 +3987,15 @@ class TestInstructionSchedulerWrapPrefetch:
             if index < 2:
                 final.add(SBarrier(comment=f"cohort{index}"))
 
-        assert advancePartitionInterleave(
-            previous, final, 2, rightAlignPreviousDtl=True)
+        assert compactWrapSeam(
+            previous,
+            final,
+            WrapSeamPolicy(
+                streamAdvanceMfmas=2,
+                syncAdvanceMfmas=2,
+                maxPrecedingDtlLoads=None,
+                rightAlignPrecedingDtl=True,
+                dropRedundantEntryLgkm=False))
 
         items = [*previous.flatitems(), *final.flatitems()]
         preceding_mfma = {}
@@ -4034,7 +4029,7 @@ class TestInstructionSchedulerWrapPrefetch:
         from rocisa.instruction import (
             DSLoadB128, MFMAInstruction, SBarrier, SWaitCnt)
         from Tensile.Components.Subtile.InstructionScheduler import (
-            advancePartitionInterleave)
+            compactWrapSeam, WrapSeamPolicy)
 
         self._schedule()
 
@@ -4064,12 +4059,15 @@ class TestInstructionSchedulerWrapPrefetch:
                     dst=vgpr(8, 4), src=vgpr(1),
                     ds=DSModifiers(offset=0), comment="wrap-read"))
 
-        assert advancePartitionInterleave(
+        assert compactWrapSeam(
             previous,
             final,
-            3,
-            dropRedundantFinalLgkm=True,
-            finalSyncAdvanceMfmas=4)
+            WrapSeamPolicy(
+                streamAdvanceMfmas=3,
+                syncAdvanceMfmas=4,
+                maxPrecedingDtlLoads=None,
+                rightAlignPrecedingDtl=False,
+                dropRedundantEntryLgkm=True))
 
         preceding_mfma = {}
         current_mfma = None
@@ -4092,7 +4090,7 @@ class TestInstructionSchedulerWrapPrefetch:
         from rocisa.instruction import (
             BufferLoadB128, MFMAInstruction, SAddU32, SBarrier, SWaitCnt)
         from Tensile.Components.Subtile.InstructionScheduler import (
-            advancePartitionInterleave)
+            compactWrapSeam, WrapSeamPolicy)
 
         self._schedule()
 
@@ -4128,13 +4126,15 @@ class TestInstructionSchedulerWrapPrefetch:
             elif index == 1:
                 final.add(SBarrier(comment="suffix"))
 
-        assert advancePartitionInterleave(
+        assert compactWrapSeam(
             previous,
             final,
-            3,
-            rightAlignPreviousDtl=True,
-            maxPreviousDtlLoads=5,
-            dropRedundantFinalLgkm=True)
+            WrapSeamPolicy(
+                streamAdvanceMfmas=3,
+                syncAdvanceMfmas=3,
+                maxPrecedingDtlLoads=5,
+                rightAlignPrecedingDtl=True,
+                dropRedundantEntryLgkm=True))
 
         previous_items = [*previous.flatitems()]
         final_items = [*final.flatitems()]
