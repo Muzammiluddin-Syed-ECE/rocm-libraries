@@ -3164,6 +3164,30 @@ class TestWholeLoopScheduleSeam:
         assert len(seen[0].groups) == 3
         assert str(through_seam) == str(previous)
 
+    def test_dependency_capacity_failure_retries_prior_density(
+            self, monkeypatch):
+        from rocisa.code import Module
+        from Tensile.Components.Subtile import InstructionScheduler as sched
+
+        calls = []
+
+        def fake_schedule(_emitted, **kwargs):
+            strict = kwargs["limitDtlBundlesPerMfma"]
+            calls.append(strict)
+            if strict:
+                raise sched._DtlIntervalCapacityError("constrained")
+            return Module()
+
+        monkeypatch.setattr(sched, "instructionSchedule", fake_schedule)
+        emitted3d = [[self._emitted_geometry()[0][0]]]
+        sched.instructionScheduleLoop(
+            emitted3d,
+            label="MAINLOOP_C0",
+            limitDtlBundlesPerMfma=True,
+        )
+
+        assert calls == [True, False]
+
 
 class TestInstructionSchedulerWrapPrefetch:
     """Partition-prefetch LRs must not delay independent MFMAs."""
@@ -3355,7 +3379,8 @@ class TestInstructionSchedulerWrapPrefetch:
                 em.instructionMetadata.append(
                     (rank_by_index[index], 2 if index < 8 else 1))
 
-        items = list(instructionSchedule(modules).flatitems())
+        items = list(instructionSchedule(
+            modules, limitDtlBundlesPerMfma=True).flatitems())
         mfma_positions = [
             i for i, inst in enumerate(items)
             if isinstance(inst, MXMFMAInstruction)
@@ -3378,8 +3403,9 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # The earliest-consumer LR cohort leads, followed by the complete
-        # partition VMEM cohort and then the remaining LRs.
+        # Finish the earliest-consumer LDS cohort before writing the future
+        # LDS epoch.  Then issue exactly one m0/load bundle per MFMA interval;
+        # remaining LDS reads follow.
         assert next(
             inst.comment for inst in items[mfma_positions[0] + 1:]
             if isinstance(inst, DSLoadB128)
@@ -3395,8 +3421,10 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         assert clustered == [
             *expected_reads[:4],
-            "m0-0", "gr-0", "m0-1", "gr-1",
-            "m0-2", "gr-2", "m0-3", "gr-3",
+            "m0-0", "gr-0",
+            "m0-1", "gr-1",
+            "m0-2", "gr-2",
+            "m0-3", "gr-3",
             *expected_reads[4:],
         ]
         assert [
@@ -3412,8 +3440,19 @@ class TestInstructionSchedulerWrapPrefetch:
                 for inst in items[begin + 1:end])
             for begin, end in zip(mfma_positions, mfma_positions[1:])
         ]
+        global_reads_per_interval = [
+            sum(isinstance(inst, BufferLoadB128)
+                for inst in items[begin + 1:end])
+            for begin, end in zip(mfma_positions, mfma_positions[1:])
+        ]
+        instructions_per_interval = [
+            end - begin - 1
+            for begin, end in zip(mfma_positions, mfma_positions[1:])
+        ]
         assert sum(count > 0 for count in reads_per_interval) >= 8
         assert max(reads_per_interval) <= 2
+        assert max(global_reads_per_interval) <= 1
+        assert max(instructions_per_interval) <= 3
         assert next(
             i for i, inst in reversed(list(enumerate(items)))
             if isinstance(inst, DSLoadB128)
@@ -3707,6 +3746,64 @@ class TestInstructionSchedulerWrapPrefetch:
                 isinstance(inst, MXMFMAInstruction)
                 for inst in items[setup_position + 1:load_position])
 
+    def test_dtl_density_falls_back_when_geometry_has_too_few_intervals(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import accvgpr, mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MXMFMAInstruction, SAddU32)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8, accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1], acc=accvgpr(0, 4),
+                a=vgpr(0, 8), b=vgpr(8, 8), acc2=accvgpr(0, 4),
+                mxsa=vgpr(16), mxsb=vgpr(17), block=32,
+                comment=f"mfma{index}")
+            for index in range(4)
+        ]
+        requests = []
+        for index in range(6):
+            requests.extend([
+                SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"m0-{index}"),
+                BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"gr-{index}"),
+            ])
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1, instructions=requests,
+                source=SimpleNamespace(kind="gr")),
+        ]
+
+        items = list(instructionSchedule(
+            modules,
+            partitionPrefetch=True,
+            limitDtlBundlesPerMfma=True,
+        ).flatitems())
+
+        assert [
+            inst.comment for inst in items
+            if isinstance(inst, BufferLoadB128)
+        ] == [f"gr-{index}" for index in range(6)]
+        assert sum(
+            isinstance(inst, MXMFMAInstruction) for inst in items
+        ) == len(mfmas)
+
     def test_vmem_bundles_follow_first_consumer_rank(self):
         import shutil
         from types import SimpleNamespace
@@ -3846,7 +3943,7 @@ class TestInstructionSchedulerWrapPrefetch:
             not isinstance(inst, DSLoadB128)
             for inst in items[:barrier_position])
 
-    def test_four_slot_p0_reserves_first_slot_from_ds_and_valu(self):
+    def test_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
         from rocisa import rocIsa
         from rocisa.container import DSModifiers, vgpr
@@ -3864,13 +3961,13 @@ class TestInstructionSchedulerWrapPrefetch:
             ds=DSModifiers(offset=0))
         valu = VXorB32(
             dst=vgpr(2), src0=vgpr(2), src1=vgpr(3))
-        rules = _SchedulingRules(totalSlots=8)
+        rules = _SchedulingRules(totalSlots=4)
         placer = _SlotPlacer(
             intervals=2,
             numModules=2,
             pathOrders=[[0], [1]],
             validators=[rules.noDsReadOrValuInFirstSlot],
-            slotsPerInterval=4)
+            slotsPerInterval=2)
 
         placer.placePath([(0, ds_read)])
         placer.placePath([(1, valu)])
@@ -3880,8 +3977,8 @@ class TestInstructionSchedulerWrapPrefetch:
             for pos, slot in enumerate(placer._placed)
             for _, inst in slot
         }
-        assert positions[id(ds_read)] % 4 != 0
-        assert positions[id(valu)] % 4 != 0
+        assert positions[id(ds_read)] % 2 != 0
+        assert positions[id(valu)] % 2 != 0
 
 
 class TestIntegration:
