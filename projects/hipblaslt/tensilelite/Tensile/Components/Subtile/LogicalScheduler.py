@@ -762,13 +762,15 @@ class EmittedModule:
     """
     moduleId: int = -1
     instructions: list = field(default_factory=list)
+    # Optional per-instruction scheduler metadata populated by the concrete
+    # emitter. Entries stay aligned with ``instructions``.
+    instructionMetadata: list = field(default_factory=list)
     before: Optional[int] = None   # moduleId that must complete before this module
     source: Optional[Emittable] = None
 
     @property
     def opType(self) -> str:
         return self.source.kind if self.source else ""
-
 
 # ── Main scheduler class ───────────────────────────────────
 
@@ -3639,6 +3641,7 @@ class LogicalScheduler:
         """
         from .InstructionScheduler import (
             instructionSchedule,
+            instructionScheduleLoop,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250,
         )
@@ -3646,7 +3649,8 @@ class LogicalScheduler:
             insertLRSwapRawWaitAlu, setMatrixReuse, insertLRSwapWarWaitAlu)
         from rocisa.code import Module, Label
         from rocisa.container import sgpr
-        from rocisa.instruction import SCmpEQU32, SCBranchSCC0, SCBranchSCC1, SMovB32
+        from rocisa.instruction import (
+            SCmpEQU32, SCBranchSCC0, SCBranchSCC1, SMovB32)
 
         # gfx1250 needs a larger ds_read->waitcnt gap.
         isGfx1250 = writer.states.archCaps.get("HasWmmaArbStallBit", False)
@@ -3665,34 +3669,49 @@ class LogicalScheduler:
         pap_merge_label = Label("SubtilePAPPreloopFirstGRMerge", "") if use_pap_preloop_skip else None
         skipping_first_gr_group = False
         first_gr_group_done = False
-        for pi, partition_emitted in enumerate(emitted_3d):
-            for k, em_list in enumerate(partition_emitted):
-                module.addComment0(f"partition={pi} subIterK={k}")
-                has_mfma = any(em.opType == 'mfma' for em in em_list)
+        if schedule and not use_pap_preloop_skip:
+            module.add(instructionScheduleLoop(
+                emitted_3d,
+                label=label,
+                multiDU=self._is_multi_du(),
+                minGapDsReadToWait=minGapDsReadToWait,
+                partitionPrefetch=self.config.prefetchNextPartition,
+                derivePartialLrWaits=(
+                    self.config.prefetchNextPartition
+                    and self.config.numSubIterK == 1
+                    and label.startswith("MAINLOOP")),
+                limitDtlBundlesPerMfma=self.config.dualPeriodScale))
+        else:
+            for pi, partition_emitted in enumerate(emitted_3d):
+                for k, em_list in enumerate(partition_emitted):
+                    module.addComment0(f"partition={pi} subIterK={k}")
+                    has_mfma = any(em.opType == 'mfma' for em in em_list)
 
-                if schedule and em_list and has_mfma:
-                    scheduled = instructionSchedule(
-                        em_list,
-                        multiDU=self._is_multi_du(),
-                        minGapDsReadToWait=minGapDsReadToWait)
-                    module.add(scheduled)
-                else:
-                    for em in em_list:
-                        if use_pap_preloop_skip and not first_gr_group_done:
-                            if em.opType == 'gr':
-                                if not skipping_first_gr_group:
-                                    module.add(SBitcmp1B32(src0=sgpr("PersistentPrefetchState"), src1=0,
-                                                         comment="Subtile PAP: first PRELOOP GR already issued?"))
-                                    module.add(SCBranchSCC1(labelName=pap_merge_label.getLabelName(),
-                                                            comment="skip first PRELOOP GR group if primed"))
-                                    skipping_first_gr_group = True
-                            elif skipping_first_gr_group:
-                                module.add(pap_merge_label)
-                                module.add(SMovB32(dst=sgpr("PersistentPrefetchState"), src=0,
-                                                   comment="Subtile PAP: clear after first PRELOOP GR merge"))
-                                first_gr_group_done = True
-                        for inst in em.instructions:
-                            module.add(inst)
+                    if schedule and em_list and has_mfma:
+                        scheduled = instructionSchedule(
+                            em_list,
+                            multiDU=self._is_multi_du(),
+                            minGapDsReadToWait=minGapDsReadToWait,
+                            partitionPrefetch=self.config.prefetchNextPartition,
+                            limitDtlBundlesPerMfma=self.config.dualPeriodScale)
+                        module.add(scheduled)
+                    else:
+                        for em in em_list:
+                            if use_pap_preloop_skip and not first_gr_group_done:
+                                if em.opType == 'gr':
+                                    if not skipping_first_gr_group:
+                                        module.add(SBitcmp1B32(src0=sgpr("PersistentPrefetchState"), src1=0,
+                                                             comment="Subtile PAP: first PRELOOP GR already issued?"))
+                                        module.add(SCBranchSCC1(labelName=pap_merge_label.getLabelName(),
+                                                                comment="skip first PRELOOP GR group if primed"))
+                                        skipping_first_gr_group = True
+                                elif skipping_first_gr_group:
+                                    module.add(pap_merge_label)
+                                    module.add(SMovB32(dst=sgpr("PersistentPrefetchState"), src=0,
+                                                       comment="Subtile PAP: clear after first PRELOOP GR merge"))
+                                    first_gr_group_done = True
+                            for inst in em.instructions:
+                                module.add(inst)
         if use_pap_preloop_skip and skipping_first_gr_group and not first_gr_group_done:
             module.add(pap_merge_label)
             module.add(SMovB32(dst=sgpr("PersistentPrefetchState"), src=0,
