@@ -3043,6 +3043,103 @@ class TestGetNumVgpr:
 # Integration tests
 # ══════════════════════════════════════════════════════════════
 
+class TestWholeLoopScheduleSeam:
+    """The loop-wide view must preserve the historical per-cell schedule."""
+
+    @staticmethod
+    def _emitted_geometry():
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import MFMAInstruction
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        next_id = 0
+
+        def group(count):
+            nonlocal next_id
+            module = EmittedModule(
+                moduleId=next_id,
+                instructions=[
+                    MFMAInstruction(
+                        InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                        False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                        comment=f"mfma-{next_id}-{index}")
+                    for index in range(count)
+                ],
+                source=SimpleNamespace(kind="mfma"),
+            )
+            next_id += 1
+            return [module]
+
+        # Deliberately uneven: neither partition count nor MFMA count is a
+        # reference-kernel constant.
+        return [
+            [group(3), group(1)],
+            [group(2)],
+        ]
+
+    def test_context_uses_emitted_geometry_for_global_mfma_ordinals(self):
+        from Tensile.Components.Subtile.InstructionScheduler import \
+            buildLoopScheduleContext
+
+        context = buildLoopScheduleContext(
+            self._emitted_geometry(),
+            label="MAINLOOP_C0",
+            multiDU=True,
+            minGapDsReadToWait=7,
+        )
+
+        assert context.label == "MAINLOOP_C0"
+        assert context.totalMfmaCount == 6
+        assert context.multiDU is True
+        assert context.minGapDsReadToWait == 7
+        assert [
+            (group.partition, group.subIterK,
+             group.mfmaBegin, group.mfmaEnd)
+            for group in context.groups
+        ] == [
+            (0, 0, 0, 3),
+            (0, 1, 3, 4),
+            (1, 0, 4, 6),
+        ]
+
+    def test_none_policy_is_byte_identical_to_previous_cell_loop(self):
+        from rocisa.code import Module
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule, instructionScheduleLoop)
+
+        emitted3d = self._emitted_geometry()
+        previous = Module()
+        for partition, partition_emitted in enumerate(emitted3d):
+            for sub_iter_k, emitted in enumerate(partition_emitted):
+                previous.addComment0(
+                    f"partition={partition} subIterK={sub_iter_k}")
+                previous.add(instructionSchedule(emitted))
+
+        seen = []
+
+        def observe_and_fallback(context):
+            seen.append(context)
+            return None
+
+        through_seam = instructionScheduleLoop(
+            emitted3d,
+            label="MAINLOOP_C0",
+            policy=observe_and_fallback,
+        )
+
+        assert len(seen) == 1
+        assert len(seen[0].groups) == 3
+        assert str(through_seam) == str(previous)
+
+
 class TestInstructionSchedulerWrapPrefetch:
     """Partition-prefetch LRs must not delay independent MFMAs."""
 
