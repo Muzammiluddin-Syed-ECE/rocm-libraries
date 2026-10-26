@@ -3889,6 +3889,296 @@ class TestInstructionSchedulerWrapPrefetch:
         assert safeOutstandingLocalReadSuffix(
             unsafe_tail, emitted, immediateMfmaCount=4) == 0
 
+    @pytest.mark.parametrize("advance", [1, 2, 3])
+    @pytest.mark.parametrize("advance_followers", [True, False])
+    def test_final_partition_interleave_advances_across_empty_seam(
+            self, advance, advance_followers):
+        from rocisa.code import Module
+        from rocisa.container import vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            MFMAInstruction, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            advancePartitionInterleave)
+
+        # Initialize rocISA through the shared fixture helper.
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        previous = Module()
+        previous_mfmas = [mfma(f"p{index}") for index in range(4)]
+        previous.addItems(previous_mfmas)
+
+        final = Module()
+        final.add(SWaitCnt(dscnt=0, comment="entry"))
+        final_mfmas = [mfma(f"f{index}") for index in range(4)]
+        cohorts = [
+            SBarrier(comment=f"cohort{index}") for index in range(3)
+        ]
+        for index, inst in enumerate(final_mfmas):
+            final.add(inst)
+            if index < len(cohorts):
+                final.add(cohorts[index])
+
+        assert advancePartitionInterleave(
+            previous,
+            final,
+            advance,
+            advanceFinalFollowers=advance_followers)
+        items = [
+            *previous.flatitems(),
+            *final.flatitems(),
+        ]
+        preceding_mfma = {}
+        current_mfma = None
+        for inst in items:
+            if isinstance(inst, MFMAInstruction):
+                current_mfma = inst.comment
+            else:
+                preceding_mfma[inst.comment] = current_mfma
+
+        def target_name(index):
+            return f"p{index}" if index < 4 else f"f{index - 4}"
+
+        assert preceding_mfma["entry"] == target_name(3 - advance)
+        assert [
+            preceding_mfma[f"cohort{index}"] for index in range(3)
+        ] == (
+            [
+                target_name(4 + index - advance) for index in range(3)
+            ]
+            if advance_followers
+            else [f"f{index}" for index in range(3)]
+        )
+        assert [
+            inst.comment for inst in items
+            if not isinstance(inst, MFMAInstruction)
+        ] == ["entry", "cohort0", "cohort1", "cohort2"]
+
+    def test_final_partition_advance_right_aligns_previous_dtl_bundles(self):
+        from rocisa.code import Module
+        from rocisa.container import mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MFMAInstruction, SAddU32, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            advancePartitionInterleave)
+
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        previous = Module()
+        for index in range(8):
+            previous.add(mfma(f"p{index}"))
+            if index < 3:
+                previous.add(SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"m0-{index}"))
+                previous.add(BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"gr-{index}"))
+            elif index in (3, 4):
+                previous.add(SAddU32(
+                    dst=sgpr(40 + index), src0=sgpr(40 + index), src1=1,
+                    comment=f"residual-{index}"))
+
+        final = Module()
+        final.add(SWaitCnt(dscnt=0, comment="entry"))
+        for index in range(4):
+            final.add(mfma(f"f{index}"))
+            if index < 2:
+                final.add(SBarrier(comment=f"cohort{index}"))
+
+        assert advancePartitionInterleave(
+            previous, final, 2, rightAlignPreviousDtl=True)
+
+        items = [*previous.flatitems(), *final.flatitems()]
+        preceding_mfma = {}
+        current_mfma = None
+        for inst in items:
+            if isinstance(inst, MFMAInstruction):
+                current_mfma = inst.comment
+            else:
+                preceding_mfma[inst.comment] = current_mfma
+
+        assert [
+            preceding_mfma[f"gr-{index}"] for index in range(3)
+        ] == ["p2", "p3", "p4"]
+        for index in range(3):
+            setup = next(
+                pos for pos, inst in enumerate(items)
+                if inst.comment == f"m0-{index}")
+            load = next(
+                pos for pos, inst in enumerate(items)
+                if inst.comment == f"gr-{index}")
+            assert load == setup + 1
+        assert preceding_mfma["entry"] == "p5"
+        assert preceding_mfma["cohort0"] == "p6"
+        assert preceding_mfma["cohort1"] == "p7"
+
+    def test_final_sync_prefix_advances_farther_without_crossing_wrap_reads(
+            self):
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            DSLoadB128, MFMAInstruction, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            advancePartitionInterleave)
+
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        previous = Module()
+        previous.add(SWaitCnt(dscnt=0, comment="previous-drain"))
+        for index in range(8):
+            previous.add(mfma(f"p{index}"))
+
+        final = Module()
+        final.add(SWaitCnt(dscnt=0, comment="redundant-entry"))
+        for index in range(5):
+            final.add(mfma(f"f{index}"))
+            if index == 0:
+                final.add(SWaitCnt(vlcnt=15, comment="vmem-frontier"))
+            elif index == 1:
+                final.add(SBarrier(comment="barrier"))
+            elif index == 2:
+                final.add(SBarrier(comment="lr-swap-standin"))
+            elif index == 3:
+                final.add(DSLoadB128(
+                    dst=vgpr(8, 4), src=vgpr(1),
+                    ds=DSModifiers(offset=0), comment="wrap-read"))
+
+        assert advancePartitionInterleave(
+            previous,
+            final,
+            3,
+            dropRedundantFinalLgkm=True,
+            finalSyncAdvanceMfmas=4)
+
+        preceding_mfma = {}
+        current_mfma = None
+        for inst in [*previous.flatitems(), *final.flatitems()]:
+            if isinstance(inst, MFMAInstruction):
+                current_mfma = inst.comment
+            else:
+                preceding_mfma[inst.comment] = current_mfma
+
+        assert "redundant-entry" not in preceding_mfma
+        assert preceding_mfma["vmem-frontier"] == "p4"
+        assert preceding_mfma["barrier"] == "p5"
+        assert preceding_mfma["lr-swap-standin"] == "p6"
+        assert preceding_mfma["wrap-read"] == "f0"
+
+    def test_final_partition_advance_caps_previous_dtl_loads(self):
+        from rocisa.code import Module
+        from rocisa.container import mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MFMAInstruction, SAddU32, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            advancePartitionInterleave)
+
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        previous = Module()
+        previous.add(SWaitCnt(dscnt=0, comment="previous-drain"))
+        for index in range(10):
+            previous.add(mfma(f"p{index}"))
+            if index < 5:
+                previous.add(SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"previous-m0-{index}"))
+                previous.add(BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"previous-gr-{index}"))
+
+        final = Module()
+        final.add(SWaitCnt(dscnt=0, comment="entry"))
+        for index in range(4):
+            final.add(mfma(f"f{index}"))
+            if index == 0:
+                final.add(SAddU32(
+                    dst=mgpr(0), src0=sgpr(28), src1=0,
+                    comment="final-m0"))
+                final.add(BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(32, 4),
+                    soffset=0, comment="final-gr"))
+            elif index == 1:
+                final.add(SBarrier(comment="suffix"))
+
+        assert advancePartitionInterleave(
+            previous,
+            final,
+            3,
+            rightAlignPreviousDtl=True,
+            maxPreviousDtlLoads=5,
+            dropRedundantFinalLgkm=True)
+
+        previous_items = [*previous.flatitems()]
+        final_items = [*final.flatitems()]
+        assert all(inst.comment != "entry" for inst in previous_items)
+        assert all(inst.comment != "entry" for inst in final_items)
+        assert sum(
+            isinstance(inst, BufferLoadB128)
+            for inst in previous_items
+        ) == 5
+        assert sum(
+            isinstance(inst, BufferLoadB128)
+            for inst in final_items
+        ) == 1
+
+        items = previous_items + final_items
+        preceding_mfma = {}
+        current_mfma = None
+        for inst in items:
+            if isinstance(inst, MFMAInstruction):
+                current_mfma = inst.comment
+            else:
+                preceding_mfma[inst.comment] = current_mfma
+
+        assert preceding_mfma["previous-drain"] is None
+        assert [
+            preceding_mfma[f"previous-gr-{index}"] for index in range(5)
+        ] == ["p1", "p2", "p3", "p4", "p5"]
+        assert preceding_mfma["final-gr"] == "f0"
+        assert preceding_mfma["suffix"] == "f1"
+
+        for prefix in ("previous", "final"):
+            indices = (
+                range(5) if prefix == "previous" else (None,)
+            )
+            for index in indices:
+                suffix = f"-{index}" if index is not None else ""
+                setup = next(
+                    pos for pos, inst in enumerate(items)
+                    if inst.comment == f"{prefix}-m0{suffix}")
+                load = next(
+                    pos for pos, inst in enumerate(items)
+                    if inst.comment == f"{prefix}-gr{suffix}")
+                assert load == setup + 1
+
     def test_data_only_partition_zero_prefetch_is_recognized(self):
         import shutil
         from types import SimpleNamespace
