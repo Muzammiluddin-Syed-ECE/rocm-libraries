@@ -39,6 +39,7 @@ class LoopScheduleContext:
     totalMfmaCount: int
     multiDU: bool
     minGapDsReadToWait: int
+    partitionPrefetch: bool
 
 
 LoopSchedulePolicy = Callable[[LoopScheduleContext], Optional[Module]]
@@ -142,9 +143,62 @@ class _SlotPlacer:
         if self._onPlace:
             self._onPlace(self, pos, item[1])
 
+    def _placeAtomicDtlPair(self, setupItem, loadItem, limit: int) -> Optional[int]:
+        """Place final m0 setup and its DTL request before the same MFMA.
+
+        The pair may use any two slots in one MFMA interval.  Keeping it
+        interval-local ensures that moving setup earlier also ages the actual
+        request instead of leaving a matrix instruction between the two.
+        """
+        setupMid, setupInst = setupItem
+        loadMid, loadInst = loadItem
+        setupLo, setupHi = self.bounds(setupMid)
+        loadLo, loadHi = self.bounds(loadMid)
+
+        first = max(limit, setupLo)
+        for setupPos in range(first, setupHi + 1):
+            intervalEnd = min(
+                self.totalSlots - 1,
+                (setupPos // self.slotsPerInterval + 1)
+                * self.slotsPerInterval - 1,
+            )
+            if not self._canPlace(setupPos, setupInst):
+                continue
+            for loadPos in range(
+                    max(setupPos, loadLo),
+                    min(intervalEnd, loadHi) + 1):
+                if (loadPos == setupPos
+                        and len(self._placed[setupPos]) != 0):
+                    continue
+                if not self._canPlace(loadPos, loadInst):
+                    continue
+                self.place(setupPos, setupItem)
+                self.place(loadPos, loadItem)
+                return loadPos
+
+        # Match the placer's normal overflow behavior: preserve the semantic
+        # boundary even when the abstract slot capacity is exhausted.  This
+        # may overfill a slot, but it cannot move the request across an MFMA.
+        firstInterval = max(0, first // self.slotsPerInterval)
+        lastInterval = (self.totalSlots - 1) // self.slotsPerInterval
+        for interval in range(firstInterval, lastInterval + 1):
+            intervalBegin = interval * self.slotsPerInterval
+            intervalEnd = min(
+                self.totalSlots - 1,
+                intervalBegin + self.slotsPerInterval - 1,
+            )
+            setupPos = max(first, intervalBegin)
+            loadPos = max(setupPos, loadLo)
+            if (setupPos <= min(setupHi, intervalEnd)
+                    and loadPos <= min(loadHi, intervalEnd)):
+                self.place(setupPos, setupItem)
+                self.place(loadPos, loadItem)
+                return loadPos
+        return None
+
     def placePath(self, pathInsts: List[Tuple[int, object]], reverse: bool = False,
                   multiDU: bool = False, startLimit: Optional[int] = None,
-                  overflowToTail: bool = False):
+                  overflowToTail: bool = False, atomicDtl: bool = False):
         """Place a sequence of (moduleId, instruction) items into slots.
 
         Walks pathInsts in order, applying adjusters (forward only) and
@@ -160,12 +214,27 @@ class _SlotPlacer:
         overflowToTail preserves forward path order by placing the first
         unplaceable item and the rest of its path after the final MFMA,
         rather than collapsing them into one overfull slot.
+
+        atomicDtl keeps an adjacent final-m0/DTL-load pair inside one MFMA
+        interval. It is used only by the partition-prefetch phase scheduler.
         """
         limit = ((self.totalSlots - 1) if reverse else 0) \
             if startLimit is None else startLimit
         if not multiDU:
-            for idx, item in enumerate(pathInsts):
+            idx = 0
+            while idx < len(pathInsts):
+                item = pathInsts[idx]
                 mid, inst = item
+                if (atomicDtl and not reverse
+                        and idx + 1 < len(pathInsts)
+                        and _isM0Update(inst)
+                        and _isDtlLoad(pathInsts[idx + 1][1])):
+                    pairEnd = self._placeAtomicDtlPair(
+                        item, pathInsts[idx + 1], limit)
+                    if pairEnd is not None:
+                        limit = pairEnd + 1
+                        idx += 2
+                        continue
                 if not reverse:
                     limit = self.adjustLimit(limit, inst)
                 pos = self.findSlot(mid, inst, limit, reverse=reverse)
@@ -176,6 +245,7 @@ class _SlotPlacer:
                     pos = self._forceSlot(mid, limit, reverse)
                 self.place(pos, item, reverse=reverse)
                 limit = (pos - 1) if reverse else (pos + 1)
+                idx += 1
             return
 
         idx = 0
@@ -248,6 +318,10 @@ _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250 = 8
 
 _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
+# Compiled rocisa buffer-load bindings do not expose their MUBUF modifiers.
+# In this policy an immediately preceding m0 write is the semantic DTL marker:
+# ordinary VGPR buffer loads neither consume nor set m0.
+_isDtlLoad = _isBufferLoad
 _isWaitCnt = lambda x: isinstance(x, SWaitCnt)
 _isM0Update = lambda x: isinstance(x, CommonInstruction) and hasattr(x, 'dst') and hasattr(x.dst, 'regType') and x.dst.regType == 'm'
 _isVALU = lambda x: isinstance(x, CommonInstruction) \
@@ -470,7 +544,13 @@ def _isWrapPrefetchPath(order, emittedModules):
 
 
 def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
-    """Find the exact 16-read p0 dual-period prefetch path."""
+    """Find p0's partition-prefetch path from semantic placement metadata.
+
+    C0 contains data and scale reads while scale-reuse bodies contain only
+    data reads. The read count and tensor mix vary with the macrotile, so the
+    invariant is instead that at least one emitted A/B LR in partition 0 feeds
+    a later partition in the current MT.
+    """
     for order in preMfmaOrders:
         modules = [emittedModules[mid] for mid in order]
         if not (any(em.opType == "wait_gr" for em in modules)
@@ -492,18 +572,12 @@ def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
             and getattr(em.source, "mtIteration", 0) == 0
             for em in readModules
         )
-        scaleTensors = {
-            getattr(em.source, "tensor", None)
-            for em in readModules
-            if any(_isDsRead(inst) for inst in em.instructions)
-        } & {"SA", "SB"}
         readCount = sum(
             _isDsRead(inst)
             for em in readModules
             for inst in em.instructions
         )
-        if not hasNextPartitionData or scaleTensors != {"SA", "SB"} \
-                or readCount != 16:
+        if not hasNextPartitionData or readCount == 0:
             continue
         return order
     return None
@@ -527,7 +601,7 @@ def _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules):
 
 
 def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
-    """Move p0's full LR drain before its 16 independent younger reads.
+    """Move p0's full LR drain before its independent younger reads.
 
     Returns the matched order, a pre-MFMA wait/sync prefix, and the payload
     path to spread through four 4-cycle scheduling slots per MXMFMA.
@@ -555,6 +629,173 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     ]
     payloadInsts = _flattenPath(payloadOrder, emittedModules)
     return order, prefixInsts, payloadOrder, payloadInsts
+
+
+def _orderLocalReadsByFirstConsumer(pathInsts, emittedModules):
+    """Order independent local-read atoms by their next MFMA consumer.
+
+    The emitter tags each instruction in an atomic read group with a rank
+    derived from the configured partition traversal. Sort complete groups by
+    that deadline. If two operands feed the same MFMA, issue the shorter group
+    first (for example, one scale read before a two-instruction data read).
+    Non-read payload such as LDS pointer updates remains after the read cohort
+    in its original order.
+
+    Return None when semantic metadata is unavailable, preserving unrelated
+    schedules byte-for-byte.
+    """
+    reads = []
+    nonReads = []
+    for original_index, item in enumerate(pathInsts):
+        mid, inst = item
+        if not _isDsRead(inst):
+            nonReads.append(item)
+            continue
+        instruction_index = next(
+            (index for index, candidate
+             in enumerate(emittedModules[mid].instructions)
+             if candidate is inst),
+            -1,
+        )
+        metadata = emittedModules[mid].instructionMetadata
+        if instruction_index < 0 or instruction_index >= len(metadata):
+            return None
+        rank, span = metadata[instruction_index]
+        rank = rank if rank is not None else float("inf")
+        reads.append((rank, span, original_index, item))
+
+    if not reads:
+        return None
+    reads.sort(key=lambda entry: entry[:3])
+    return [item for _, _, _, item in reads] + nonReads
+
+
+def _splitAfterFirstConsumerCohort(pathInsts, emittedModules):
+    """Split after all consecutive LR groups sharing the earliest deadline.
+
+    ``pathInsts`` may begin with synchronization and address setup. Those
+    instructions stay attached to the leading cohort. Atomic multi-instruction
+    reads share one metadata rank, so the split never bisects a read group.
+    """
+    first_rank = None
+    split = None
+    saw_first_cohort = False
+
+    for index, (mid, inst) in enumerate(pathInsts):
+        if not _isDsRead(inst):
+            continue
+        instruction_index = next(
+            (item_index for item_index, candidate
+             in enumerate(emittedModules[mid].instructions)
+             if candidate is inst),
+            -1,
+        )
+        metadata = emittedModules[mid].instructionMetadata
+        if instruction_index < 0 or instruction_index >= len(metadata):
+            return [], pathInsts
+        rank, _span = metadata[instruction_index]
+        if rank is None:
+            if saw_first_cohort:
+                split = index
+                break
+            continue
+        if first_rank is None:
+            first_rank = rank
+            saw_first_cohort = True
+        elif rank != first_rank:
+            split = index
+            break
+
+    if not saw_first_cohort:
+        return [], pathInsts
+    if split is None:
+        split = len(pathInsts)
+    return pathInsts[:split], pathInsts[split:]
+
+
+def _orderGlobalReadBundlesByFirstConsumer(grPaths, emittedModules):
+    """Order complete GR request bundles by their next MFMA consumer.
+
+    The emitter assigns one metadata rank and span to every instruction in a
+    request atom (address setup, final m0 setup, and DTL load). Only a
+    contiguous GR prefix may move. Any SRD update or other path tail remains
+    after every request, preserving its producer dependencies.
+
+    Return the original flattened order when metadata or topology is
+    incomplete so unrelated schedules remain byte-identical.
+    """
+    original = [item for path in grPaths for item in path]
+    bundles = []
+    tails = []
+    original_index = 0
+    saw_rank = False
+
+    for path in grPaths:
+        module_groups = []
+        for item in path:
+            if not module_groups or module_groups[-1][0] != item[0]:
+                module_groups.append((item[0], [item]))
+            else:
+                module_groups[-1][1].append(item)
+
+        in_tail = False
+        path_tail = []
+        for mid, module_items in module_groups:
+            em = emittedModules[mid]
+            if em.opType != "gr":
+                in_tail = True
+                path_tail.extend(module_items)
+                continue
+            if in_tail:
+                return original
+
+            metadata = em.instructionMetadata
+            if len(metadata) != len(module_items):
+                return original
+            offset = 0
+            while offset < len(module_items):
+                rank, span = metadata[offset]
+                if not isinstance(span, int) or span <= 0:
+                    return original
+                end = offset + span
+                if end > len(module_items):
+                    return original
+                if any(metadata[index] != (rank, span)
+                       for index in range(offset, end)):
+                    return original
+                saw_rank = saw_rank or rank is not None
+                bundles.append((
+                    rank if rank is not None else float("inf"),
+                    original_index,
+                    module_items[offset:end],
+                ))
+                original_index += 1
+                offset = end
+        tails.extend(path_tail)
+
+    if not saw_rank:
+        return original
+    bundles.sort(key=lambda entry: entry[:2])
+    return [
+        item
+        for _rank, _index, bundle in bundles
+        for item in bundle
+    ] + tails
+
+
+def _hasPartitionPrefetchReads(emittedModules):
+    """Whether this cell belongs to partition-directed local-read prefetch."""
+    return any(
+        em.opType == "lr"
+        and any(_isDsRead(inst) for inst in em.instructions)
+        and (
+            getattr(em.source, "targetPartition",
+                    getattr(em.source, "partition", 0))
+            != getattr(em.source, "partition", 0)
+            or getattr(em.source, "mtIteration", 0) > 0
+        )
+        for em in emittedModules
+    )
 
 
 def _splitItemsAfterHalf(pathInsts, predicate):
@@ -704,8 +945,10 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
     return mfmaIdx, regularPaths, preMfmaPaths
 
 
-def instructionSchedule(emittedModules, multiDU: bool = False,
-                      minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT):
+def instructionSchedule(
+        emittedModules, multiDU: bool = False,
+        minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
+        partitionPrefetch: bool = False):
     """Interleave non-MFMA instructions between MFMAs.
 
     Rules (shared):
@@ -737,17 +980,35 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
     mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
     p0Split = None
-    if mfmas and all(
+    isMx8Cycle = bool(mfmas) and all(
             isinstance(inst, MXMFMAInstruction)
-            and inst.getIssueLatency() == 8 for inst in mfmas):
+            and inst.getIssueLatency() == 8 for inst in mfmas)
+    if isMx8Cycle:
         p0Split = _splitPartitionZeroPrefetch(
             preMfmaOrders, emittedModules)
     if p0Split is None:
         _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
+    partitionPrefetchPolicy = (
+        isMx8Cycle
+        and not multiDU
+        and (partitionPrefetch
+             or _hasPartitionPrefetchReads(emittedModules))
+    )
 
-    slotsPerInterval = 4 if p0Split is not None else 2
-    placementPathOrders = list(pathOrders)
+    p0Payload = p0Split[3] if p0Split is not None else None
+    p0PayloadReordered = False
     if p0Split is not None:
+        reordered = _orderLocalReadsByFirstConsumer(
+            p0Payload, emittedModules)
+        if reordered is not None:
+            p0Payload = reordered
+            p0PayloadReordered = True
+
+    slotsPerInterval = (
+        4 if partitionPrefetchPolicy or p0Split is not None else 2
+    )
+    placementPathOrders = list(pathOrders)
+    if p0Split is not None and not p0PayloadReordered:
         placementPathOrders.append(p0Split[2])
 
     def _emitPreMfma(result):
@@ -767,7 +1028,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         for m in mfmas:
             result.add(m)
         if p0Split is not None:
-            for _, inst in p0Split[3]:
+            for _, inst in p0Payload:
                 result.add(inst)
         for order in pathOrders:
             for mid in order:
@@ -776,13 +1037,28 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         return result
 
     paths = _classifyPaths(pathOrders, emittedModules)
+    phasePathInsts = []
+    canUseThreePhase = partitionPrefetchPolicy
+    for order, _hasWaitGR in paths:
+        pathInsts = _flattenPath(order, emittedModules)
+        hasLR = any(_isDsRead(inst) for _, inst in pathInsts)
+        hasGR = any(_isBufferLoad(inst) for _, inst in pathInsts)
+        if hasLR and hasGR:
+            canUseThreePhase = False
+        phasePathInsts.append((order, pathInsts, hasLR, hasGR))
+    if canUseThreePhase:
+        # The phase scheduler below preserves dependencies explicitly.
+        placementPathOrders = []
+
     rules = _SchedulingRules(
         totalSlots=(len(mfmas) - 1) * slotsPerInterval,
         minGapDsReadToWait=minGapDsReadToWait)
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
-                       rules.minGapDsReadToWait, rules.noM0WithBufferLoad]
+                       rules.minGapDsReadToWait]
+    if not (partitionPrefetchPolicy or p0Split is not None):
+        base_validators.append(rules.noM0WithBufferLoad)
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
-    if p0Split is not None:
+    if partitionPrefetchPolicy or p0Split is not None:
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
@@ -831,13 +1107,79 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
             if multiDU and hasWaitGR:
                 rules.setPostWaitGrDsReadFence(placer)
 
-    if p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
+    if canUseThreePhase:
+        leading = []
+        trailing = []
+        grPaths = []
+        otherPaths = []
+
+        for _order, pathInsts, hasLR, hasGR in phasePathInsts:
+            if hasLR:
+                first, rest = _splitAfterFirstConsumerCohort(
+                    pathInsts, emittedModules)
+                leading.extend(first)
+                trailing.extend(rest)
+            elif hasGR:
+                grPaths.append(pathInsts)
+            else:
+                otherPaths.append(pathInsts)
+
+        orderedGrItems = _orderGlobalReadBundlesByFirstConsumer(
+            grPaths, emittedModules)
+
+        if p0Split is not None:
+            first, rest = _splitAfterFirstConsumerCohort(
+                p0Payload, emittedModules)
+            leading.extend(first)
+            trailing.extend(rest)
+
+        allPhaseItems = (
+            leading
+            + orderedGrItems
+            + trailing
+            + [item for path in otherPaths for item in path]
+        )
+        numDsReads = sum(
+            _isDsRead(inst) for _, inst in allPhaseItems)
+        numBufferLoads = sum(
+            _isBufferLoad(inst) for _, inst in allPhaseItems)
+        # Right-align non-p0 work so synchronization remains hidden behind
+        # independent MFMAs. Reserve holes for DS issue-pair restrictions and
+        # m0/load pairing; p0's synchronization remains before MFMA0.
+        reserveSlots = (numDsReads + 1) // 2 + numBufferLoads
+        phaseLimit = 0 if p0Split is not None else max(
+            0, placer.totalSlots - len(allPhaseItems) - reserveSlots)
+
+        def _placePhase(pathInsts, atomicDtl=False):
+            nonlocal phaseLimit
+            if not pathInsts:
+                return
+            rules.resetPath()
+            placer.placePath(
+                pathInsts, startLimit=phaseLimit, atomicDtl=atomicDtl)
+            phaseLimit = _nextPlacementSlot(placer)
+
+        if leading:
+            _placePhase(leading)
+            _placePhase(orderedGrItems, atomicDtl=True)
+            _placePhase(trailing)
+            for pathInsts in otherPaths:
+                _placePhase(pathInsts)
+        else:
+            # No immediate consumer can use an LR prefix. Keep independent
+            # work first and right-align the VMEM cohort near the partition
+            # tail, as in the CMS schedule.
+            _placePhase(trailing)
+            for pathInsts in otherPaths:
+                _placePhase(pathInsts)
+            _placePhase(orderedGrItems, atomicDtl=True)
+    elif p0Split is not None and all(not hasWaitGR for _, hasWaitGR in paths):
         regularHalves = [
             _splitItemsAfterHalf(
                 _flattenPath(order, emittedModules), _isBufferLoad)
             for order, _ in paths
         ]
-        p0Halves = _splitItemsAfterHalf(p0Split[3], _isDsRead)
+        p0Halves = _splitItemsAfterHalf(p0Payload, _isDsRead)
 
         def _placePacked(pathInsts):
             if not pathInsts:
@@ -859,7 +1201,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         _placeRegularPaths()
         if p0Split is not None:
             rules.resetPath()
-            placer.placePath(p0Split[3])
+            placer.placePath(p0Payload)
 
     scheduled = Module()
     _emitPreMfma(scheduled)
@@ -883,7 +1225,8 @@ def buildLoopScheduleContext(
         *,
         label: str,
         multiDU: bool = False,
-        minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT
+        minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
+        partitionPrefetch: bool = False
 ) -> LoopScheduleContext:
     """Build a loop-wide timeline from the geometry that codegen emitted.
 
@@ -917,6 +1260,7 @@ def buildLoopScheduleContext(
         totalMfmaCount=mfmaOrdinal,
         multiDU=multiDU,
         minGapDsReadToWait=minGapDsReadToWait,
+        partitionPrefetch=partitionPrefetch,
     )
 
 
@@ -926,6 +1270,7 @@ def instructionScheduleLoop(
         label: str,
         multiDU: bool = False,
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
+        partitionPrefetch: bool = False,
         policy: Optional[LoopSchedulePolicy] = None
 ) -> Module:
     """Schedule one complete emitted loop with a safe partition-local fallback.
@@ -939,6 +1284,7 @@ def instructionScheduleLoop(
         label=label,
         multiDU=multiDU,
         minGapDsReadToWait=minGapDsReadToWait,
+        partitionPrefetch=partitionPrefetch,
     )
     if policy is not None:
         scheduled = policy(context)
@@ -954,7 +1300,8 @@ def instructionScheduleLoop(
             result.add(instructionSchedule(
                 emittedModules,
                 multiDU=context.multiDU,
-                minGapDsReadToWait=context.minGapDsReadToWait))
+                minGapDsReadToWait=context.minGapDsReadToWait,
+                partitionPrefetch=context.partitionPrefetch))
         else:
             for em in emittedModules:
                 for inst in em.instructions:

@@ -762,6 +762,9 @@ class EmittedModule:
     """
     moduleId: int = -1
     instructions: list = field(default_factory=list)
+    # Optional per-instruction scheduler metadata populated by the concrete
+    # emitter. Entries stay aligned with ``instructions``.
+    instructionMetadata: list = field(default_factory=list)
     before: Optional[int] = None   # moduleId that must complete before this module
     source: Optional[Emittable] = None
 
@@ -3729,7 +3732,8 @@ class LogicalScheduler:
                 emitted_3d,
                 label=label,
                 multiDU=self._is_multi_du(),
-                minGapDsReadToWait=minGapDsReadToWait))
+                minGapDsReadToWait=minGapDsReadToWait,
+                partitionPrefetch=self.config.prefetchNextPartition))
         else:
             for pi, partition_emitted in enumerate(emitted_3d):
                 for k, em_list in enumerate(partition_emitted):
@@ -3740,7 +3744,8 @@ class LogicalScheduler:
                         scheduled = instructionSchedule(
                             em_list,
                             multiDU=self._is_multi_du(),
-                            minGapDsReadToWait=minGapDsReadToWait)
+                            minGapDsReadToWait=minGapDsReadToWait,
+                            partitionPrefetch=self.config.prefetchNextPartition)
                         module.add(scheduled)
                     else:
                         for em in em_list:
