@@ -72,6 +72,10 @@ _ADVANCE_FINAL_PARTITION_FOLLOWERS = True
 _FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 4
 
 
+class _DtlIntervalCapacityError(RuntimeError):
+    """Strict DTL density could not satisfy the emitted dependency windows."""
+
+
 class _SlotPlacer:
     """Generic slot placement engine for interleaving instructions between MFMAs.
 
@@ -360,7 +364,7 @@ class _SlotPlacer:
                         idx += 2
                         continue
                     if self.oneDtlPerInterval:
-                        raise RuntimeError(
+                        raise _DtlIntervalCapacityError(
                             "unable to place one DTL bundle per MFMA interval "
                             f"(path index {idx}, start slot {limit}, "
                             f"total slots {self.totalSlots}, "
@@ -472,6 +476,24 @@ _isVALU = lambda x: isinstance(x, CommonInstruction) \
 # substrings in the instruction comment, which is brittle to comment edits.
 _isWaitGr = lambda x: _isWaitCnt(x) and getattr(x, "isWaitGr", False)
 _isBarrier = lambda x: isinstance(x, SBarrier)
+
+
+def _hasDtlIntervalCapacity(
+        pathOrders, emittedModules, mfmaIntervals: int) -> bool:
+    """Return whether strict one-DTL-per-MFMA placement can fit.
+
+    Count only modules in regular interleaving paths. DTL requests in a
+    pre-MFMA dependency prefix do not consume an MFMA follower interval.
+    """
+    scheduledModuleIndices = {
+        moduleIndex for order in pathOrders for moduleIndex in order
+    }
+    dtlLoads = sum(
+        _isDtlLoad(inst)
+        for moduleIndex in scheduledModuleIndices
+        for inst in emittedModules[moduleIndex].instructions
+    )
+    return dtlLoads <= mfmaIntervals
 
 
 class _SchedulingRules:
@@ -1475,12 +1497,17 @@ def instructionSchedule(
             p0Payload = reordered
             p0PayloadReordered = True
 
+    strictDtlSpacing = (
+        limitDtlBundlesPerMfma
+        and _hasDtlIntervalCapacity(
+            pathOrders, emittedModules, max(0, len(mfmas) - 1))
+    )
     # The strict partition-prefetch policy normally emits two instructions
     # between adjacent MFMAs.  A third placement slot lets the leading LDS
     # cohort issue a second read when necessary, so it completes before the
     # first future-epoch DTL bundle without stacking multiple DTL bundles in
     # one MFMA interval.
-    slotsPerInterval = 3 if limitDtlBundlesPerMfma else 2
+    slotsPerInterval = 3 if strictDtlSpacing else 2
     placementPathOrders = list(pathOrders)
     if p0Split is not None and not p0PayloadReordered:
         placementPathOrders.append(p0Split[2])
@@ -1550,7 +1577,7 @@ def instructionSchedule(
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
     if partitionPrefetchPolicy or p0Split is not None:
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
-        if limitDtlBundlesPerMfma:
+        if strictDtlSpacing:
             base_validators.append(rules.oneDtlLoadPerInterval)
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
@@ -1562,10 +1589,10 @@ def instructionSchedule(
         onPlace=rules.trackPlacement,
         slotsPerInterval=slotsPerInterval,
         oneDtlPerInterval=(
-            limitDtlBundlesPerMfma
+            strictDtlSpacing
             and (partitionPrefetchPolicy or p0Split is not None)),
         maxInstructionsPerInterval=(
-            3 if limitDtlBundlesPerMfma
+            3 if strictDtlSpacing
             and (partitionPrefetchPolicy or p0Split is not None)
             else None))
 
@@ -2025,13 +2052,25 @@ def instructionScheduleLoop(
                     group.mfmaCount,
                 )
                 _setEntryWaitLrCount(emittedModules, safeCount)
-            scheduled = instructionSchedule(
-                emittedModules,
-                multiDU=context.multiDU,
-                minGapDsReadToWait=context.minGapDsReadToWait,
-                partitionPrefetch=context.partitionPrefetch,
-                limitDtlBundlesPerMfma=context.limitDtlBundlesPerMfma,
-                uniformPgrEpoch=context.uniformPgrEpoch)
+            try:
+                scheduled = instructionSchedule(
+                    emittedModules,
+                    multiDU=context.multiDU,
+                    minGapDsReadToWait=context.minGapDsReadToWait,
+                    partitionPrefetch=context.partitionPrefetch,
+                    limitDtlBundlesPerMfma=context.limitDtlBundlesPerMfma,
+                    uniformPgrEpoch=context.uniformPgrEpoch)
+            except _DtlIntervalCapacityError:
+                # Dependency windows can make the simple bundle-count capacity
+                # check optimistic. Retry this generated cell with the prior
+                # legal density policy instead of failing code generation.
+                scheduled = instructionSchedule(
+                    emittedModules,
+                    multiDU=context.multiDU,
+                    minGapDsReadToWait=context.minGapDsReadToWait,
+                    partitionPrefetch=context.partitionPrefetch,
+                    limitDtlBundlesPerMfma=False,
+                    uniformPgrEpoch=context.uniformPgrEpoch)
             if (
                     context.uniformPgrEpoch
                     and context.label.startswith("MAINLOOP")
