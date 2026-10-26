@@ -351,7 +351,10 @@ class InstructionEmitter:
                     dst=vgpr(vdst),
                     src=vgpr(ti.sharedVgprLROffset[0]),
                     ds=DSModifiers(offset=dsOffset),
-                    comment=f"scale{tc}[group{scaleGroupIdx},K={placement.tiles.subIterK_start}]: load 4B from LDS")
+                    comment=(
+                        f"scale{tc}[group{scaleGroupIdx},"
+                        f"K={placement.tiles.subIterK_start}]: "
+                        "load 4B from LDS"))
                 instruction_metadata.extend(
                     self._local_read_group_metadata(
                         [read], placement, tileId))

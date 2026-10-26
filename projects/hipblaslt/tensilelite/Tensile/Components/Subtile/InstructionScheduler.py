@@ -7,73 +7,59 @@ Interleaves non-MFMA instructions between MFMAs using a slot-based placer
 with pluggable scheduling rules.
 """
 
-from dataclasses import dataclass
-from typing import Callable, List, Tuple, Optional
+from dataclasses import dataclass, replace
+from typing import List, Tuple, Optional
 from rocisa.code import Module, TextBlock
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
     LocalReadInstruction, GlobalReadInstruction, CommonInstruction
 
 
 @dataclass(frozen=True)
-class LoopScheduleGroup:
+class LoopScheduleCell:
     """One generated partition/sub-iteration cell in a loop-wide timeline."""
 
     partition: int
     subIterK: int
     emittedModules: Tuple[object, ...]
-    mfmaBegin: int
     mfmaCount: int
-    hasMfmaModule: bool
-
-    @property
-    def mfmaEnd(self) -> int:
-        return self.mfmaBegin + self.mfmaCount
 
 
 @dataclass(frozen=True)
 class LoopScheduleContext:
-    """Geometry-derived view of every scheduling cell in one emitted loop."""
+    """Scheduling inputs shared by every generated cell in one loop."""
 
     label: str
-    groups: Tuple[LoopScheduleGroup, ...]
-    totalMfmaCount: int
+    cells: Tuple[LoopScheduleCell, ...]
     multiDU: bool
     minGapDsReadToWait: int
     partitionPrefetch: bool
     derivePartialLrWaits: bool
     limitDtlBundlesPerMfma: bool
     uniformPgrEpoch: bool
+    uniformPgrCohortSize: Optional[int]
 
 
-LoopSchedulePolicy = Callable[[LoopScheduleContext], Optional[Module]]
+@dataclass(frozen=True)
+class WrapSeamPolicy:
+    """Placement policy for the cyclic final-partition seam.
+
+    The values describe scheduling capacity, not a particular partition
+    number or macrotile.  Legality checks in ``compactWrapSeam`` decide whether
+    a generated geometry can use the preferred placement.
+    """
+
+    streamAdvanceMfmas: int = 3
+    syncAdvanceMfmas: int = 4
+    maxPrecedingDtlLoads: Optional[int] = 5
+    rightAlignPrecedingDtl: bool = True
+    dropRedundantEntryLgkm: bool = True
+
+
+CMS_ANALOGUE_WRAP_SEAM = WrapSeamPolicy()
 
 
 class _DtlIntervalCapacityError(RuntimeError):
     """Strict DTL density could not satisfy the emitted dependency windows."""
-
-
-# Prototype policy: advance the final partition's complete interleaving stream
-# into otherwise-empty intervals at the end of the preceding partition.  Each
-# experiment changes only this distance, while the relocation mechanism and
-# its safety checks remain fixed.
-_FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 3
-# Experiment 33: move the preceding partition's native DTL bundles as late as
-# possible without colliding with the advanced final-partition suffix.
-_RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX = True
-# Experiment 34: retain at most the CMS-sized five-load cohort in the
-# preceding partition.  Once advancing another DTL load would exceed the cap,
-# keep that complete load group and the ordered suffix in the final partition.
-_MAX_PREVIOUS_PARTITION_DTL_LOADS = 5
-# Experiment 35: the final-partition entry LDS drain is redundant when the
-# preceding partition already completed a full drain and issued no younger
-# LGKM-producing instruction.  Keep its former placement as a seam anchor so
-# the retained P2 DTL cohort does not otherwise move.
-_DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
-# Experiment 37 advances the P3 synchronization prefix into the empty P2 tail.
-# The wait/barrier prefix can use the M44 slot freed by Experiment 35, while
-# the normal three-MFMA stream advance keeps every wrap DS read in P3.
-_ADVANCE_FINAL_PARTITION_FOLLOWERS = True
-_FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 4
 
 
 class _SlotPlacer:
@@ -480,7 +466,11 @@ _isBarrier = lambda x: isinstance(x, SBarrier)
 
 def _hasDtlIntervalCapacity(
         pathOrders, emittedModules, mfmaIntervals: int) -> bool:
-    """Return whether strict one-DTL-per-MFMA placement can fit."""
+    """Return whether strict one-DTL-per-MFMA placement can fit.
+
+    Count only modules in regular interleaving paths. DTL requests in a
+    pre-MFMA dependency prefix do not consume an MFMA follower interval.
+    """
     scheduledModuleIndices = {
         moduleIndex for order in pathOrders for moduleIndex in order
     }
@@ -538,10 +528,6 @@ class _SchedulingRules:
 
     def oneDtlLoadPerInterval(self, placer, pos, inst):
         """Keep every DTL request, including an unpaired first request, isolated."""
-        return not _isDtlLoad(inst) or not placer._intervalHasDtlLoad(pos)
-
-    def oneDtlLoadPerInterval(self, placer, pos, inst):
-        """Keep every DTL request, including an unpaired request, isolated."""
         return not _isDtlLoad(inst) or not placer._intervalHasDtlLoad(pos)
 
     def noDsReadOrValuInFirstSlot(self, placer, pos, inst):
@@ -1129,14 +1115,12 @@ def _endsWithDrainedLgkm(schedule) -> bool:
     return drained
 
 
-def advancePartitionInterleave(
-        previousSchedule, finalSchedule, advanceMfmas,
-        rightAlignPreviousDtl=False, maxPreviousDtlLoads=None,
-        dropRedundantFinalLgkm=False, advanceFinalFollowers=True,
-        finalSyncAdvanceMfmas=None):
-    """Move a final partition's interleaving stream earlier by whole MFMAs.
+def compactWrapSeam(
+        precedingSchedule, wrapSchedule,
+        policy: WrapSeamPolicy = CMS_ANALOGUE_WRAP_SEAM):
+    """Compact the cyclic wrap stream into the preceding partition's tail.
 
-    The entry prefix is the interval immediately before the final partition's
+    The entry prefix is the interval immediately before the wrap partition's
     first MFMA.  Treating it as part of the stream preserves the physical order
     of entry wait -> VMEM -> wait/barrier -> LDS reads while moving every item
     by the same number of MFMA intervals.  This is deliberately a narrow,
@@ -1144,28 +1128,25 @@ def advancePartitionInterleave(
     may receive work, no local read may cross the partition boundary, and each
     destination keeps the strict three-follower cap.
 
-    When maxPreviousDtlLoads is set, stop advancing at the first complete
+    ``maxPrecedingDtlLoads`` stops advancement at the first complete
     follower group that would exceed that DTL-load count.  Keep that group and
-    every younger group in the final partition so their dependency order is
+    every younger group in the wrap partition so their dependency order is
     unchanged.
 
-    When dropRedundantFinalLgkm is set, remove an LGKM-only final-partition
+    ``dropRedundantEntryLgkm`` removes an LGKM-only wrap-partition
     entry drain only if the preceding schedule already ends in a proven
     drained state.  Its unfiltered move remains a seam-placement anchor so
     this narrow removal cannot perturb the surrounding DTL schedule.
 
-    When advanceFinalFollowers is False, retain every post-MFMA follower in
-    the final partition.  The entry prefix still provides the seam anchor used
-    by the independent P2 DTL right-alignment policy.
-
-    finalSyncAdvanceMfmas may advance the leading wait/barrier/address-swap
+    ``syncAdvanceMfmas`` may advance the leading wait/barrier/address-swap
     groups farther than the remaining stream.  The first group containing an
-    LDS read or DTL request and every younger group still use advanceMfmas.
+    LDS read or DTL request and every younger group use
+    ``streamAdvanceMfmas``.
 
     Returns True and mutates both Modules when the complete shift is legal.
     Returns False without changing either Module when it is not.
     """
-    if advanceMfmas <= 0:
+    if policy.streamAdvanceMfmas <= 0:
         return False
 
     isMfma = lambda inst: isinstance(
@@ -1185,74 +1166,69 @@ def advancePartitionInterleave(
                 followers[-1].append(inst)
         return prefix, mfmas, followers
 
-    previousPrefix, previousMfmas, previousFollowers = split(
-        previousSchedule)
-    finalPrefix, finalMfmas, finalFollowers = split(finalSchedule)
-    if not previousMfmas or not finalMfmas:
+    precedingPrefix, precedingMfmas, precedingFollowers = split(
+        precedingSchedule)
+    wrapPrefix, wrapMfmas, wrapFollowers = split(wrapSchedule)
+    if not precedingMfmas or not wrapMfmas:
         return False
 
     droppedInstructionIds = set()
-    finalPrefixInstructions = [
-        inst for inst in finalPrefix
+    wrapPrefixInstructions = [
+        inst for inst in wrapPrefix
         if not isinstance(inst, TextBlock)
     ]
     if (
-            dropRedundantFinalLgkm
-            and len(finalPrefixInstructions) == 1
-            and _isLgkmOnlyDrain(finalPrefixInstructions[0])
-            and _endsWithDrainedLgkm(previousSchedule)):
-        droppedInstructionIds.add(id(finalPrefixInstructions[0]))
+            policy.dropRedundantEntryLgkm
+            and len(wrapPrefixInstructions) == 1
+            and _isLgkmOnlyDrain(wrapPrefixInstructions[0])
+            and _endsWithDrainedLgkm(precedingSchedule)):
+        droppedInstructionIds.add(id(wrapPrefixInstructions[0]))
 
-    boundary = len(previousMfmas)
-    prefixTarget = boundary - 1 - advanceMfmas
+    boundary = len(precedingMfmas)
+    prefixTarget = boundary - 1 - policy.streamAdvanceMfmas
     if prefixTarget < 0:
         return False
 
-    previousDtlLoads = sum(
+    precedingDtlLoads = sum(
         _isDtlLoad(inst)
-        for group in previousFollowers
+        for group in precedingFollowers
         for inst in group)
     if (
-            maxPreviousDtlLoads is not None
-            and previousDtlLoads > maxPreviousDtlLoads):
+            policy.maxPrecedingDtlLoads is not None
+            and precedingDtlLoads > policy.maxPrecedingDtlLoads):
         return False
 
     moves = []
-    if finalPrefix:
-        moves.append((prefixTarget, finalPrefix))
-    holdFinalSuffix = False
-    inFinalSyncPrefix = True
-    for index, group in enumerate(finalFollowers):
+    if wrapPrefix:
+        moves.append((prefixTarget, wrapPrefix))
+    holdWrapSuffix = False
+    inWrapSyncPrefix = True
+    for index, group in enumerate(wrapFollowers):
         if group:
             if any(
                     isinstance(inst, LocalReadInstruction) or _isDtlLoad(inst)
                     for inst in group):
-                inFinalSyncPrefix = False
+                inWrapSyncPrefix = False
             groupAdvanceMfmas = (
-                finalSyncAdvanceMfmas
-                if (inFinalSyncPrefix
-                    and finalSyncAdvanceMfmas is not None)
-                else advanceMfmas
+                policy.syncAdvanceMfmas
+                if inWrapSyncPrefix
+                else policy.streamAdvanceMfmas
             )
-            shiftedTarget = (
-                boundary + index - groupAdvanceMfmas
-                if advanceFinalFollowers
-                else boundary + index
-            )
+            shiftedTarget = boundary + index - groupAdvanceMfmas
             groupDtlLoads = sum(_isDtlLoad(inst) for inst in group)
             if (
-                    maxPreviousDtlLoads is not None
-                    and not holdFinalSuffix
+                    policy.maxPrecedingDtlLoads is not None
+                    and not holdWrapSuffix
                     and shiftedTarget < boundary
-                    and previousDtlLoads + groupDtlLoads
-                    > maxPreviousDtlLoads):
-                holdFinalSuffix = True
-            if holdFinalSuffix:
+                    and precedingDtlLoads + groupDtlLoads
+                    > policy.maxPrecedingDtlLoads):
+                holdWrapSuffix = True
+            if holdWrapSuffix:
                 target = boundary + index
             else:
                 target = shiftedTarget
                 if target < boundary:
-                    previousDtlLoads += groupDtlLoads
+                    precedingDtlLoads += groupDtlLoads
             moves.append((target, group))
 
     # This prototype only borrows genuinely empty MFMA intervals from the
@@ -1261,7 +1237,7 @@ def advancePartitionInterleave(
         target for target, group in moves
         if group and target < boundary
     }
-    if any(previousFollowers[target] for target in previousTargets):
+    if any(precedingFollowers[target] for target in previousTargets):
         return False
 
     # Keep LR accounting partition-local.  The tested one-to-three-MFMA
@@ -1273,14 +1249,14 @@ def advancePartitionInterleave(
             for inst in group):
         return False
 
-    if rightAlignPreviousDtl and previousTargets:
-        previousFollowers = _rightAlignDtlBundlesBefore(
-            previousFollowers, min(previousTargets))
-        if previousFollowers is None:
+    if policy.rightAlignPrecedingDtl and previousTargets:
+        precedingFollowers = _rightAlignDtlBundlesBefore(
+            precedingFollowers, min(previousTargets))
+        if precedingFollowers is None:
             return False
 
     combinedFollowers = [
-        list(group) for group in previousFollowers + finalFollowers
+        list(group) for group in precedingFollowers + wrapFollowers
     ]
     for index in range(boundary, len(combinedFollowers)):
         combinedFollowers[index] = []
@@ -1304,13 +1280,13 @@ def advancePartitionInterleave(
             items.extend(group)
         return items
 
-    previousSchedule.setItems(assemble(
-        previousPrefix,
-        previousMfmas,
+    precedingSchedule.setItems(assemble(
+        precedingPrefix,
+        precedingMfmas,
         combinedFollowers[:boundary]))
-    finalSchedule.setItems(assemble(
+    wrapSchedule.setItems(assemble(
         [],
-        finalMfmas,
+        wrapMfmas,
         combinedFollowers[boundary:]))
     return True
 
@@ -1921,16 +1897,11 @@ def buildLoopScheduleContext(
         partitionPrefetch: bool = False,
         derivePartialLrWaits: bool = False,
         limitDtlBundlesPerMfma: bool = False,
-        uniformPgrEpoch: bool = False
+        uniformPgrEpoch: bool = False,
+        uniformPgrCohortSize: Optional[int] = None
 ) -> LoopScheduleContext:
-    """Build a loop-wide timeline from the geometry that codegen emitted.
-
-    Partition and sub-iteration boundaries are retained as diagnostics, while
-    ``mfmaBegin``/``mfmaEnd`` provide stable global ordinals without assuming a
-    partition count or a fixed number of MFMAs per partition.
-    """
-    groups = []
-    mfmaOrdinal = 0
+    """Build geometry-derived scheduling cells without fixed partition counts."""
+    cells = []
     for partition, partitionEmitted in enumerate(emitted3d):
         for subIterK, emittedModules in enumerate(partitionEmitted):
             modules = tuple(emittedModules)
@@ -1939,26 +1910,23 @@ def buildLoopScheduleContext(
                 for em in modules
                 for inst in em.instructions
             )
-            groups.append(LoopScheduleGroup(
+            cells.append(LoopScheduleCell(
                 partition=partition,
                 subIterK=subIterK,
                 emittedModules=modules,
-                mfmaBegin=mfmaOrdinal,
                 mfmaCount=mfmaCount,
-                hasMfmaModule=any(em.opType == "mfma" for em in modules),
             ))
-            mfmaOrdinal += mfmaCount
 
     return LoopScheduleContext(
         label=label,
-        groups=tuple(groups),
-        totalMfmaCount=mfmaOrdinal,
+        cells=tuple(cells),
         multiDU=multiDU,
         minGapDsReadToWait=minGapDsReadToWait,
         partitionPrefetch=partitionPrefetch,
         derivePartialLrWaits=derivePartialLrWaits,
         limitDtlBundlesPerMfma=limitDtlBundlesPerMfma,
         uniformPgrEpoch=uniformPgrEpoch,
+        uniformPgrCohortSize=uniformPgrCohortSize,
     )
 
 
@@ -2009,14 +1977,9 @@ def instructionScheduleLoop(
         derivePartialLrWaits: bool = False,
         limitDtlBundlesPerMfma: bool = False,
         uniformPgrEpoch: bool = False,
-        policy: Optional[LoopSchedulePolicy] = None
+        uniformPgrCohortSize: Optional[int] = None
 ) -> Module:
-    """Schedule one complete emitted loop with a safe partition-local fallback.
-
-    A policy receives the complete geometry-derived context. Returning ``None``
-    delegates every cell to the existing scheduler, preserving the historical
-    output exactly. Returning a module opts into loop-wide placement.
-    """
+    """Schedule one complete emitted loop with a safe cell-local fallback."""
     context = buildLoopScheduleContext(
         emitted3d,
         label=label,
@@ -2026,30 +1989,27 @@ def instructionScheduleLoop(
         derivePartialLrWaits=derivePartialLrWaits,
         limitDtlBundlesPerMfma=limitDtlBundlesPerMfma,
         uniformPgrEpoch=uniformPgrEpoch,
+        uniformPgrCohortSize=uniformPgrCohortSize,
     )
-    if policy is not None:
-        scheduled = policy(context)
-        if scheduled is not None:
-            return scheduled
 
     result = Module()
     previousSchedule = None
     firstCell = None
     finalPartition = max(
-        (group.partition for group in context.groups), default=-1)
+        (cell.partition for cell in context.cells), default=-1)
     finalPartitionGroups = sum(
-        group.partition == finalPartition for group in context.groups)
-    for group in context.groups:
+        cell.partition == finalPartition for cell in context.cells)
+    for cell in context.cells:
         result.addComment0(
-            f"partition={group.partition} subIterK={group.subIterK}")
-        emittedModules = list(group.emittedModules)
-        if emittedModules and group.hasMfmaModule:
+            f"partition={cell.partition} subIterK={cell.subIterK}")
+        emittedModules = list(cell.emittedModules)
+        if emittedModules and cell.mfmaCount:
             if context.derivePartialLrWaits and previousSchedule is not None:
                 previousScheduled, previousModules = previousSchedule
                 safeCount = safeOutstandingLocalReadSuffix(
                     previousScheduled,
                     previousModules,
-                    group.mfmaCount,
+                    cell.mfmaCount,
                 )
                 _setEntryWaitLrCount(emittedModules, safeCount)
             try:
@@ -2061,9 +2021,9 @@ def instructionScheduleLoop(
                     limitDtlBundlesPerMfma=context.limitDtlBundlesPerMfma,
                     uniformPgrEpoch=context.uniformPgrEpoch)
             except _DtlIntervalCapacityError:
-                # Dependency windows can make the bundle-count check
-                # optimistic. Fall back to the prior legal density policy for
-                # this generated cell rather than failing code generation.
+                # Dependency windows can make the simple bundle-count capacity
+                # check optimistic. Retry this generated cell with the prior
+                # legal density policy instead of failing code generation.
                 scheduled = instructionSchedule(
                     emittedModules,
                     multiDU=context.multiDU,
@@ -2075,26 +2035,20 @@ def instructionScheduleLoop(
                     context.uniformPgrEpoch
                     and context.label.startswith("MAINLOOP")
                     and finalPartitionGroups == 1
-                    and group.partition == finalPartition
+                    and cell.partition == finalPartition
                     and previousSchedule is not None):
-                advancePartitionInterleave(
-                    previousSchedule[0],
-                    scheduled,
-                    _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
-                    rightAlignPreviousDtl=(
-                        _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX),
-                    maxPreviousDtlLoads=(
-                        _MAX_PREVIOUS_PARTITION_DTL_LOADS),
-                    dropRedundantFinalLgkm=(
-                        _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT),
-                    advanceFinalFollowers=(
-                        _ADVANCE_FINAL_PARTITION_FOLLOWERS),
-                    finalSyncAdvanceMfmas=(
-                        _FINAL_PARTITION_SYNC_ADVANCE_MFMAS))
+                seamPolicy = CMS_ANALOGUE_WRAP_SEAM
+                if context.uniformPgrCohortSize is not None:
+                    seamPolicy = replace(
+                        seamPolicy,
+                        maxPrecedingDtlLoads=(
+                            context.uniformPgrCohortSize))
+                compactWrapSeam(
+                    previousSchedule[0], scheduled, policy=seamPolicy)
             result.add(scheduled)
             if context.derivePartialLrWaits:
                 if firstCell is None:
-                    firstCell = (emittedModules, group.mfmaCount)
+                    firstCell = (emittedModules, cell.mfmaCount)
             previousSchedule = (scheduled, emittedModules)
         else:
             for em in emittedModules:
