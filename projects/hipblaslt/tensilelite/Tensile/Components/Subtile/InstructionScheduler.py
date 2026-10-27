@@ -459,8 +459,9 @@ class _SlotPlacer:
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT = 4
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250 = 8
 _MAX_LGKMCNT = 15
-# Experiment 09: permit two complete m0/DTL-load bundles in one MFMA
-# follower interval without moving either request across a partition boundary.
+# Experiment 10: permit two complete m0/DTL-load bundles in one MFMA
+# follower interval only in partition 0. All other partitions retain the
+# one-bundle/three-follower policy.
 _PARTITION_PREFETCH_DTL_BUNDLES_PER_INTERVAL = 2
 _PARTITION_PREFETCH_MAX_INSTRUCTIONS_PER_INTERVAL = 4
 
@@ -1502,11 +1503,32 @@ def instructionSchedule(
             p0Payload = reordered
             p0PayloadReordered = True
 
+    emittedPartitions = {
+        source.partition
+        for emitted in emittedModules
+        for source in [emitted.source]
+        if source is not None and hasattr(source, "partition")
+    }
+    currentPartition = (
+        next(iter(emittedPartitions))
+        if len(emittedPartitions) == 1
+        else None
+    )
+    dtlBundlesPerInterval = (
+        _PARTITION_PREFETCH_DTL_BUNDLES_PER_INTERVAL
+        if currentPartition == 0
+        else 1
+    )
+    maxInstructionsPerInterval = (
+        _PARTITION_PREFETCH_MAX_INSTRUCTIONS_PER_INTERVAL
+        if dtlBundlesPerInterval > 1
+        else 3
+    )
     strictDtlSpacing = (
         limitDtlBundlesPerMfma
         and _hasDtlIntervalCapacity(
             pathOrders, emittedModules, max(0, len(mfmas) - 1),
-            _PARTITION_PREFETCH_DTL_BUNDLES_PER_INTERVAL)
+            dtlBundlesPerInterval)
     )
     # The strict partition-prefetch policy normally emits two instructions
     # between adjacent MFMAs.  A third placement slot lets the leading LDS
@@ -1582,8 +1604,7 @@ def instructionSchedule(
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
     if partitionPrefetchPolicy or p0Split is not None:
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
-        if (strictDtlSpacing
-                and _PARTITION_PREFETCH_DTL_BUNDLES_PER_INTERVAL == 1):
+        if strictDtlSpacing and dtlBundlesPerInterval == 1:
             base_validators.append(rules.oneDtlLoadPerInterval)
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
@@ -1597,9 +1618,9 @@ def instructionSchedule(
         oneDtlPerInterval=(
             strictDtlSpacing
             and (partitionPrefetchPolicy or p0Split is not None)
-            and _PARTITION_PREFETCH_DTL_BUNDLES_PER_INTERVAL == 1),
+            and dtlBundlesPerInterval == 1),
         maxInstructionsPerInterval=(
-            _PARTITION_PREFETCH_MAX_INSTRUCTIONS_PER_INTERVAL
+            maxInstructionsPerInterval
             if strictDtlSpacing
             and (partitionPrefetchPolicy or p0Split is not None)
             else None))

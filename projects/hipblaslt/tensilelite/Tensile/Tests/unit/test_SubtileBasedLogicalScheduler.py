@@ -4424,7 +4424,12 @@ class TestInstructionSchedulerWrapPrefetch:
 
         assert mfma_positions[-2] < gr_position < mfma_positions[-1]
 
-    def test_partition_dtl_setup_and_load_share_mfma_interval(self):
+    @pytest.mark.parametrize(
+        "partition,request_count,expected_max_loads",
+        [(0, 5, 2), (2, 2, 1)],
+    )
+    def test_two_dtl_density_is_scoped_to_partition_zero(
+            self, partition, request_count, expected_max_loads):
         import shutil
         from types import SimpleNamespace
         from rocisa import rocIsa
@@ -4452,7 +4457,7 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         dtl = MUBUFModifiers(offen=True, lds=True)
         gr_instructions = []
-        for index in range(5):
+        for index in range(request_count):
             gr_instructions.extend([
                 SAddU32(
                     dst=mgpr(0), src0=sgpr(20), src1=index * 128,
@@ -4467,14 +4472,14 @@ class TestInstructionSchedulerWrapPrefetch:
                 source=SimpleNamespace(kind="mfma")),
             EmittedModule(
                 moduleId=1, instructions=gr_instructions,
-                source=SimpleNamespace(kind="gr")),
+                source=SimpleNamespace(kind="gr", partition=partition)),
         ]
 
         items = list(instructionSchedule(
             modules,
             partitionPrefetch=True,
             limitDtlBundlesPerMfma=True).flatitems())
-        for index in range(5):
+        for index in range(request_count):
             setup_position = next(
                 pos for pos, inst in enumerate(items)
                 if inst.comment == f"m0-{index}")
@@ -4496,7 +4501,7 @@ class TestInstructionSchedulerWrapPrefetch:
             )
             for begin, end in zip(mfma_positions, mfma_positions[1:])
         ]
-        assert max(loads_per_interval) == 2
+        assert max(loads_per_interval) == expected_max_loads
 
     def test_dtl_density_falls_back_when_geometry_has_too_few_intervals(self):
         import shutil
