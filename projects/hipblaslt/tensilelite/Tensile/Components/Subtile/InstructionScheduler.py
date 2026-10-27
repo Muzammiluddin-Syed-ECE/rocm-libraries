@@ -57,6 +57,11 @@ _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 3
 # Experiment 33: move the preceding partition's native DTL bundles as late as
 # possible without colliding with the advanced final-partition suffix.
 _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX = True
+# Trace-guided follow-up: use every compatible interval before that suffix so
+# a dense DTL cohort does not build enough VMEM backpressure to escape MFMA
+# coverage near the partition tail.
+_SPREAD_PREVIOUS_DTL_ACROSS_AVAILABLE_INTERVALS = True
+_PREVIOUS_DTL_TAIL_GAP_MFMAS = 1
 # Experiment 34: retain at most the CMS-sized five-load cohort in the
 # preceding partition.  Once advancing another DTL load would exceed the cap,
 # keep that complete load group and the ordered suffix in the final partition.
@@ -1121,13 +1126,16 @@ def safeOutstandingLocalReadSuffix(
     return min(safe, _MAX_LGKMCNT)
 
 
-def _rightAlignDtlBundlesBefore(followers, endExclusive):
-    """Right-align complete m0/DTL pairs before a reserved MFMA suffix.
+def _rightAlignDtlBundlesBefore(
+        followers, endExclusive, spreadAcrossAvailable=False, tailGap=0):
+    """Place complete m0/DTL pairs before a reserved MFMA suffix.
 
     Operate on the already scheduled physical stream so the policy adapts to
     any partition width.  Non-DTL followers stay in place; complete DTL
     bundles retain request order and are moved only into intervals with room
-    for both physical instructions.
+    for both physical instructions.  By default bundles are right-aligned.
+    ``spreadAcrossAvailable`` instead distributes them uniformly over every
+    compatible interval, preserving order while reducing request density.
 
     Return a rewritten follower list, or None when every bundle cannot be
     moved atomically.
@@ -1155,15 +1163,29 @@ def _rightAlignDtlBundlesBefore(followers, endExclusive):
     def physicalCount(group):
         return sum(not isinstance(inst, TextBlock) for inst in group)
 
+    candidateEnd = max(0, min(endExclusive, len(rewritten)) - tailGap)
     candidates = [
-        index for index in range(min(endExclusive, len(rewritten)))
+        index for index in range(candidateEnd)
         if physicalCount(rewritten[index]) <= 1
         and not any(_isDtlLoad(inst) for inst in rewritten[index])
     ]
     if len(candidates) < len(bundles):
         return None
 
-    for target, bundle in zip(candidates[-len(bundles):], bundles):
+    if spreadAcrossAvailable:
+        if len(bundles) == 1:
+            targets = candidates[:1]
+        else:
+            targets = [
+                candidates[
+                    index * (len(candidates) - 1) // (len(bundles) - 1)
+                ]
+                for index in range(len(bundles))
+            ]
+    else:
+        targets = candidates[-len(bundles):]
+
+    for target, bundle in zip(targets, bundles):
         rewritten[target].extend(bundle)
     return rewritten
 
@@ -1302,7 +1324,9 @@ def rotateLoopEntryLgkmDrains(loopBodies, minMfmaGap):
 
 def advancePartitionInterleave(
         previousSchedule, finalSchedule, advanceMfmas,
-        rightAlignPreviousDtl=False, maxPreviousDtlLoads=None,
+        rightAlignPreviousDtl=False, spreadPreviousDtl=False,
+        previousDtlTailGap=0,
+        maxPreviousDtlLoads=None,
         dropRedundantFinalLgkm=False, advanceFinalFollowers=True,
         finalSyncAdvanceMfmas=None):
     """Move a final partition's interleaving stream earlier by whole MFMAs.
@@ -1319,6 +1343,11 @@ def advancePartitionInterleave(
     follower group that would exceed that DTL-load count.  Keep that group and
     every younger group in the final partition so their dependency order is
     unchanged.
+
+    spreadPreviousDtl changes the preceding-partition DTL rewrite from
+    right-alignment to uniform distribution over compatible intervals.
+    previousDtlTailGap leaves whole MFMA intervals empty between the last
+    eligible DTL destination and the advanced suffix.
 
     When dropRedundantFinalLgkm is set, remove an LGKM-only final-partition
     entry drain only if the preceding schedule already ends in a proven
@@ -1446,7 +1475,10 @@ def advancePartitionInterleave(
 
     if rightAlignPreviousDtl and previousTargets:
         previousFollowers = _rightAlignDtlBundlesBefore(
-            previousFollowers, min(previousTargets))
+            previousFollowers,
+            min(previousTargets),
+            spreadAcrossAvailable=spreadPreviousDtl,
+            tailGap=previousDtlTailGap)
         if previousFollowers is None:
             return False
 
@@ -2273,6 +2305,10 @@ def instructionScheduleLoop(
                     _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
                     rightAlignPreviousDtl=(
                         _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX),
+                    spreadPreviousDtl=(
+                        _SPREAD_PREVIOUS_DTL_ACROSS_AVAILABLE_INTERVALS),
+                    previousDtlTailGap=(
+                        _PREVIOUS_DTL_TAIL_GAP_MFMAS),
                     maxPreviousDtlLoads=(
                         _MAX_PREVIOUS_PARTITION_DTL_LOADS),
                     dropRedundantFinalLgkm=(
