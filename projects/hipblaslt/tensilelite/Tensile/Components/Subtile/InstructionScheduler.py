@@ -75,7 +75,7 @@ _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
 # cohort to age the P3 VMEM frontier one more MFMA.  The normal three-MFMA
 # stream advance still keeps every wrap DS read in P3.
 _ADVANCE_FINAL_PARTITION_FOLLOWERS = True
-_FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 6
+_FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 5
 
 
 class _DtlIntervalCapacityError(RuntimeError):
