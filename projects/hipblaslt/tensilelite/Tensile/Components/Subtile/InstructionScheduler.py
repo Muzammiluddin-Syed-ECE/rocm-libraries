@@ -1827,24 +1827,35 @@ def instructionSchedule(
 
                     _placePhase(preWaitTail)
                     trailing = postWaitTail
-                _placePhase(orderedGrItems, atomicDtl=True)
                 if overwriteReads and trailing:
-                    # The five-request p0 cohort leaves one physical follower
-                    # slot in most MFMA intervals.  Reuse those holes for the
-                    # independent LR tail instead of stacking it after the
-                    # penultimate MFMA.  Dependencies still prevent any item
-                    # from crossing its producer; this only relaxes the
-                    # artificial phase frontier.
-                    grSlots = [
-                        pos
-                        for pos, slot in enumerate(placer._placed)
-                        if any(_isBufferLoad(inst) for _, inst in slot)
-                    ]
-                    _placePhase(
-                        trailing,
-                        startOverride=min(grSlots) if grSlots else None,
-                        overflowToTail=True)
+                    # This interval range still has current-epoch LDS reads to
+                    # issue. Preserve the original one-bundle/three-follower
+                    # policy here so each DTL bundle leaves physical capacity
+                    # for a trailing read. Other ranges with no pending reads
+                    # retain the experiment's two-bundle/four-follower policy.
+                    oldOneDtlPerInterval = placer.oneDtlPerInterval
+                    oldMaxInstructions = placer.maxInstructionsPerInterval
+                    placer.oneDtlPerInterval = True
+                    placer.maxInstructionsPerInterval = 3
+                    try:
+                        _placePhase(orderedGrItems, atomicDtl=True)
+                        grSlots = [
+                            pos
+                            for pos, slot in enumerate(placer._placed)
+                            if any(
+                                _isBufferLoad(inst)
+                                for _, inst in slot)
+                        ]
+                        _placePhase(
+                            trailing,
+                            startOverride=(
+                                min(grSlots) if grSlots else None),
+                            overflowToTail=True)
+                    finally:
+                        placer.oneDtlPerInterval = oldOneDtlPerInterval
+                        placer.maxInstructionsPerInterval = oldMaxInstructions
                 else:
+                    _placePhase(orderedGrItems, atomicDtl=True)
                     _placePhase(trailing)
             for pathInsts in otherPaths:
                 _placePhase(pathInsts)

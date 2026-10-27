@@ -3717,7 +3717,8 @@ class TestInstructionSchedulerWrapPrefetch:
             emitted(1, 'lr', reads(0, 8), before=8, tensor='B',
                     partition=0, targetPartition=1, mtIteration=0),
             emitted(2, 'lr', reads(8, 12), before=1, tensor='SA',
-                    partition=0, targetPartition=0, mtIteration=0),
+                    partition=0, targetPartition=0, mtIteration=0,
+                    mustPrecedeP0Overwrite=True),
             emitted(3, 'lr', reads(12, 16), before=2, tensor='SB',
                     partition=0, targetPartition=0, mtIteration=0),
             emitted(6, 'wait_lr', [
@@ -3769,29 +3770,21 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # Finish the earliest-consumer LDS cohort before writing the future
-        # LDS epoch. Then issue up to two complete m0/load bundles per MFMA
-        # interval; remaining LDS reads follow.
-        assert next(
-            inst.comment for inst in items[mfma_positions[0] + 1:]
-            if isinstance(inst, DSLoadB128)
-        ) == "ds8"
+        # Finish the overwrite prerequisites before the future-epoch DTL
+        # writes, then preserve one follower slot per DTL interval for the
+        # remaining current-epoch reads.
+        first_gr = next(
+            index for index, inst in enumerate(items)
+            if isinstance(inst, BufferLoadB128)
+        )
+        assert all(
+            next(index for index, inst in enumerate(items)
+                 if inst.comment == f"ds{read_index}") < first_gr
+            for read_index in range(8, 12)
+        )
         expected_reads = [
-            "ds8", "ds14", "ds0", "ds1", "ds2", "ds3", "ds15", "ds4",
-            "ds5", "ds6", "ds7", "ds9", "ds10", "ds12", "ds13", "ds11",
-        ]
-        clustered = [
-            inst.comment for inst in items
-            if getattr(inst, "comment", "").startswith(
-                ("m0-", "gr-", "ds"))
-        ]
-        assert clustered == [
-            *expected_reads[:4],
-            "m0-0", "gr-0",
-            "m0-1", "gr-1",
-            "m0-2", "gr-2",
-            "m0-3", "gr-3",
-            *expected_reads[4:],
+            "ds14", "ds0", "ds1", "ds8", "ds9", "ds10", "ds11", "ds2",
+            "ds3", "ds15", "ds4", "ds5", "ds12", "ds6", "ds7", "ds13",
         ]
         assert [
             inst.comment for inst in items
@@ -3817,8 +3810,13 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         assert sum(count > 0 for count in reads_per_interval) >= 8
         assert max(reads_per_interval) <= 2
-        assert max(global_reads_per_interval) == 2
-        assert max(instructions_per_interval) == 4
+        assert max(global_reads_per_interval) == 1
+        assert max(instructions_per_interval) <= 3
+        assert all(
+            reads_per_interval[index] > 0
+            for index, count in enumerate(global_reads_per_interval)
+            if count > 0
+        )
         assert next(
             i for i, inst in reversed(list(enumerate(items)))
             if isinstance(inst, DSLoadB128)
@@ -4454,7 +4452,7 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         dtl = MUBUFModifiers(offen=True, lds=True)
         gr_instructions = []
-        for index in range(2):
+        for index in range(5):
             gr_instructions.extend([
                 SAddU32(
                     dst=mgpr(0), src0=sgpr(20), src1=index * 128,
@@ -4473,8 +4471,10 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
 
         items = list(instructionSchedule(
-            modules, partitionPrefetch=True).flatitems())
-        for index in range(2):
+            modules,
+            partitionPrefetch=True,
+            limitDtlBundlesPerMfma=True).flatitems())
+        for index in range(5):
             setup_position = next(
                 pos for pos, inst in enumerate(items)
                 if inst.comment == f"m0-{index}")
@@ -4485,6 +4485,18 @@ class TestInstructionSchedulerWrapPrefetch:
             assert not any(
                 isinstance(inst, MXMFMAInstruction)
                 for inst in items[setup_position + 1:load_position])
+        mfma_positions = [
+            pos for pos, inst in enumerate(items)
+            if isinstance(inst, MXMFMAInstruction)
+        ]
+        loads_per_interval = [
+            sum(
+                isinstance(inst, BufferLoadB128)
+                for inst in items[begin + 1:end]
+            )
+            for begin, end in zip(mfma_positions, mfma_positions[1:])
+        ]
+        assert max(loads_per_interval) == 2
 
     def test_dtl_density_falls_back_when_geometry_has_too_few_intervals(self):
         import shutil
