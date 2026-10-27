@@ -4180,6 +4180,40 @@ class TestInstructionSchedulerWrapPrefetch:
                 drain not in items[:mfma_positions[0]]
                 for drain in drains)
 
+    def test_unrelated_trailing_gr_increment_detaches_from_vmem_path(self):
+        from types import SimpleNamespace
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            _extractIndependentGrIncTails)
+
+        a_request = object()
+        b_increment = [object(), object(), object()]
+        modules = [
+            EmittedModule(
+                moduleId=0,
+                instructions=[a_request],
+                source=SimpleNamespace(kind="gr", tensor="A")),
+            EmittedModule(
+                moduleId=1,
+                instructions=b_increment,
+                source=SimpleNamespace(kind="gr_inc", tensor="B")),
+        ]
+        path = [
+            (0, a_request),
+            *((1, instruction) for instruction in b_increment),
+        ]
+
+        early, retained = _extractIndependentGrIncTails(
+            [path], modules)
+
+        assert early == path[1:]
+        assert retained == [[path[0]]]
+
+        modules[1].source.tensor = "A"
+        early, retained = _extractIndependentGrIncTails(
+            [path], modules)
+        assert early == []
+        assert retained == [path]
+
     def test_final_partition_advance_caps_previous_dtl_loads(self):
         from rocisa.code import Module
         from rocisa.container import mgpr, sgpr, vgpr

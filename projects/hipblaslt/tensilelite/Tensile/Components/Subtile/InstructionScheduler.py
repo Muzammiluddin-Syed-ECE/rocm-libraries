@@ -963,6 +963,55 @@ def _orderGlobalReadBundlesByFirstConsumer(grPaths, emittedModules):
     ] + tails
 
 
+def _extractIndependentGrIncTails(grPaths, emittedModules):
+    """Detach pointer increments for tensors with no request in this cell.
+
+    The dependency graph serializes all tensor transitions into one path.  A
+    trailing GR increment for tensor B can consequently follow an unrelated A
+    request stream even when no B request in the cell consumes the old SRD.
+    Such a final module is independent filler: it may issue in earlier empty
+    scalar slots after the cell begins, while still following every request
+    from the preceding cell.
+
+    Only complete trailing modules are detached, and only when their tensor
+    has no GR module anywhere in the emitted cell.  Every other path is
+    returned byte-for-byte.
+    """
+    requestTensors = {
+        getattr(em.source, "tensor", None)
+        for em in emittedModules
+        if em.opType == "gr"
+    }
+    early = []
+    retained = []
+    for path in grPaths:
+        if not path:
+            retained.append(path)
+            continue
+        tailMid = path[-1][0]
+        tail = emittedModules[tailMid]
+        tensor = getattr(tail.source, "tensor", None)
+        if (
+                tail.opType == "gr_inc"
+                and tensor is not None
+                and tensor not in requestTensors
+                and all(mid == tailMid for mid, _inst in path[
+                    next(
+                        index for index, item in enumerate(path)
+                        if item[0] == tailMid
+                    ):
+                ])):
+            split = next(
+                index for index, item in enumerate(path)
+                if item[0] == tailMid
+            )
+            retained.append(path[:split])
+            early.extend(path[split:])
+        else:
+            retained.append(path)
+    return early, retained
+
+
 def _hasPartitionPrefetchReads(emittedModules):
     """Whether this cell belongs to partition-directed local-read prefetch."""
     return any(
@@ -1747,6 +1796,10 @@ def instructionSchedule(
             else:
                 otherPaths.append(pathInsts)
 
+        earlyGrIncItems = []
+        if p0Split is not None and not uniformEpochFrontier:
+            earlyGrIncItems, grPaths = _extractIndependentGrIncTails(
+                grPaths, emittedModules)
         orderedGrItems = _orderGlobalReadBundlesByFirstConsumer(
             grPaths, emittedModules)
 
@@ -1781,6 +1834,7 @@ def instructionSchedule(
         allPhaseItems = (
             p0Sync
             + leading
+            + earlyGrIncItems
             + orderedGrItems
             + trailing
             + [item for path in otherPaths for item in path]
@@ -1850,6 +1904,10 @@ def instructionSchedule(
                         denseToFit=True)
             else:
                 _placePhase(leading, mfmaBetweenWaitAndBarrier=True)
+                # Fill the scalar-leading holes left by p0's DS-read cohorts
+                # before VMEM can stall the wave.  The extracted increment
+                # belongs to a tensor with no request in this cell.
+                _placePhase(earlyGrIncItems, startOverride=0)
                 if overwriteReads and trailing and orderedGrItems:
                     # Fill the MFMA intervals needed to age the prerequisite
                     # read with unrelated, younger LDS reads.  The overwrite
