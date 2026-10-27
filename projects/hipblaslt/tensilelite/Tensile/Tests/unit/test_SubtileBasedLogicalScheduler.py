@@ -4847,6 +4847,94 @@ class TestInstructionSchedulerWrapPrefetch:
             isinstance(inst, MXMFMAInstruction)
             for inst in items[setup_position + 1:load_position])
 
+    def test_mixed_lr_gr_path_keeps_each_dtl_bundle_atomic(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import (
+            DSModifiers, MUBUFModifiers, accvgpr, mgpr, sgpr, vgpr)
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, DSLoadB128, MXMFMAInstruction, SAddU32,
+            SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8, accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1], acc=accvgpr(0, 4),
+                a=vgpr(0, 8), b=vgpr(8, 8), acc2=accvgpr(0, 4),
+                mxsa=vgpr(16), mxsb=vgpr(17), block=32,
+                comment=f"mfma{index}")
+            for index in range(12)
+        ]
+        reads = [
+            DSLoadB128(
+                dst=vgpr(24, 4), src=vgpr(1),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"ds{index}")
+            for index in range(2)
+        ]
+        setups = []
+        loads = []
+        requests = []
+        for index in range(3):
+            setup = SAddU32(
+                dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                comment=f"dtl-m0-{index}")
+            load = BufferLoadB128(
+                dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4), soffset=0,
+                mubuf=MUBUFModifiers(offen=True, lds=True),
+                comment=f"dtl-load-{index}")
+            setups.append(setup)
+            loads.append(load)
+            requests.extend([setup, load])
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1, instructions=reads,
+                source=SimpleNamespace(kind="lr")),
+            EmittedModule(
+                moduleId=2,
+                instructions=[SWaitCnt(dscnt=0, comment="wait-lr")],
+                before=1, source=SimpleNamespace(kind="wait_lr")),
+            EmittedModule(
+                moduleId=3,
+                instructions=[SBarrier(comment="barrier")],
+                before=2, source=SimpleNamespace(kind="sync")),
+            EmittedModule(
+                moduleId=4, instructions=requests, before=3,
+                source=SimpleNamespace(kind="gr")),
+        ]
+
+        items = list(instructionSchedule(
+            modules,
+            partitionPrefetch=True,
+            limitDtlBundlesPerMfma=True,
+        ).flatitems())
+
+        def preceding_mfma(inst):
+            position = items.index(inst)
+            return sum(
+                isinstance(item, MXMFMAInstruction)
+                for item in items[:position]
+            ) - 1
+
+        setup_mfmas = [preceding_mfma(inst) for inst in setups]
+        load_mfmas = [preceding_mfma(inst) for inst in loads]
+        assert setup_mfmas == load_mfmas
+        assert load_mfmas == list(
+            range(load_mfmas[0], load_mfmas[0] + len(loads)))
+        assert preceding_mfma(modules[3].instructions[0]) < load_mfmas[0]
+
     def test_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
         from rocisa import rocIsa
