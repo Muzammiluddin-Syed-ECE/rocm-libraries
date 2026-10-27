@@ -4126,6 +4126,60 @@ class TestInstructionSchedulerWrapPrefetch:
         assert preceding_mfma["lr-swap-standin"] == "p6"
         assert preceding_mfma["wrap-read"] == "f0"
 
+    def test_cyclic_entry_lgkm_drains_move_after_predecessor_reads(self):
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import DSLoadB128, MFMAInstruction, SWaitCnt
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            rotateLoopEntryLgkmDrains)
+
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        bodies = []
+        drains = []
+        for body_index in range(2):
+            body = Module()
+            drain = SWaitCnt(
+                dscnt=0, comment=f"entry-drain-{body_index}")
+            drains.append(drain)
+            body.add(drain)
+            for mfma_index in range(6):
+                body.add(mfma(f"c{body_index}-m{mfma_index}"))
+                if mfma_index == 0:
+                    body.add(DSLoadB128(
+                        dst=vgpr(8, 4),
+                        src=vgpr(1),
+                        ds=DSModifiers(offset=body_index * 16),
+                        comment=f"read-{body_index}"))
+            bodies.append(body)
+
+        startup = rotateLoopEntryLgkmDrains(
+            bodies, minMfmaGap=2)
+
+        assert isinstance(startup, SWaitCnt)
+        assert startup is not drains[0]
+        assert startup.comment == "Wait for preloop LR before first mainloop"
+
+        for body_index, body in enumerate(bodies):
+            items = list(body.flatitems())
+            mfma_positions = [
+                index for index, inst in enumerate(items)
+                if isinstance(inst, MFMAInstruction)
+            ]
+            moved = drains[(body_index + 1) % len(bodies)]
+            moved_position = items.index(moved)
+            assert mfma_positions[2] < moved_position < mfma_positions[3]
+            assert all(
+                drain not in items[:mfma_positions[0]]
+                for drain in drains)
+
     def test_final_partition_advance_caps_previous_dtl_loads(self):
         from rocisa.code import Module
         from rocisa.container import mgpr, sgpr, vgpr

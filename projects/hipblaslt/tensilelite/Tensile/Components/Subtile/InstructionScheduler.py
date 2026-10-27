@@ -7,6 +7,7 @@ Interleaves non-MFMA instructions between MFMAs using a slot-based placer
 with pluggable scheduling rules.
 """
 
+import copy
 from dataclasses import dataclass
 from typing import Callable, List, Tuple, Optional
 from rocisa.code import Module, TextBlock
@@ -1127,6 +1128,102 @@ def _endsWithDrainedLgkm(schedule) -> bool:
         elif _isLgkmProducer(inst):
             drained = False
     return drained
+
+
+def rotateLoopEntryLgkmDrains(loopBodies, minMfmaGap):
+    """Hide cyclic entry drains in the preceding loop copy.
+
+    Partition-prefetch bodies consume LDS reads issued near the end of the
+    preceding C copy.  A full LGKM drain at the next copy's entry is therefore
+    movable into an empty MFMA follower interval of that predecessor once:
+
+      * every LGKM producer in the predecessor has issued;
+      * at least ``minMfmaGap`` MFMAs separate the final producer and wait; and
+      * a later MFMA remains to cover the wait latency.
+
+    Rotate each body's unique pre-MFMA full drain to its cyclic predecessor and
+    return a copy of C0's drain for the one-time preloop-to-C0 transition.
+    Return ``None`` without mutating any body when the proof cannot be made.
+    """
+    if not loopBodies or minMfmaGap < 0:
+        return None
+
+    isMfma = lambda inst: isinstance(
+        inst, (MFMAInstruction, MXMFMAInstruction))
+    originalItems = [list(body.flatitems()) for body in loopBodies]
+    entryDrains = []
+    rewrittenItems = []
+
+    for items in originalItems:
+        firstMfma = next(
+            (index for index, inst in enumerate(items) if isMfma(inst)),
+            None)
+        if firstMfma is None:
+            return None
+        candidates = [
+            (index, inst)
+            for index, inst in enumerate(items[:firstMfma])
+            if _isLgkmOnlyDrain(inst)
+        ]
+        if len(candidates) != 1:
+            return None
+        drainIndex, drain = candidates[0]
+        entryDrains.append(drain)
+        rewrittenItems.append(
+            items[:drainIndex] + items[drainIndex + 1:])
+
+    insertions = []
+    for sourceIndex, items in enumerate(rewrittenItems):
+        mfmaPositions = [
+            index for index, inst in enumerate(items) if isMfma(inst)
+        ]
+        if len(mfmaPositions) < 2:
+            return None
+
+        lastProducer = max(
+            (
+                index for index, inst in enumerate(items)
+                if _isLgkmProducer(inst)
+            ),
+            default=-1,
+        )
+        if lastProducer < 0:
+            return None
+        producerMfma = max(
+            (
+                ordinal
+                for ordinal, position in enumerate(mfmaPositions)
+                if position < lastProducer
+            ),
+            default=-1,
+        )
+        if producerMfma < 0:
+            return None
+
+        firstLegalMfma = producerMfma + minMfmaGap
+        destination = None
+        for ordinal in range(firstLegalMfma, len(mfmaPositions) - 1):
+            begin = mfmaPositions[ordinal] + 1
+            end = mfmaPositions[ordinal + 1]
+            if not any(
+                    not isinstance(inst, TextBlock)
+                    for inst in items[begin:end]):
+                destination = end
+                break
+        if destination is None:
+            return None
+
+        nextBody = (sourceIndex + 1) % len(loopBodies)
+        insertions.append((sourceIndex, destination, entryDrains[nextBody]))
+
+    for sourceIndex, destination, drain in insertions:
+        items = rewrittenItems[sourceIndex]
+        items.insert(destination, drain)
+        loopBodies[sourceIndex].setItems(items)
+
+    startupDrain = copy.deepcopy(entryDrains[0])
+    startupDrain.comment = "Wait for preloop LR before first mainloop"
+    return startupDrain
 
 
 def advancePartitionInterleave(
