@@ -4138,6 +4138,64 @@ class TestInstructionSchedulerWrapPrefetch:
         assert preceding_mfma["cohort0"] == "p6"
         assert preceding_mfma["cohort1"] == "p7"
 
+    def test_farther_sync_advance_does_not_reflow_previous_dtl_bundles(self):
+        from rocisa.code import Module
+        from rocisa.container import mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MFMAInstruction, SAddU32, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            advancePartitionInterleave)
+
+        self._schedule()
+
+        def mfma(name):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=name)
+
+        previous = Module()
+        for index in range(8):
+            previous.add(mfma(f"p{index}"))
+            if index < 3:
+                previous.add(SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"m0-{index}"))
+                previous.add(BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"gr-{index}"))
+
+        final = Module()
+        final.add(SWaitCnt(dscnt=0, comment="entry"))
+        for index in range(2):
+            final.add(mfma(f"f{index}"))
+            if index == 0:
+                final.add(SBarrier(comment="sync"))
+
+        assert advancePartitionInterleave(
+            previous,
+            final,
+            2,
+            rightAlignPreviousDtl=True,
+            spreadPreviousDtl=True,
+            previousDtlTailGap=1,
+            finalSyncAdvanceMfmas=4)
+
+        preceding_mfma = {}
+        current_mfma = None
+        for inst in [*previous.flatitems(), *final.flatitems()]:
+            if isinstance(inst, MFMAInstruction):
+                current_mfma = inst.comment
+            else:
+                preceding_mfma[inst.comment] = current_mfma
+
+        assert [
+            preceding_mfma[f"gr-{index}"] for index in range(3)
+        ] == ["p0", "p1", "p3"]
+        assert preceding_mfma["sync"] == "p4"
+        assert preceding_mfma["entry"] == "p5"
+
     def test_final_sync_prefix_advances_farther_without_crossing_wrap_reads(
             self):
         from rocisa.code import Module
@@ -4181,7 +4239,7 @@ class TestInstructionSchedulerWrapPrefetch:
             final,
             3,
             dropRedundantFinalLgkm=True,
-            finalSyncAdvanceMfmas=4)
+            finalSyncAdvanceMfmas=5)
 
         preceding_mfma = {}
         current_mfma = None
@@ -4192,9 +4250,9 @@ class TestInstructionSchedulerWrapPrefetch:
                 preceding_mfma[inst.comment] = current_mfma
 
         assert "redundant-entry" not in preceding_mfma
-        assert preceding_mfma["vmem-frontier"] == "p4"
-        assert preceding_mfma["barrier"] == "p5"
-        assert preceding_mfma["lr-swap-standin"] == "p6"
+        assert preceding_mfma["vmem-frontier"] == "p3"
+        assert preceding_mfma["barrier"] == "p4"
+        assert preceding_mfma["lr-swap-standin"] == "p5"
         assert preceding_mfma["wrap-read"] == "f0"
 
     def test_cyclic_entry_lgkm_drains_move_after_predecessor_reads(self):

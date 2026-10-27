@@ -71,11 +71,11 @@ _MAX_PREVIOUS_PARTITION_DTL_LOADS = 5
 # LGKM-producing instruction.  Keep its former placement as a seam anchor so
 # the retained P2 DTL cohort does not otherwise move.
 _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
-# Experiment 37 advances the P3 synchronization prefix into the empty P2 tail.
-# The wait/barrier prefix can use the M44 slot freed by Experiment 35, while
-# the normal three-MFMA stream advance keeps every wrap DS read in P3.
+# Trace-guided follow-up: use the empty interval left after the spread P2 DTL
+# cohort to age the P3 VMEM frontier one more MFMA.  The normal three-MFMA
+# stream advance still keeps every wrap DS read in P3.
 _ADVANCE_FINAL_PARTITION_FOLLOWERS = True
-_FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 4
+_FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 5
 
 
 class _DtlIntervalCapacityError(RuntimeError):
@@ -1346,8 +1346,9 @@ def advancePartitionInterleave(
 
     spreadPreviousDtl changes the preceding-partition DTL rewrite from
     right-alignment to uniform distribution over compatible intervals.
-    previousDtlTailGap leaves whole MFMA intervals empty between the last
-    eligible DTL destination and the advanced suffix.
+    previousDtlTailGap leaves whole MFMA intervals empty before the normally
+    advanced seam.  A farther sync-only prefix may consume that reservation
+    without causing the preceding partition's DTL cohort to be reflowed.
 
     When dropRedundantFinalLgkm is set, remove an LGKM-only final-partition
     entry drain only if the preceding schedule already ends in a proven
@@ -1476,7 +1477,7 @@ def advancePartitionInterleave(
     if rightAlignPreviousDtl and previousTargets:
         previousFollowers = _rightAlignDtlBundlesBefore(
             previousFollowers,
-            min(previousTargets),
+            prefixTarget,
             spreadAcrossAvailable=spreadPreviousDtl,
             tailGap=previousDtlTailGap)
         if previousFollowers is None:
