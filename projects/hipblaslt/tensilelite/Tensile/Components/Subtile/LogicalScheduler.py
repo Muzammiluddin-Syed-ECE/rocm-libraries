@@ -4290,29 +4290,6 @@ class LogicalScheduler:
         module.add(self._emitLoop(writer, kernel, "PRELOOP",
                                   preloop_emitted, schedule=False))
 
-        loopBodies = [
-            self._emitLoop(
-                writer, kernel, f"MAINLOOP_C{ui}",
-                self._emitted_per_unroll[ui])
-            for ui in range(uf)
-        ]
-        if (
-                self.config.uniformPgrEpoch
-                and self.config.prefetchNextPartition):
-            from .InstructionScheduler import (
-                _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
-                _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250,
-                rotateLoopEntryLgkmDrains,
-            )
-            startupDrain = rotateLoopEntryLgkmDrains(
-                loopBodies,
-                _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250
-                if isGfx1250
-                else _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
-            )
-            if startupDrain is not None:
-                module.add(startupDrain)
-
         # ── Mainloop ──
         module.addComment0("MAINLOOP")
         loopBegin = Label("LoopBeginL", "", alignment=16)
@@ -4337,7 +4314,8 @@ class LogicalScheduler:
                 module.add(_SMovB32(dst=mgpr(0), src=sgpr("LoopCounterL"),
                                     comment="trace: M0 = LoopCounterL"))
                 module.add(_STtraceData(comment="trace: emit M0 to SQTT"))
-            loopBody = loopBodies[ui]
+            loopBody = self._emitLoop(writer, kernel, f"MAINLOOP_C{ui}",
+                                      self._emitted_per_unroll[ui])
             # dec + compare that produce the SCC the loop-control branch reads.
             setupInsts = [
                 SSubU32(dst=sgpr("LoopCounterL"),

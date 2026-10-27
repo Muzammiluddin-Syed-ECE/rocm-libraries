@@ -7,7 +7,6 @@ Interleaves non-MFMA instructions between MFMAs using a slot-based placer
 with pluggable scheduling rules.
 """
 
-import copy
 from dataclasses import dataclass
 from typing import Callable, List, Tuple, Optional
 from rocisa.code import Module, TextBlock
@@ -57,11 +56,6 @@ _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 3
 # Experiment 33: move the preceding partition's native DTL bundles as late as
 # possible without colliding with the advanced final-partition suffix.
 _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX = True
-# Trace-guided follow-up: use every compatible interval before that suffix so
-# a dense DTL cohort does not build enough VMEM backpressure to escape MFMA
-# coverage near the partition tail.
-_SPREAD_PREVIOUS_DTL_ACROSS_AVAILABLE_INTERVALS = True
-_PREVIOUS_DTL_TAIL_GAP_MFMAS = 1
 # Experiment 34: retain at most the CMS-sized five-load cohort in the
 # preceding partition.  Once advancing another DTL load would exceed the cap,
 # keep that complete load group and the ordered suffix in the final partition.
@@ -71,11 +65,11 @@ _MAX_PREVIOUS_PARTITION_DTL_LOADS = 5
 # LGKM-producing instruction.  Keep its former placement as a seam anchor so
 # the retained P2 DTL cohort does not otherwise move.
 _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
-# Trace-guided follow-up: use the empty interval left after the spread P2 DTL
-# cohort to age the P3 VMEM frontier one more MFMA.  The normal three-MFMA
-# stream advance still keeps every wrap DS read in P3.
+# Experiment 37 advances the P3 synchronization prefix into the empty P2 tail.
+# The wait/barrier prefix can use the M44 slot freed by Experiment 35, while
+# the normal three-MFMA stream advance keeps every wrap DS read in P3.
 _ADVANCE_FINAL_PARTITION_FOLLOWERS = True
-_FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 5
+_FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 4
 
 
 class _DtlIntervalCapacityError(RuntimeError):
@@ -550,31 +544,6 @@ class _SchedulingRules:
         """Keep every DTL request, including an unpaired first request, isolated."""
         return not _isDtlLoad(inst) or not placer._intervalHasDtlLoad(pos)
 
-    def noBarrierWithDtlBundle(self, placer, pos, inst):
-        """Keep a synchronization stall out of a DTL request's MFMA interval.
-
-        A barrier may delay every instruction behind it.  Starting a direct-
-        to-LDS request in that same interval can therefore move the VMEM issue
-        beyond the matrix instruction's latency window.  Reserve a fresh MFMA
-        interval for the request setup and load whenever the partition has
-        capacity.
-        """
-        if not (_isBarrier(inst) or _isM0Update(inst) or _isDtlLoad(inst)):
-            return True
-        begin = (pos // placer.slotsPerInterval) * placer.slotsPerInterval
-        end = min(begin + placer.slotsPerInterval, placer.totalSlots)
-        peers = [
-            peer
-            for slot in range(begin, end)
-            for _, peer in placer._placed[slot]
-        ]
-        if _isBarrier(inst):
-            return not any(
-                _isM0Update(peer) or _isDtlLoad(peer)
-                for peer in peers
-            )
-        return not any(_isBarrier(peer) for peer in peers)
-
     def noDsReadOrValuInFirstSlot(self, placer, pos, inst):
         """Reserve each p0 interval's first slot from DS reads and VALU."""
         if pos % placer.slotsPerInterval != 0:
@@ -993,55 +962,6 @@ def _orderGlobalReadBundlesByFirstConsumer(grPaths, emittedModules):
     ] + tails
 
 
-def _extractIndependentGrIncTails(grPaths, emittedModules):
-    """Detach pointer increments for tensors with no request in this cell.
-
-    The dependency graph serializes all tensor transitions into one path.  A
-    trailing GR increment for tensor B can consequently follow an unrelated A
-    request stream even when no B request in the cell consumes the old SRD.
-    Such a final module is independent filler: it may issue in earlier empty
-    scalar slots after the cell begins, while still following every request
-    from the preceding cell.
-
-    Only complete trailing modules are detached, and only when their tensor
-    has no GR module anywhere in the emitted cell.  Every other path is
-    returned byte-for-byte.
-    """
-    requestTensors = {
-        getattr(em.source, "tensor", None)
-        for em in emittedModules
-        if em.opType == "gr"
-    }
-    early = []
-    retained = []
-    for path in grPaths:
-        if not path:
-            retained.append(path)
-            continue
-        tailMid = path[-1][0]
-        tail = emittedModules[tailMid]
-        tensor = getattr(tail.source, "tensor", None)
-        if (
-                tail.opType == "gr_inc"
-                and tensor is not None
-                and tensor not in requestTensors
-                and all(mid == tailMid for mid, _inst in path[
-                    next(
-                        index for index, item in enumerate(path)
-                        if item[0] == tailMid
-                    ):
-                ])):
-            split = next(
-                index for index, item in enumerate(path)
-                if item[0] == tailMid
-            )
-            retained.append(path[:split])
-            early.extend(path[split:])
-        else:
-            retained.append(path)
-    return early, retained
-
-
 def _hasPartitionPrefetchReads(emittedModules):
     """Whether this cell belongs to partition-directed local-read prefetch."""
     return any(
@@ -1126,16 +1046,13 @@ def safeOutstandingLocalReadSuffix(
     return min(safe, _MAX_LGKMCNT)
 
 
-def _rightAlignDtlBundlesBefore(
-        followers, endExclusive, spreadAcrossAvailable=False, tailGap=0):
-    """Place complete m0/DTL pairs before a reserved MFMA suffix.
+def _rightAlignDtlBundlesBefore(followers, endExclusive):
+    """Right-align complete m0/DTL pairs before a reserved MFMA suffix.
 
     Operate on the already scheduled physical stream so the policy adapts to
     any partition width.  Non-DTL followers stay in place; complete DTL
     bundles retain request order and are moved only into intervals with room
-    for both physical instructions.  By default bundles are right-aligned.
-    ``spreadAcrossAvailable`` instead distributes them uniformly over every
-    compatible interval, preserving order while reducing request density.
+    for both physical instructions.
 
     Return a rewritten follower list, or None when every bundle cannot be
     moved atomically.
@@ -1163,29 +1080,15 @@ def _rightAlignDtlBundlesBefore(
     def physicalCount(group):
         return sum(not isinstance(inst, TextBlock) for inst in group)
 
-    candidateEnd = max(0, min(endExclusive, len(rewritten)) - tailGap)
     candidates = [
-        index for index in range(candidateEnd)
+        index for index in range(min(endExclusive, len(rewritten)))
         if physicalCount(rewritten[index]) <= 1
         and not any(_isDtlLoad(inst) for inst in rewritten[index])
     ]
     if len(candidates) < len(bundles):
         return None
 
-    if spreadAcrossAvailable:
-        if len(bundles) == 1:
-            targets = candidates[:1]
-        else:
-            targets = [
-                candidates[
-                    index * (len(candidates) - 1) // (len(bundles) - 1)
-                ]
-                for index in range(len(bundles))
-            ]
-    else:
-        targets = candidates[-len(bundles):]
-
-    for target, bundle in zip(targets, bundles):
+    for target, bundle in zip(candidates[-len(bundles):], bundles):
         rewritten[target].extend(bundle)
     return rewritten
 
@@ -1226,107 +1129,9 @@ def _endsWithDrainedLgkm(schedule) -> bool:
     return drained
 
 
-def rotateLoopEntryLgkmDrains(loopBodies, minMfmaGap):
-    """Hide cyclic entry drains in the preceding loop copy.
-
-    Partition-prefetch bodies consume LDS reads issued near the end of the
-    preceding C copy.  A full LGKM drain at the next copy's entry is therefore
-    movable into an empty MFMA follower interval of that predecessor once:
-
-      * every LGKM producer in the predecessor has issued;
-      * at least ``minMfmaGap`` MFMAs separate the final producer and wait; and
-      * a later MFMA remains to cover the wait latency.
-
-    Rotate each body's unique pre-MFMA full drain to its cyclic predecessor and
-    return a copy of C0's drain for the one-time preloop-to-C0 transition.
-    Return ``None`` without mutating any body when the proof cannot be made.
-    """
-    if not loopBodies or minMfmaGap < 0:
-        return None
-
-    isMfma = lambda inst: isinstance(
-        inst, (MFMAInstruction, MXMFMAInstruction))
-    originalItems = [list(body.flatitems()) for body in loopBodies]
-    entryDrains = []
-    rewrittenItems = []
-
-    for items in originalItems:
-        firstMfma = next(
-            (index for index, inst in enumerate(items) if isMfma(inst)),
-            None)
-        if firstMfma is None:
-            return None
-        candidates = [
-            (index, inst)
-            for index, inst in enumerate(items[:firstMfma])
-            if _isLgkmOnlyDrain(inst)
-        ]
-        if len(candidates) != 1:
-            return None
-        drainIndex, drain = candidates[0]
-        entryDrains.append(drain)
-        rewrittenItems.append(
-            items[:drainIndex] + items[drainIndex + 1:])
-
-    insertions = []
-    for sourceIndex, items in enumerate(rewrittenItems):
-        mfmaPositions = [
-            index for index, inst in enumerate(items) if isMfma(inst)
-        ]
-        if len(mfmaPositions) < 2:
-            return None
-
-        lastProducer = max(
-            (
-                index for index, inst in enumerate(items)
-                if _isLgkmProducer(inst)
-            ),
-            default=-1,
-        )
-        if lastProducer < 0:
-            return None
-        producerMfma = max(
-            (
-                ordinal
-                for ordinal, position in enumerate(mfmaPositions)
-                if position < lastProducer
-            ),
-            default=-1,
-        )
-        if producerMfma < 0:
-            return None
-
-        firstLegalMfma = producerMfma + minMfmaGap
-        destination = None
-        for ordinal in range(firstLegalMfma, len(mfmaPositions) - 1):
-            begin = mfmaPositions[ordinal] + 1
-            end = mfmaPositions[ordinal + 1]
-            if not any(
-                    not isinstance(inst, TextBlock)
-                    for inst in items[begin:end]):
-                destination = end
-                break
-        if destination is None:
-            return None
-
-        nextBody = (sourceIndex + 1) % len(loopBodies)
-        insertions.append((sourceIndex, destination, entryDrains[nextBody]))
-
-    for sourceIndex, destination, drain in insertions:
-        items = rewrittenItems[sourceIndex]
-        items.insert(destination, drain)
-        loopBodies[sourceIndex].setItems(items)
-
-    startupDrain = copy.deepcopy(entryDrains[0])
-    startupDrain.comment = "Wait for preloop LR before first mainloop"
-    return startupDrain
-
-
 def advancePartitionInterleave(
         previousSchedule, finalSchedule, advanceMfmas,
-        rightAlignPreviousDtl=False, spreadPreviousDtl=False,
-        previousDtlTailGap=0,
-        maxPreviousDtlLoads=None,
+        rightAlignPreviousDtl=False, maxPreviousDtlLoads=None,
         dropRedundantFinalLgkm=False, advanceFinalFollowers=True,
         finalSyncAdvanceMfmas=None):
     """Move a final partition's interleaving stream earlier by whole MFMAs.
@@ -1343,12 +1148,6 @@ def advancePartitionInterleave(
     follower group that would exceed that DTL-load count.  Keep that group and
     every younger group in the final partition so their dependency order is
     unchanged.
-
-    spreadPreviousDtl changes the preceding-partition DTL rewrite from
-    right-alignment to uniform distribution over compatible intervals.
-    previousDtlTailGap leaves whole MFMA intervals empty before the normally
-    advanced seam.  A farther sync-only prefix may consume that reservation
-    without causing the preceding partition's DTL cohort to be reflowed.
 
     When dropRedundantFinalLgkm is set, remove an LGKM-only final-partition
     entry drain only if the preceding schedule already ends in a proven
@@ -1476,10 +1275,7 @@ def advancePartitionInterleave(
 
     if rightAlignPreviousDtl and previousTargets:
         previousFollowers = _rightAlignDtlBundlesBefore(
-            previousFollowers,
-            prefixTarget,
-            spreadAcrossAvailable=spreadPreviousDtl,
-            tailGap=previousDtlTailGap)
+            previousFollowers, min(previousTargets))
         if previousFollowers is None:
             return False
 
@@ -1780,7 +1576,6 @@ def instructionSchedule(
         base_validators.append(rules.noM0WithBufferLoad)
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
     if partitionPrefetchPolicy or p0Split is not None:
-        base_validators.append(rules.noBarrierWithDtlBundle)
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
         if strictDtlSpacing:
             base_validators.append(rules.oneDtlLoadPerInterval)
@@ -1834,16 +1629,7 @@ def instructionSchedule(
             rules.resetPath()
             if not hasWaitGR:
                 rules.setupBufLoadSpreading(placer, pathInsts, order)
-            placer.placePath(
-                pathInsts,
-                reverse=reverse,
-                multiDU=multiDU,
-                # A dependency path may contain LR -> wait -> barrier -> GR,
-                # which deliberately bypasses the three-phase scheduler.  Its
-                # DTL setup/load atoms still must remain inside one MFMA
-                # interval; otherwise load spreading can strand each setup in
-                # the preceding interval.
-                atomicDtl=(partitionPrefetchPolicy and not reverse))
+            placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
             if multiDU and hasWaitGR:
                 rules.setPostWaitGrDsReadFence(placer)
 
@@ -1864,10 +1650,6 @@ def instructionSchedule(
             else:
                 otherPaths.append(pathInsts)
 
-        earlyGrIncItems = []
-        if p0Split is not None and not uniformEpochFrontier:
-            earlyGrIncItems, grPaths = _extractIndependentGrIncTails(
-                grPaths, emittedModules)
         orderedGrItems = _orderGlobalReadBundlesByFirstConsumer(
             grPaths, emittedModules)
 
@@ -1902,7 +1684,6 @@ def instructionSchedule(
         allPhaseItems = (
             p0Sync
             + leading
-            + earlyGrIncItems
             + orderedGrItems
             + trailing
             + [item for path in otherPaths for item in path]
@@ -1972,10 +1753,6 @@ def instructionSchedule(
                         denseToFit=True)
             else:
                 _placePhase(leading, mfmaBetweenWaitAndBarrier=True)
-                # Fill the scalar-leading holes left by p0's DS-read cohorts
-                # before VMEM can stall the wave.  The extracted increment
-                # belongs to a tensor with no request in this cell.
-                _placePhase(earlyGrIncItems, startOverride=0)
                 if overwriteReads and trailing and orderedGrItems:
                     # Fill the MFMA intervals needed to age the prerequisite
                     # read with unrelated, younger LDS reads.  The overwrite
@@ -2306,10 +2083,6 @@ def instructionScheduleLoop(
                     _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
                     rightAlignPreviousDtl=(
                         _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX),
-                    spreadPreviousDtl=(
-                        _SPREAD_PREVIOUS_DTL_ACROSS_AVAILABLE_INTERVALS),
-                    previousDtlTailGap=(
-                        _PREVIOUS_DTL_TAIL_GAP_MFMAS),
                     maxPreviousDtlLoads=(
                         _MAX_PREVIOUS_PARTITION_DTL_LOADS),
                     dropRedundantFinalLgkm=(
