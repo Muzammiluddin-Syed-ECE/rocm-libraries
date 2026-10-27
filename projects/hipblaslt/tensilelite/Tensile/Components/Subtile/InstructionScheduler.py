@@ -1605,7 +1605,16 @@ def instructionSchedule(
             rules.resetPath()
             if not hasWaitGR:
                 rules.setupBufLoadSpreading(placer, pathInsts, order)
-            placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
+            placer.placePath(
+                pathInsts,
+                reverse=reverse,
+                multiDU=multiDU,
+                # A dependency path may contain LR -> wait -> barrier -> GR,
+                # which deliberately bypasses the three-phase scheduler.  Its
+                # DTL setup/load atoms still must remain inside one MFMA
+                # interval; otherwise load spreading can strand each setup in
+                # the preceding interval.
+                atomicDtl=(partitionPrefetchPolicy and not reverse))
             if multiDU and hasWaitGR:
                 rules.setPostWaitGrDsReadFence(placer)
 
