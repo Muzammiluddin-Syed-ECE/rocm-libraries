@@ -3815,10 +3815,10 @@ class TestInstructionSchedulerWrapPrefetch:
             end - begin - 1
             for begin, end in zip(mfma_positions, mfma_positions[1:])
         ]
-        assert sum(count > 0 for count in reads_per_interval) >= 8
-        assert max(reads_per_interval) <= 2
+        assert sum(count > 0 for count in reads_per_interval) >= 7
+        assert max(reads_per_interval) == 3
         assert max(global_reads_per_interval) <= 1
-        assert max(instructions_per_interval) <= 3
+        assert max(instructions_per_interval) <= 4
         assert next(
             i for i, inst in reversed(list(enumerate(items)))
             if isinstance(inst, DSLoadB128)

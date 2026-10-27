@@ -70,6 +70,9 @@ _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
 # the normal three-MFMA stream advance keeps every wrap DS read in P3.
 _ADVANCE_FINAL_PARTITION_FOLLOWERS = True
 _FINAL_PARTITION_SYNC_ADVANCE_MFMAS = 4
+# Slot-density experiment: retain the leading slot for scalar/VMEM work, but
+# allow three LDS reads to issue after one MFMA instead of two.
+_PARTITION_PREFETCH_DS_READS_PER_INTERVAL = 3
 
 
 class _DtlIntervalCapacityError(RuntimeError):
@@ -1445,8 +1448,9 @@ def instructionSchedule(
     Rules (shared):
       - MFMA order is preserved.
       - The legacy schedule uses 2 placement slots between adjacent MFMAs.
-      - Strict partition-prefetch scheduling permits a third slot when needed,
-        while capping physical follower instructions at three per MFMA.
+      - Strict partition-prefetch scheduling reserves one leading slot and
+        permits three DS-read slots, while capping physical followers at four
+        per MFMA.
       - DS reads occupy only non-leading placement slots.
       - Before dependencies are respected at module order level.
       - Minimm distance between ds_read and it waitcnt (hardcoded for now)
@@ -1502,12 +1506,11 @@ def instructionSchedule(
         and _hasDtlIntervalCapacity(
             pathOrders, emittedModules, max(0, len(mfmas) - 1))
     )
-    # The strict partition-prefetch policy normally emits two instructions
-    # between adjacent MFMAs.  A third placement slot lets the leading LDS
-    # cohort issue a second read when necessary, so it completes before the
-    # first future-epoch DTL bundle without stacking multiple DTL bundles in
-    # one MFMA interval.
-    slotsPerInterval = 3 if strictDtlSpacing else 2
+    # Keep DS/VALU out of the leading slot while permitting this experiment's
+    # three-read cohort in the remaining slots.
+    slotsPerInterval = (
+        1 + _PARTITION_PREFETCH_DS_READS_PER_INTERVAL
+        if strictDtlSpacing else 2)
     placementPathOrders = list(pathOrders)
     if p0Split is not None and not p0PayloadReordered:
         placementPathOrders.append(p0Split[2])
@@ -1592,7 +1595,8 @@ def instructionSchedule(
             strictDtlSpacing
             and (partitionPrefetchPolicy or p0Split is not None)),
         maxInstructionsPerInterval=(
-            3 if strictDtlSpacing
+            1 + _PARTITION_PREFETCH_DS_READS_PER_INTERVAL
+            if strictDtlSpacing
             and (partitionPrefetchPolicy or p0Split is not None)
             else None))
 
@@ -1695,7 +1699,9 @@ def instructionSchedule(
         # Right-align non-p0 work so synchronization remains hidden behind
         # independent MFMAs. Reserve holes for DS issue-pair restrictions and
         # m0/load pairing; p0's synchronization remains before MFMA0.
-        reserveSlots = (numDsReads + 1) // 2 + numBufferLoads
+        reserveSlots = (
+            numDsReads + _PARTITION_PREFETCH_DS_READS_PER_INTERVAL - 1
+        ) // _PARTITION_PREFETCH_DS_READS_PER_INTERVAL + numBufferLoads
         # Each atomic m0/DTL-load pair consumes one abstract placement slot,
         # not two. Account for that when right-aligning the VMEM tail.
         estimatedSlots = len(allPhaseItems) - numBufferLoads
