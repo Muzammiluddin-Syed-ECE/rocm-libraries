@@ -4239,7 +4239,7 @@ class TestInstructionSchedulerWrapPrefetch:
             final,
             3,
             dropRedundantFinalLgkm=True,
-            finalSyncAdvanceMfmas=5)
+            finalSyncAdvanceMfmas=6)
 
         preceding_mfma = {}
         current_mfma = None
@@ -4250,9 +4250,9 @@ class TestInstructionSchedulerWrapPrefetch:
                 preceding_mfma[inst.comment] = current_mfma
 
         assert "redundant-entry" not in preceding_mfma
-        assert preceding_mfma["vmem-frontier"] == "p3"
-        assert preceding_mfma["barrier"] == "p4"
-        assert preceding_mfma["lr-swap-standin"] == "p5"
+        assert preceding_mfma["vmem-frontier"] == "p2"
+        assert preceding_mfma["barrier"] == "p3"
+        assert preceding_mfma["lr-swap-standin"] == "p4"
         assert preceding_mfma["wrap-read"] == "f0"
 
     def test_cyclic_entry_lgkm_drains_move_after_predecessor_reads(self):
