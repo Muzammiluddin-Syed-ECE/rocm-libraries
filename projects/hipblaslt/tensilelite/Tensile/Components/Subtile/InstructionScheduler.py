@@ -459,6 +459,10 @@ class _SlotPlacer:
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT = 4
 _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250 = 8
 _MAX_LGKMCNT = 15
+# Experiment 09: permit two complete m0/DTL-load bundles in one MFMA
+# follower interval without moving either request across a partition boundary.
+_PARTITION_PREFETCH_DTL_BUNDLES_PER_INTERVAL = 2
+_PARTITION_PREFETCH_MAX_INSTRUCTIONS_PER_INTERVAL = 4
 
 _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
@@ -479,8 +483,9 @@ _isBarrier = lambda x: isinstance(x, SBarrier)
 
 
 def _hasDtlIntervalCapacity(
-        pathOrders, emittedModules, mfmaIntervals: int) -> bool:
-    """Return whether strict one-DTL-per-MFMA placement can fit.
+        pathOrders, emittedModules, mfmaIntervals: int,
+        dtlBundlesPerInterval: int = 1) -> bool:
+    """Return whether the configured DTL-per-MFMA placement can fit.
 
     Count only modules in regular interleaving paths. DTL requests in a
     pre-MFMA dependency prefix do not consume an MFMA follower interval.
@@ -493,7 +498,7 @@ def _hasDtlIntervalCapacity(
         for moduleIndex in scheduledModuleIndices
         for inst in emittedModules[moduleIndex].instructions
     )
-    return dtlLoads <= mfmaIntervals
+    return dtlLoads <= mfmaIntervals * dtlBundlesPerInterval
 
 
 class _SchedulingRules:
@@ -1500,13 +1505,13 @@ def instructionSchedule(
     strictDtlSpacing = (
         limitDtlBundlesPerMfma
         and _hasDtlIntervalCapacity(
-            pathOrders, emittedModules, max(0, len(mfmas) - 1))
+            pathOrders, emittedModules, max(0, len(mfmas) - 1),
+            _PARTITION_PREFETCH_DTL_BUNDLES_PER_INTERVAL)
     )
     # The strict partition-prefetch policy normally emits two instructions
     # between adjacent MFMAs.  A third placement slot lets the leading LDS
-    # cohort issue a second read when necessary, so it completes before the
-    # first future-epoch DTL bundle without stacking multiple DTL bundles in
-    # one MFMA interval.
+    # cohort issue a second read when necessary.  Complete DTL bundles may
+    # share an interval up to the configured density.
     slotsPerInterval = 3 if strictDtlSpacing else 2
     placementPathOrders = list(pathOrders)
     if p0Split is not None and not p0PayloadReordered:
@@ -1577,7 +1582,8 @@ def instructionSchedule(
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
     if partitionPrefetchPolicy or p0Split is not None:
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
-        if strictDtlSpacing:
+        if (strictDtlSpacing
+                and _PARTITION_PREFETCH_DTL_BUNDLES_PER_INTERVAL == 1):
             base_validators.append(rules.oneDtlLoadPerInterval)
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
@@ -1590,9 +1596,11 @@ def instructionSchedule(
         slotsPerInterval=slotsPerInterval,
         oneDtlPerInterval=(
             strictDtlSpacing
-            and (partitionPrefetchPolicy or p0Split is not None)),
+            and (partitionPrefetchPolicy or p0Split is not None)
+            and _PARTITION_PREFETCH_DTL_BUNDLES_PER_INTERVAL == 1),
         maxInstructionsPerInterval=(
-            3 if strictDtlSpacing
+            _PARTITION_PREFETCH_MAX_INSTRUCTIONS_PER_INTERVAL
+            if strictDtlSpacing
             and (partitionPrefetchPolicy or p0Split is not None)
             else None))
 

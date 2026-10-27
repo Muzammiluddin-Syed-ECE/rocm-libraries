@@ -3770,8 +3770,8 @@ class TestInstructionSchedulerWrapPrefetch:
         )
 
         # Finish the earliest-consumer LDS cohort before writing the future
-        # LDS epoch.  Then issue exactly one m0/load bundle per MFMA interval;
-        # remaining LDS reads follow.
+        # LDS epoch. Then issue up to two complete m0/load bundles per MFMA
+        # interval; remaining LDS reads follow.
         assert next(
             inst.comment for inst in items[mfma_positions[0] + 1:]
             if isinstance(inst, DSLoadB128)
@@ -3817,8 +3817,8 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         assert sum(count > 0 for count in reads_per_interval) >= 8
         assert max(reads_per_interval) <= 2
-        assert max(global_reads_per_interval) <= 1
-        assert max(instructions_per_interval) <= 3
+        assert max(global_reads_per_interval) == 2
+        assert max(instructions_per_interval) == 4
         assert next(
             i for i, inst in reversed(list(enumerate(items)))
             if isinstance(inst, DSLoadB128)
