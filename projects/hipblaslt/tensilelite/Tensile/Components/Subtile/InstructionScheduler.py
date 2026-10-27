@@ -545,6 +545,31 @@ class _SchedulingRules:
         """Keep every DTL request, including an unpaired first request, isolated."""
         return not _isDtlLoad(inst) or not placer._intervalHasDtlLoad(pos)
 
+    def noBarrierWithDtlBundle(self, placer, pos, inst):
+        """Keep a synchronization stall out of a DTL request's MFMA interval.
+
+        A barrier may delay every instruction behind it.  Starting a direct-
+        to-LDS request in that same interval can therefore move the VMEM issue
+        beyond the matrix instruction's latency window.  Reserve a fresh MFMA
+        interval for the request setup and load whenever the partition has
+        capacity.
+        """
+        if not (_isBarrier(inst) or _isM0Update(inst) or _isDtlLoad(inst)):
+            return True
+        begin = (pos // placer.slotsPerInterval) * placer.slotsPerInterval
+        end = min(begin + placer.slotsPerInterval, placer.totalSlots)
+        peers = [
+            peer
+            for slot in range(begin, end)
+            for _, peer in placer._placed[slot]
+        ]
+        if _isBarrier(inst):
+            return not any(
+                _isM0Update(peer) or _isDtlLoad(peer)
+                for peer in peers
+            )
+        return not any(_isBarrier(peer) for peer in peers)
+
     def noDsReadOrValuInFirstSlot(self, placer, pos, inst):
         """Reserve each p0 interval's first slot from DS reads and VALU."""
         if pos % placer.slotsPerInterval != 0:
@@ -1722,6 +1747,7 @@ def instructionSchedule(
         base_validators.append(rules.noM0WithBufferLoad)
     base_adjusters = [rules.spreadLocalReads, rules.spreadBufferLoads]
     if partitionPrefetchPolicy or p0Split is not None:
+        base_validators.append(rules.noBarrierWithDtlBundle)
         base_validators.append(rules.noDsReadOrValuInFirstSlot)
         if strictDtlSpacing:
             base_validators.append(rules.oneDtlLoadPerInterval)

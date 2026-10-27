@@ -4771,6 +4771,82 @@ class TestInstructionSchedulerWrapPrefetch:
             not isinstance(inst, DSLoadB128)
             for inst in items[:barrier_position])
 
+    def test_partition_barrier_and_dtl_use_separate_mfma_intervals(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import (
+            DSModifiers, MUBUFModifiers, accvgpr, mgpr, sgpr, vgpr)
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, DSLoadB128, MXMFMAInstruction, SAddU32,
+            SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8, accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1], acc=accvgpr(0, 4),
+                a=vgpr(0, 8), b=vgpr(8, 8), acc2=accvgpr(0, 4),
+                mxsa=vgpr(16), mxsb=vgpr(17), block=32,
+                comment=f"mfma{index}")
+            for index in range(10)
+        ]
+        reads = [
+            DSLoadB128(
+                dst=vgpr(24, 4), src=vgpr(1),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"ds{index}")
+            for index in range(2)
+        ]
+        setup = SAddU32(
+            dst=mgpr(0), src0=sgpr(20), src1=0, comment="dtl-m0")
+        load = BufferLoadB128(
+            dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4), soffset=0,
+            mubuf=MUBUFModifiers(offen=True, lds=True),
+            comment="dtl-load")
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1, instructions=reads,
+                source=SimpleNamespace(kind="lr")),
+            EmittedModule(
+                moduleId=2,
+                instructions=[SWaitCnt(dscnt=0, comment="wait-lr")],
+                before=1, source=SimpleNamespace(kind="wait_lr")),
+            EmittedModule(
+                moduleId=3,
+                instructions=[SBarrier(comment="barrier")],
+                before=2, source=SimpleNamespace(kind="sync")),
+            EmittedModule(
+                moduleId=4, instructions=[setup, load], before=3,
+                source=SimpleNamespace(kind="gr")),
+        ]
+
+        items = list(instructionSchedule(
+            modules,
+            partitionPrefetch=True,
+            limitDtlBundlesPerMfma=True,
+        ).flatitems())
+        barrier_position = items.index(modules[3].instructions[0])
+        setup_position = items.index(setup)
+        load_position = items.index(load)
+
+        assert any(
+            isinstance(inst, MXMFMAInstruction)
+            for inst in items[barrier_position + 1:setup_position])
+        assert not any(
+            isinstance(inst, MXMFMAInstruction)
+            for inst in items[setup_position + 1:load_position])
+
     def test_p0_reserves_first_slot_from_ds_and_valu(self):
         import shutil
         from rocisa import rocIsa
