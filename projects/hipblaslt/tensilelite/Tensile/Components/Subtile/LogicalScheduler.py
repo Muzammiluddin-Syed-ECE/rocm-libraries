@@ -3209,6 +3209,18 @@ class LogicalScheduler:
                         ordered_grs[0].deps = [
                             Dep(ref=last_lr, mt_offset=0)]
 
+                if (self.config.scaleLRPolicy
+                        == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME):
+                    # SA/SB use disjoint LDS regions and independent SRDs.
+                    # Chaining them behind the complete A/B GR cohort leaves
+                    # every scale update/load at the partition tail even
+                    # though there are legal MFMA holes throughout P0.
+                    # Keep each scale producer as its own physical path; its
+                    # preOps still preserve its internal SRD/LW-base order.
+                    for gr in ordered_grs:
+                        if gr.tensor in ('SA', 'SB'):
+                            gr.deps = []
+
                 # ── Phase 3: Cross-group merge ──
                 # If any LR depends on a GR in this slot, merge into one
                 # chain: GR_group → LR_group to avoid shared parents.

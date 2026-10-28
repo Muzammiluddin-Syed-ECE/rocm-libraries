@@ -8,7 +8,7 @@ with pluggable scheduling rules.
 """
 
 from typing import List, Tuple, Optional
-from rocisa.code import Module
+from rocisa.code import Module, TextBlock
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
     LocalReadInstruction, GlobalReadInstruction, CommonInstruction
 
@@ -25,9 +25,11 @@ class _SlotPlacer:
 
     def __init__(self, intervals: int, numModules: int,
                  pathOrders: List[List[int]],
-                 validators=None, adjusters=None, onPlace=None):
+                 validators=None, adjusters=None, onPlace=None,
+                 maxInstructionsPerInterval: Optional[int] = None):
         self.totalSlots = intervals * 2
         self._n = numModules
+        self.maxInstructionsPerInterval = maxInstructionsPerInterval
         self._prevInPath: List[int] = [-1] * numModules
         self._nextInPath: List[int] = [-1] * numModules
         for order in pathOrders:
@@ -46,9 +48,45 @@ class _SlotPlacer:
     # ── Placement ──
 
     def _canPlace(self, pos: int, inst) -> bool:
-        if pos < 0 or pos >= self.totalSlots or len(self._placed[pos]) >= 2:
+        if pos < 0 or pos >= self.totalSlots:
             return False
+        slotCount = sum(
+            not _isZeroWidth(item[1]) for item in self._placed[pos])
+        if not _isZeroWidth(inst) and slotCount >= 2:
+            return False
+        if self.maxInstructionsPerInterval is not None:
+            interval = pos // 2
+            count = sum(
+                not _isZeroWidth(item[1])
+                for p in (2 * interval, 2 * interval + 1)
+                if p < self.totalSlots
+                for item in self._placed[p])
+            if (not _isZeroWidth(inst)
+                    and count >= self.maxInstructionsPerInterval):
+                return False
         return all(v(self, pos, inst) for v in self._validators)
+
+    def _canPlaceBundle(self, pos: int, items: List[Tuple[int, object]]) -> bool:
+        """Return whether an ordered instruction bundle fits one physical slot."""
+        if pos < 0 or pos >= self.totalSlots:
+            return False
+        slotCount = sum(
+            not _isZeroWidth(item[1]) for item in self._placed[pos])
+        bundleCount = sum(not _isZeroWidth(item[1]) for item in items)
+        if slotCount + bundleCount > 2:
+            return False
+        if self.maxInstructionsPerInterval is not None:
+            interval = pos // 2
+            count = sum(
+                not _isZeroWidth(item[1])
+                for p in (2 * interval, 2 * interval + 1)
+                if p < self.totalSlots
+                for item in self._placed[p])
+            if count + bundleCount > self.maxInstructionsPerInterval:
+                return False
+        return all(
+            all(v(self, pos, inst) for v in self._validators)
+            for _, inst in items)
 
     def adjustLimit(self, limit: int, inst) -> int:
         for adj in self._adjusters:
@@ -77,6 +115,23 @@ class _SlotPlacer:
         for pos in (range(hi, lo - 1, -1) if reverse else range(lo, hi + 1)):
             if self._canPlace(pos, inst):
                 return pos
+        return None
+
+    def findBundleSlot(self, mid: int, items: List[Tuple[int, object]],
+                       limit: int) -> Optional[int]:
+        """Find one slot for an ordered forward-only instruction bundle."""
+        lo, hi = self.bounds(mid)
+        lo = max(lo, limit)
+        if hi < lo:
+            return None
+        firstInterval = lo // 2
+        lastInterval = hi // 2
+        for interval in range(firstInterval, lastInterval + 1):
+            for pos in (2 * interval, 2 * interval + 1):
+                if pos < lo or pos > hi:
+                    continue
+                if self._canPlaceBundle(pos, items):
+                    return pos
         return None
 
     def _forceSlot(self, mid: int, limit: int, reverse: bool) -> int:
@@ -109,7 +164,8 @@ class _SlotPlacer:
             self._onPlace(self, pos, item[1])
 
     def placePath(self, pathInsts: List[Tuple[int, object]], reverse: bool = False,
-                  multiDU: bool = False):
+                  multiDU: bool = False,
+                  bundleM0BufferLoad: bool = False):
         """Place a sequence of (moduleId, instruction) items into slots.
 
         Walks pathInsts in order, applying adjusters (forward only) and
@@ -122,23 +178,47 @@ class _SlotPlacer:
         insert m0 setup between them.
         """
         limit = (self.totalSlots - 1) if reverse else 0
-        if not multiDU:
-            for item in pathInsts:
-                mid, inst = item
-                if not reverse:
-                    limit = self.adjustLimit(limit, inst)
-                pos = self.findSlot(mid, inst, limit, reverse=reverse)
-                if pos is None:
-                    pos = self._forceSlot(mid, limit, reverse)
-                self.place(pos, item, reverse=reverse)
-                limit = (pos - 1) if reverse else (pos + 1)
-            return
-
         idx = 0
         while idx < len(pathInsts):
             item = pathInsts[idx]
             mid, inst = item
-            if (not reverse and idx + 1 < len(pathInsts)
+            if _isZeroWidth(inst):
+                # Keep comments/directives in the emitted assembly without
+                # charging an issue slot or advancing the placement cursor.
+                prior = self._firstPos[mid] if reverse else self._lastPos[mid]
+                pos = prior if prior is not None else max(
+                    0, min(limit, self.totalSlots - 1))
+                self.place(pos, item, reverse=reverse)
+                idx += 1
+                continue
+            if (bundleM0BufferLoad and not reverse
+                    and idx + 1 < len(pathInsts)
+                    and pathInsts[idx + 1][0] == mid
+                    and _isM0Update(inst)
+                    and _isBufferLoad(pathInsts[idx + 1][1])):
+                bundle = pathInsts[idx:idx + 2]
+                limit = self.adjustLimit(limit, bundle[0][1])
+                limit = self.adjustLimit(limit, bundle[1][1])
+                pos = self.findBundleSlot(mid, bundle, limit)
+                if pos is None:
+                    # Capacity fallback: retain ordering and hard lower bounds
+                    # without overfilling one physical slot.
+                    for bundleItem in bundle:
+                        bundleMid, bundleInst = bundleItem
+                        pos = self.findSlot(
+                            bundleMid, bundleInst, limit, reverse=False)
+                        if pos is None:
+                            pos = self._forceSlot(
+                                bundleMid, limit, reverse=False)
+                        self.place(pos, bundleItem, reverse=False)
+                        limit = pos + 1
+                else:
+                    self.place(pos, bundle[0], reverse=False)
+                    self.place(pos, bundle[1], reverse=False)
+                    limit = pos + 1
+                idx += 2
+                continue
+            if (multiDU and not reverse and idx + 1 < len(pathInsts)
                     and _isWaitGr(inst) and _isBarrier(pathInsts[idx + 1][1])):
                 if not reverse:
                     limit = self.adjustLimit(limit, inst)
@@ -171,14 +251,14 @@ class _SlotPlacer:
     # ── Assembly ──
 
     def assemble(self, mfmas) -> Module:
-        intervals = len(mfmas) - 1
         result = Module()
-        result.add(mfmas[0])
-        for i in range(intervals):
+        for i, mfma in enumerate(mfmas):
+            result.add(mfma)
             for slot in (2 * i, 2 * i + 1):
+                if slot >= self.totalSlots:
+                    continue
                 for item in self._placed[slot]:
                     result.add(item[1])
-            result.add(mfmas[i + 1])
         for _, inst in self.leftovers:
             result.add(inst)
         return result
@@ -195,6 +275,7 @@ _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
 _isWaitCnt = lambda x: isinstance(x, SWaitCnt)
 _isM0Update = lambda x: isinstance(x, CommonInstruction) and hasattr(x, 'dst') and hasattr(x.dst, 'regType') and x.dst.regType == 'm'
+_isZeroWidth = lambda x: isinstance(x, TextBlock)
 # Typed op detection (see SWaitCntEx.isWaitGr / SBarrier) rather than matching
 # substrings in the instruction comment, which is brittle to comment edits.
 _isWaitGr = lambda x: _isWaitCnt(x) and getattr(x, "isWaitGr", False)
@@ -223,16 +304,24 @@ class _SchedulingRules:
         self.bufLoadIdx = 0
         self.bufLoadMaxSlot = 0
         self.numBufLoads = 0
+        self.remainingDsReads = 0
+        self.allowSecondDsRead = False
 
     # ── Validators: (placer, pos, inst) -> bool ──
 
     def oneDsReadPerInterval(self, placer, pos, inst):
-        """At most one ds_read per interval (pair of slots) to avoid same SIMD pair stalls as we have a single codepath"""
+        """Use one ds_read per interval, permitting a second only when needed."""
         if not _isDsRead(inst):
             return True
-        peer = pos ^ 1
-        return not (0 <= peer < placer.totalSlots
-                    and any(_isDsRead(item[1]) for item in placer._placed[peer]))
+        interval = pos // 2
+        count = sum(
+            _isDsRead(item[1])
+            for p in (2 * interval, 2 * interval + 1)
+            if p < placer.totalSlots
+            for item in placer._placed[p])
+        if count == 0:
+            return True
+        return self.allowSecondDsRead and count < 2
 
     def minGapDsReadBeforeWait(self, placer, pos, inst):
         """Reject ds_read too close to an already-placed waitcnt ahead."""
@@ -321,12 +410,40 @@ class _SchedulingRules:
         self.bufLoadIdx += 1
         return limit
 
+    def allowNecessarySecondDsReads(self, placer, limit, inst):
+        """Permit two DS reads only when one-per-remaining-interval cannot fit."""
+        if not _isDsRead(inst):
+            return limit
+        zeroDsIntervals = 0
+        for interval in range(limit // 2, (placer.totalSlots + 1) // 2):
+            positions = [
+                p for p in (2 * interval, 2 * interval + 1)
+                if limit <= p < placer.totalSlots
+            ]
+            if not positions:
+                continue
+            instructions = [
+                item[1]
+                for p in (2 * interval, 2 * interval + 1)
+                if p < placer.totalSlots
+                for item in placer._placed[p]
+            ]
+            if any(_isDsRead(item) for item in instructions):
+                continue
+            if (placer.maxInstructionsPerInterval is not None
+                    and len(instructions) >= placer.maxInstructionsPerInterval):
+                continue
+            zeroDsIntervals += 1
+        self.allowSecondDsRead = self.remainingDsReads > zeroDsIntervals
+        return limit
+
     # ── Placement hook: (placer, pos, inst) -> None ──
 
     def trackPlacement(self, placer, pos, inst):
         """Update rule state after a successful placement."""
         if _isDsRead(inst):
             self.lastDsReadPos = max(self.lastDsReadPos, pos)
+            self.remainingDsReads = max(0, self.remainingDsReads - 1)
         if _isWaitCnt(inst):
             self.earliestWaitCntPos = min(self.earliestWaitCntPos, pos)
         if _isBufferLoad(inst) and self.firstBufLoadPos is None:
@@ -336,6 +453,10 @@ class _SchedulingRules:
 
     def resetPath(self):
         self._resetPath()
+
+    def setupPath(self, pathInsts):
+        self.remainingDsReads = sum(
+            1 for _, inst in pathInsts if _isDsRead(inst))
 
     def setupBufLoadSpreading(self, placer, pathInsts, order):
         """Compute buffer-load spreading bounds for a forward path.
@@ -401,7 +522,14 @@ def _classifyPaths(pathOrders, emittedModules):
 
 def _flattenPath(order, emittedModules, reverse=False):
     """Flatten a path of module indices into (moduleId, instruction) pairs."""
-    pathInsts = [(mid, inst) for mid in order for inst in emittedModules[mid].instructions]
+    pathInsts = []
+    for mid in order:
+        for inst in emittedModules[mid].instructions:
+            # Some emitters return a nested Module (notably scale SRD/base
+            # updates). Slot capacity must account for the physical
+            # instructions, not the Python wrapper as one synthetic item.
+            physical = list(inst.flatitems()) if isinstance(inst, Module) else [inst]
+            pathInsts.extend((mid, item) for item in physical)
     if reverse:
         pathInsts.reverse()
     return pathInsts
@@ -603,10 +731,16 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         return result
 
     paths = _classifyPaths(pathOrders, emittedModules)
-    rules = _SchedulingRules(totalSlots=(len(mfmas) - 1) * 2,
+    # Staged frontiers use the interval after the partition's final MFMA too.
+    # This is still inside the partition boundary and is needed to distribute
+    # a full wrap-read cohort over all of its matrix issue windows.
+    numIntervals = len(mfmas) if stagedProducerFrontiers else len(mfmas) - 1
+    rules = _SchedulingRules(totalSlots=numIntervals * 2,
                              minGapDsReadToWait=minGapDsReadToWait)
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
-                       rules.minGapDsReadToWait, rules.noM0WithBufferLoad]
+                       rules.minGapDsReadToWait]
+    if not stagedProducerFrontiers:
+        base_validators.append(rules.noM0WithBufferLoad)
     base_adjusters = [rules.spreadBufferLoads]
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
@@ -614,11 +748,13 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     elif stagedProducerFrontiers:
         base_validators.append(rules.grAfterWaitGrBarrier)
         base_adjusters.insert(0, rules.deferGrAfterWaitGrBarrier)
+        base_adjusters.insert(1, rules.allowNecessarySecondDsReads)
     placer = _SlotPlacer(
-        len(mfmas) - 1, n, pathOrders,
+        numIntervals, n, pathOrders,
         validators=base_validators,
         adjusters=base_adjusters,
-        onPlace=rules.trackPlacement)
+        onPlace=rules.trackPlacement,
+        maxInstructionsPerInterval=(3 if stagedProducerFrontiers else None))
 
     for order, hasWaitGR in paths:
         if not order:
@@ -627,9 +763,14 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         reverse = (not forwardWaitPath) and hasWaitGR
         pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
         rules.resetPath()
+        rules.setupPath(pathInsts)
         if not hasWaitGR:
             rules.setupBufLoadSpreading(placer, pathInsts, order)
-        placer.placePath(pathInsts, reverse=reverse, multiDU=forwardWaitPath)
+        placer.placePath(
+            pathInsts,
+            reverse=reverse,
+            multiDU=forwardWaitPath,
+            bundleM0BufferLoad=stagedProducerFrontiers)
         if multiDU and hasWaitGR:
             rules.setPostWaitGrDsReadFence(placer)
         elif stagedProducerFrontiers and hasWaitGR:

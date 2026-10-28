@@ -3497,6 +3497,37 @@ class TestInstructionSchedulerStagedFrontier:
         assert barrier_pos < first_lr_pos
         assert barrier_pos < gr_pos
 
+    def test_dtl_bundle_and_interval_capacity(self):
+        from rocisa.instruction import (
+            GlobalReadInstruction, LocalReadInstruction, MFMAInstruction)
+
+        items = self._schedule()
+        mfma_positions = [
+            i for i, inst in enumerate(items)
+            if isinstance(inst, MFMAInstruction)
+        ]
+        windows = [
+            items[begin + 1:(
+                mfma_positions[index + 1]
+                if index + 1 < len(mfma_positions)
+                else len(items))]
+            for index, begin in enumerate(mfma_positions)
+        ]
+        assert all(len(window) <= 3 for window in windows)
+        assert all(
+            sum(isinstance(inst, LocalReadInstruction) for inst in window) <= 2
+            for window in windows)
+
+        gr_pos = next(
+            i for i, inst in enumerate(items)
+            if isinstance(inst, GlobalReadInstruction))
+        assert items[gr_pos - 1].comment == "future m0"
+        assert sum(
+            isinstance(inst, MFMAInstruction) for inst in items[:gr_pos - 1]
+        ) == sum(
+            isinstance(inst, MFMAInstruction) for inst in items[:gr_pos]
+        )
+
 
 class TestIntegration:
 
