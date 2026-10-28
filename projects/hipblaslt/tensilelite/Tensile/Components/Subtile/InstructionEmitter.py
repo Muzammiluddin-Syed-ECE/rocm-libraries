@@ -174,6 +174,12 @@ class InstructionEmitter:
         else:
             abPairs = [(a, b) for a in aTiles for b in bTiles]
 
+        # Preserve the architecture-specific physical traversal as typed
+        # metadata on the placement. Lifetime-aware scale reads consume this
+        # after concrete MFMA generation, so they need not assume a macrotile
+        # shape or duplicate the emitter's ordering policy.
+        placement.physicalTilePairs = tuple(abPairs)
+
         for a, b in abPairs:
             groupA = (a // self.config.lrA.mn) * self.config.lrA.mn
             groupB = (b // self.config.lrB.mn) * self.config.lrB.mn

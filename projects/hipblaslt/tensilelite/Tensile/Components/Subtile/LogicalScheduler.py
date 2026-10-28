@@ -555,6 +555,7 @@ class MFMAPlacement(Emittable):
     subIterK: int
     tileA: MFMATileRange       # A tiles consumed
     tileB: MFMATileRange       # B tiles consumed
+    physicalTilePairs: Tuple[Tuple[int, int], ...] = field(default_factory=tuple)
     deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     postOps: List['BaseOp'] = field(default_factory=list)    # populated by insert_gr_lr_inc()
@@ -3165,7 +3166,12 @@ class LogicalScheduler:
                             Dep(ref=group[i - 1], mt_offset=0)]
 
                 _chain_lrs(early_lrs)
-                _chain_lrs(late_lrs)
+                # Preserve each scale tensor's own lifetime path.  A single
+                # SA→SB chain would make an earlier-dead SB group wait behind
+                # a later-dead SA group (for example SB2 behind SA3).
+                for tensor in ('SA', 'SB'):
+                    _chain_lrs([
+                        lr for lr in late_lrs if lr.tensor == tensor])
 
                 # Only the ordinary LR path may feed same-partition GRs or
                 # current-body MFMAs.  The late path overwrites dead scale

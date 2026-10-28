@@ -26,10 +26,15 @@ class _SlotPlacer:
     def __init__(self, intervals: int, numModules: int,
                  pathOrders: List[List[int]],
                  validators=None, adjusters=None, onPlace=None,
-                 maxInstructionsPerInterval: Optional[int] = None):
+                 maxInstructionsPerInterval: Optional[int] = None,
+                 minimumPositions: Optional[List[Optional[int]]] = None):
         self.totalSlots = intervals * 2
         self._n = numModules
         self.maxInstructionsPerInterval = maxInstructionsPerInterval
+        self._minimumPositions = (
+            minimumPositions
+            if minimumPositions is not None
+            else [None] * numModules)
         self._prevInPath: List[int] = [-1] * numModules
         self._nextInPath: List[int] = [-1] * numModules
         for order in pathOrders:
@@ -94,10 +99,10 @@ class _SlotPlacer:
         return limit
 
     def bounds(self, mid: int) -> Tuple[int, int]:
-        lo = 0
+        lo = self._minimumPositions[mid] or 0
         pred = self._prevInPath[mid]
         if 0 <= pred < self._n and self._lastPos[pred] is not None:
-            lo = self._lastPos[pred] + 1
+            lo = max(lo, self._lastPos[pred] + 1)
         hi = self.totalSlots - 1
         succ = self._nextInPath[mid]
         if 0 <= succ < self._n and self._firstPos[succ] is not None:
@@ -654,6 +659,37 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
     return mfmaIdx, regularPaths, preMfmaPaths
 
 
+def _positionAfterLastScaleConsumer(source, mfmas,
+                                    mfmaSource) -> Optional[int]:
+    """Return the first slot after a lifetime-delayed scale's last MFMA use.
+
+    MFMA tile metadata is attached by InstructionEmitter after it chooses the
+    architecture-specific physical traversal.  Deriving the bound from those
+    concrete instructions keeps this policy independent of macrotile geometry
+    and avoids duplicating emitter ordering rules.
+    """
+    if not getattr(source, "scheduleAfterMfma", False):
+        return None
+    tensor = getattr(source, "tensor", None)
+    tiles = getattr(source, "tiles", None)
+    if tensor not in ("SA", "SB") or tiles is None:
+        return None
+    pairs = getattr(mfmaSource, "physicalTilePairs", None)
+    if not pairs or len(pairs) != len(mfmas):
+        return None
+    pairIndex = 0 if tensor == "SA" else 1
+    consumers = [
+        ordinal
+        for ordinal, pair in enumerate(pairs)
+        if tiles.tileId_start <= pair[pairIndex] < tiles.tileId_end
+    ]
+    if not consumers:
+        raise ValueError(
+            f"{tensor} tiles [{tiles.tileId_start},{tiles.tileId_end}) "
+            "have no MFMA consumer in their placement partition")
+    return 2 * max(consumers)
+
+
 def instructionSchedule(emittedModules, multiDU: bool = False,
                       stagedProducerFrontiers: bool = False,
                       minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT):
@@ -694,12 +730,22 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
     mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
 
+    minimumPositions: List[Optional[int]] = [None] * n
+    mfmaSource = emittedModules[mfmaIdx].source
+    for mid, emitted in enumerate(emittedModules):
+        minimumPositions[mid] = _positionAfterLastScaleConsumer(
+            emitted.source, mfmas, mfmaSource)
+
     postMfmaOrders = []
     regularOrders = []
     for order in pathOrders:
-        if any(getattr(emittedModules[mid].source,
-                       "scheduleAfterMfma", False)
-               for mid in order):
+        delayed = [
+            mid for mid in order
+            if getattr(emittedModules[mid].source,
+                       "scheduleAfterMfma", False)]
+        # Keep the legacy final-MFMA fallback for callers that do not attach
+        # concrete MFMA tile metadata.
+        if delayed and any(minimumPositions[mid] is None for mid in delayed):
             postMfmaOrders.append(order)
         else:
             regularOrders.append(order)
@@ -754,7 +800,8 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
         validators=base_validators,
         adjusters=base_adjusters,
         onPlace=rules.trackPlacement,
-        maxInstructionsPerInterval=(3 if stagedProducerFrontiers else None))
+        maxInstructionsPerInterval=(3 if stagedProducerFrontiers else None),
+        minimumPositions=minimumPositions)
 
     for order, hasWaitGR in paths:
         if not order:

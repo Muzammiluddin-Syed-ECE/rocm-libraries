@@ -3528,6 +3528,53 @@ class TestInstructionSchedulerStagedFrontier:
             isinstance(inst, MFMAInstruction) for inst in items[:gr_pos]
         )
 
+    def test_scale_read_starts_after_exact_last_consumer(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import DSLoadB128, MFMAInstruction
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        ri.init((9, 5, 0), shutil.which('amdclang++') or '/usr/bin/amdclang++')
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = []
+        for index in range(8):
+            mfma = MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=f"mfma{index}")
+            mfmas.append(mfma)
+        late_source = SimpleNamespace(
+            kind='lr', tensor='SB', scheduleAfterMfma=True,
+            tiles=SimpleNamespace(tileId_start=0, tileId_end=2))
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas,
+                source=SimpleNamespace(
+                    kind='mfma',
+                    physicalTilePairs=tuple(
+                        (index // 4, index % 4)
+                        for index in range(8)))),
+            EmittedModule(
+                moduleId=1,
+                instructions=[DSLoadB128(
+                    dst=vgpr(8, 4), src=vgpr(1),
+                    ds=DSModifiers(offset=0), comment="late SB read")],
+                source=late_source),
+        ]
+
+        items = list(instructionSchedule(
+            modules, stagedProducerFrontiers=True).flatitems())
+        read_pos = next(
+            index for index, inst in enumerate(items)
+            if inst.comment == "late SB read")
+        assert items.index(mfmas[5]) < read_pos < items.index(mfmas[6])
+
 
 class TestIntegration:
 
