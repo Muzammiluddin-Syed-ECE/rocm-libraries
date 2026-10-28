@@ -3416,6 +3416,88 @@ class TestGetNumVgpr:
 # Integration tests
 # ══════════════════════════════════════════════════════════════
 
+class TestInstructionSchedulerStagedFrontier:
+    """Future direct-to-LDS reads must not cross a producer barrier."""
+
+    @staticmethod
+    def _schedule():
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import (
+            DSModifiers, MUBUFModifiers, mgpr, sgpr, vgpr)
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, DSLoadB128, MFMAInstruction, SAddU32,
+            SBarrier)
+        from Tensile.Components.Subtile.InstructionEmitter import SWaitCntEx
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        def emitted(module_id, kind, instructions, before=None):
+            return EmittedModule(
+                moduleId=module_id,
+                instructions=instructions,
+                before=before,
+                source=SimpleNamespace(kind=kind))
+
+        def mfma(index):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=f"mfma{index}")
+
+        modules = [
+            emitted(0, 'mfma', [mfma(i) for i in range(8)]),
+            emitted(1, 'wait_gr', [
+                SWaitCntEx(vlcnt=8, dscnt=-1, comment="frontier wait")]),
+            emitted(2, 'sync', [SBarrier(comment="frontier barrier")],
+                    before=1),
+            emitted(3, 'lr', [
+                DSLoadB128(
+                    dst=vgpr(8, 4), src=vgpr(1),
+                    ds=DSModifiers(offset=i * 16), comment=f"ds{i}")
+                for i in range(4)
+            ], before=2),
+            emitted(4, 'gr', [
+                SAddU32(
+                    dst=mgpr(0), src0=sgpr(4), src1=0,
+                    comment="future m0"),
+                BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(8, 4), soffset=0,
+                    mubuf=MUBUFModifiers(offen=True, lds=True),
+                    comment="future gr"),
+            ]),
+        ]
+        return list(instructionSchedule(
+            modules, stagedProducerFrontiers=True).flatitems())
+
+    def test_wait_barrier_precede_future_global_read(self):
+        from rocisa.instruction import (
+            BufferLoadB128, LocalReadInstruction, SBarrier)
+        from Tensile.Components.Subtile.InstructionEmitter import SWaitCntEx
+
+        items = self._schedule()
+        wait_pos = next(
+            i for i, inst in enumerate(items) if isinstance(inst, SWaitCntEx))
+        barrier_pos = next(
+            i for i, inst in enumerate(items) if isinstance(inst, SBarrier))
+        gr_pos = next(
+            i for i, inst in enumerate(items) if isinstance(inst, BufferLoadB128))
+        first_lr_pos = next(
+            i for i, inst in enumerate(items)
+            if isinstance(inst, LocalReadInstruction))
+
+        assert wait_pos + 1 == barrier_pos
+        assert barrier_pos < first_lr_pos
+        assert barrier_pos < gr_pos
+
+
 class TestIntegration:
 
     def test_populate_instructions_256x256_fp4(self):

@@ -4347,6 +4347,9 @@ class LogicalScheduler:
                     scheduled = instructionSchedule(
                         em_list,
                         multiDU=self._is_multi_du(),
+                        stagedProducerFrontiers=(
+                            self.config.producerFrontiers
+                            == ProducerFrontierPolicy.STAGED_BY_FIRST_LR),
                         minGapDsReadToWait=minGapDsReadToWait)
                     module.add(scheduled)
                 else:

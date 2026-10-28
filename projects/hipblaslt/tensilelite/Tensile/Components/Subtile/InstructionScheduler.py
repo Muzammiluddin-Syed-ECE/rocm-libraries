@@ -238,6 +238,12 @@ class _SchedulingRules:
         """Reject ds_read too close to an already-placed waitcnt ahead."""
         if not _isDsRead(inst):
             return True
+        # A wait already behind this read guards older traffic, not this read.
+        # Forward producer-frontier paths intentionally have
+        # wait_gr -> barrier -> ds_read, so only enforce the gap when the
+        # already-placed wait is actually ahead of the candidate read.
+        if pos >= self.earliestWaitCntPos:
+            return True
         gap = self.minGap * 2
         return self.earliestWaitCntPos - pos >= gap
 
@@ -270,6 +276,19 @@ class _SchedulingRules:
             return True
         return pos > self.maxDsReadAfterWaitGr
 
+    def grAfterWaitGrBarrier(self, placer, pos, inst):
+        """Keep aliasing future GRs strictly after the producer frontier.
+
+        Unlike the multi-DU fence, this allows GRs to interleave with the
+        post-barrier local reads.  The barrier is the correctness boundary;
+        finishing every local read first is unnecessarily restrictive.
+        """
+        if not (_isBufferLoad(inst) or _isM0Update(inst)):
+            return True
+        if self.waitGrBarrierPos is None:
+            return True
+        return pos > self.waitGrBarrierPos
+
     # ── Adjusters: (placer, limit, inst) -> limit ──
 
     def deferGrAfterWaitGrDsReads(self, placer, limit, inst):
@@ -281,6 +300,14 @@ class _SchedulingRules:
         if limit <= self.waitGrBarrierPos:
             return limit
         return max(limit, self.maxDsReadAfterWaitGr + 1)
+
+    def deferGrAfterWaitGrBarrier(self, placer, limit, inst):
+        """Start future GR placement immediately after the frontier barrier."""
+        if not (_isBufferLoad(inst) or _isM0Update(inst)):
+            return limit
+        if self.waitGrBarrierPos is None:
+            return limit
+        return max(limit, self.waitGrBarrierPos + 1)
 
     def spreadBufferLoads(self, placer, limit, inst):
         """Spread buffer_load instructions evenly across available range."""
@@ -346,6 +373,20 @@ class _SchedulingRules:
                     max_ds = max(max_ds, pos)
         self.waitGrBarrierPos = wg_pos
         self.maxDsReadAfterWaitGr = max_ds
+
+    def setWaitGrBarrierFence(self, placer) -> None:
+        """Record the barrier that closes the current wait_gr frontier."""
+        wg_pos = None
+        barrier_pos = None
+        for pos, slot in enumerate(placer._placed):
+            for _, inst in slot:
+                if _isWaitGr(inst) and wg_pos is None:
+                    wg_pos = pos
+                elif (_isBarrier(inst) and wg_pos is not None
+                      and pos >= wg_pos and barrier_pos is None):
+                    barrier_pos = pos
+        self.waitGrBarrierPos = barrier_pos
+        self.maxDsReadAfterWaitGr = -1
 
 
 def _classifyPaths(pathOrders, emittedModules):
@@ -486,6 +527,7 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
 
 
 def instructionSchedule(emittedModules, multiDU: bool = False,
+                      stagedProducerFrontiers: bool = False,
                       minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT):
     """Interleave non-MFMA instructions between MFMAs using 2 slots/interval.
 
@@ -507,6 +549,11 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
       - LR path containing a WAIT_GR is placed forward (wait_gr → sync → LR insts).
       - wait_gr+barrier stay contiguous; GR m0/buffer_load defer until that path's
         post-barrier ds_reads complete.
+
+    When stagedProducerFrontiers is True:
+      - WAIT_GR paths are also placed forward and keep wait_gr+barrier atomic.
+      - Future GRs are hard-bounded after the barrier, but may interleave with
+        post-barrier local reads.
 
       TODO : To be tested on multi-partition setup.
     """
@@ -564,6 +611,9 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     if multiDU:
         base_validators.append(rules.grAfterWaitGrDsReads)
         base_adjusters.insert(0, rules.deferGrAfterWaitGrDsReads)
+    elif stagedProducerFrontiers:
+        base_validators.append(rules.grAfterWaitGrBarrier)
+        base_adjusters.insert(0, rules.deferGrAfterWaitGrBarrier)
     placer = _SlotPlacer(
         len(mfmas) - 1, n, pathOrders,
         validators=base_validators,
@@ -573,14 +623,17 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     for order, hasWaitGR in paths:
         if not order:
             continue
-        reverse = (not multiDU) and hasWaitGR
+        forwardWaitPath = multiDU or stagedProducerFrontiers
+        reverse = (not forwardWaitPath) and hasWaitGR
         pathInsts = _flattenPath(order, emittedModules, reverse=reverse)
         rules.resetPath()
         if not hasWaitGR:
             rules.setupBufLoadSpreading(placer, pathInsts, order)
-        placer.placePath(pathInsts, reverse=reverse, multiDU=multiDU)
+        placer.placePath(pathInsts, reverse=reverse, multiDU=forwardWaitPath)
         if multiDU and hasWaitGR:
             rules.setPostWaitGrDsReadFence(placer)
+        elif stagedProducerFrontiers and hasWaitGR:
+            rules.setWaitGrBarrierFence(placer)
 
     scheduled = Module()
     _emitPreMfma(scheduled)
