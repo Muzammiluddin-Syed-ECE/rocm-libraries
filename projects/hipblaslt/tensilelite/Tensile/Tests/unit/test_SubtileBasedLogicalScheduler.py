@@ -19,6 +19,7 @@ from Tensile.Components.Subtile.Kernel import (
     TileInfo, AB_B8, AB_B16, AB_B16_W32, AB_B4, MXSA_B4, MXSB_B4, CD_F32, CD_F32_W32,
 )
 from Tensile.Components.Subtile.LogicalScheduler import (
+    GREpochPolicy,
     GRPlacementStrategy,
     GROrderingPolicy,
     LogicalScheduler,
@@ -556,7 +557,8 @@ class TestDualPeriodMXFP8NextPartition:
 
     @staticmethod
     def _make_cfg(scaleReuse=2, grSA_k=2,
-                  grOrdering=GROrderingPolicy.LEGACY):
+                  grOrdering=GROrderingPolicy.LEGACY,
+                  grEpoch=GREpochPolicy.LEGACY_RING):
         # 8-wave MT256x256: MIWT 8x4, MIWG 2x4 -> 8 M-tiles, 4 N-tiles.
         return SchedulerConfig(
             numMFMATilesM=8,
@@ -580,6 +582,7 @@ class TestDualPeriodMXFP8NextPartition:
             prefetchNextPartition=True,
             partitionOrder="n-major",
             grOrdering=grOrdering,
+            grEpoch=grEpoch,
             scaleReuse=scaleReuse,
         )
 
@@ -673,6 +676,80 @@ class TestDualPeriodMXFP8NextPartition:
                 and em.source.mtIteration == 1)
         ]
         assert mt1_ranges == [('B', 0, 2), ('A', 0, 4)]
+
+    def test_uniform_epoch_mainloop_contains_complete_n2_data(self):
+        cfg = self._make_cfg(
+            grOrdering=GROrderingPolicy.CONSUMER_COHORT,
+            grEpoch=GREpochPolicy.UNIFORM_PGR2)
+        sched = LogicalScheduler(cfg)
+        sched.build(stop_after=Pass.GR)
+
+        atoms = {'A': [], 'B': []}
+        for slots in sched._partitions:
+            for slot in slots:
+                for gr in slot.grs:
+                    if gr.tensor not in atoms:
+                        continue
+                    assert gr.mtIteration == 2
+                    gran = cfg.grA if gr.tensor == 'A' else cfg.grB
+                    atoms[gr.tensor].extend(range(
+                        gr.tiles.tileId_start,
+                        gr.tiles.tileId_end,
+                        gran.mn))
+
+        assert sorted(atoms['A']) == list(range(cfg.numMFMATilesM))
+        assert sorted(atoms['B']) == list(range(cfg.numMFMATilesN))
+
+    def test_staged_preloop_wait_and_complete_second_data_epoch(self):
+        cfg = self._make_cfg(
+            grOrdering=GROrderingPolicy.CONSUMER_COHORT,
+            grEpoch=GREpochPolicy.UNIFORM_PGR2)
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        preloop = sched.build_preloop()[0][0]
+
+        initial = [
+            em.source for em in preloop
+            if (em.opType == 'gr'
+                and isinstance(em.source, GRPlacement)
+                and em.source.mtIteration == 0)
+        ]
+        assert [(gr.tensor, gr.tiles.tileId_start, gr.tiles.tileId_end)
+                for gr in initial] == [
+            ('B', 0, 2),
+            ('A', 0, 4),
+            ('SA', 0, 8),
+            ('SB', 0, 4),
+            ('B', 2, 4),
+            ('A', 4, 8),
+        ]
+
+        waits = [
+            em.source for em in preloop
+            if em.opType == 'wait_gr'
+        ]
+        assert len(waits) == 2
+        partial = waits[0].wait_gr_counts
+        assert (partial.A, partial.B, partial.SA, partial.SB) == (4, 2, 0, 0)
+        cold = waits[1].wait_gr_counts
+        assert (cold.A, cold.B, cold.SA, cold.SB) == (0, 0, 0, 0)
+
+        second = [
+            em.source for em in preloop
+            if (em.opType == 'gr'
+                and isinstance(em.source, GRPlacement)
+                and em.source.mtIteration == 1)
+        ]
+        second_atoms = {'A': [], 'B': []}
+        for gr in second:
+            if gr.tensor in second_atoms:
+                gran = cfg.grA if gr.tensor == 'A' else cfg.grB
+                second_atoms[gr.tensor].extend(range(
+                    gr.tiles.tileId_start,
+                    gr.tiles.tileId_end,
+                    gran.mn))
+        assert sorted(second_atoms['A']) == list(range(cfg.numMFMATilesM))
+        assert sorted(second_atoms['B']) == list(range(cfg.numMFMATilesN))
 
 
 class TestPlaceLRs:

@@ -231,6 +231,17 @@ class GROrderingPolicy(IntEnum):
     CONSUMER_COHORT = 1
 
 
+class GREpochPolicy(IntEnum):
+    """Logical A/B epoch represented by each PGR2 steady-state body.
+
+    LEGACY_RING preserves the historical partition-ring stream, where a body
+    can contain both n+1 and n+2 requests.  UNIFORM_PGR2 emits one complete
+    n+2 A/B epoch and requires the preloop to seed the complete n+1 epoch.
+    """
+    LEGACY_RING = 0
+    UNIFORM_PGR2 = 1
+
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the MFMATile-based scheduler."""
@@ -277,6 +288,7 @@ class SchedulerConfig:
     partitionOrder: str = "m-major"
     grPlacement: GRPlacementStrategy = GRPlacementStrategy.SPREAD
     grOrdering: GROrderingPolicy = GROrderingPolicy.LEGACY
+    grEpoch: GREpochPolicy = GREpochPolicy.LEGACY_RING
     pgl: int = 0              # Prefetch GL2 (0=off, 1 or 2 tiles ahead)
     # Dual-period MXFP8: how many data (DepthU) iterations share one 256-K scale
     # epoch.  >1 decouples the data K cadence from the scale cadence: numSubIterK
@@ -398,9 +410,17 @@ class SchedulerConfig:
         assert self.partitionOrder in ("m-major", "n-major"), \
             f"partitionOrder must be m-major or n-major, got {self.partitionOrder}"
         self.grOrdering = GROrderingPolicy(self.grOrdering)
+        self.grEpoch = GREpochPolicy(self.grEpoch)
         if self.grOrdering == GROrderingPolicy.CONSUMER_COHORT:
             assert self.prefetchNextPartition, \
                 "consumer-cohort GR ordering requires partition prefetch"
+        if self.grEpoch == GREpochPolicy.UNIFORM_PGR2:
+            assert self.pgr == 2, \
+                "uniform PGR2 epochs require PrefetchGlobalRead=2"
+            assert self.prefetchNextPartition, \
+                "uniform PGR2 epochs require partition prefetch"
+            assert self.grOrdering == GROrderingPolicy.CONSUMER_COHORT, \
+                "uniform PGR2 epochs require consumer-cohort ordering"
 
         # plr=-1 auto-derives from pgr (legacy: 0 when pgr==0, else 1).
         if self.plr == -1:
@@ -869,6 +889,24 @@ class LogicalScheduler:
         tensor, mt, ts, te, ks, ke, _ = entry
         tiles = MFMATileRange(ks, ke, ts, te)
         return self._consumer_cohort_key(tensor, mt, tiles)
+
+    def _preloop_gr_entry_sort_key(self, entry: tuple) -> tuple:
+        """Order the initial epoch by the first preloop publication frontier."""
+        tensor, mt, ts, te, ks, ke, _ = entry
+        tiles = MFMATileRange(ks, ke, ts, te)
+        if tensor in ('A', 'B'):
+            frontier = self._first_consumer_partition(tensor, tiles)
+            tensor_rank = 0 if tensor == 'B' else 1
+        else:
+            # Initial scales are required with the partition-zero A/B cohort.
+            frontier = 0
+            tensor_rank = 2 if tensor == 'SA' else 3
+        return (frontier, tensor_rank, mt, ks, ts)
+
+    def _preloop_gr_is_initially_required(self, gr: GRPlacement) -> bool:
+        """Whether the first preloop barrier must publish this request."""
+        return (gr.tensor in ('SA', 'SB')
+                or self._first_consumer_partition(gr.tensor, gr.tiles) == 0)
 
     @pipeline_pass(Pass.LR)
     def place_LRs(self) -> LogicalSchedule:
@@ -1439,7 +1477,8 @@ class LogicalScheduler:
 
     # ── Place GRs ─────────────────────────────────────────
 
-    def _build_gr_list(self, part_ranges, offsetMT, offsetPartition, unrollId=0):
+    def _build_gr_list(self, part_ranges, offsetMT, offsetPartition, unrollId=0,
+                       applyEpochPolicy=True):
         """Phase 1: Build ordered GR list from placed MFMAs.
 
         For each partition × subIterK, derive target partition/MT from
@@ -1463,7 +1502,7 @@ class LogicalScheduler:
 
             target_pi = (pi + offsetPartition) % numP
             wraps = (pi + offsetPartition) >= numP
-            mt_val = offsetMT + (1 if wraps else 0)
+            ring_mt_val = offsetMT + (1 if wraps else 0)
 
             target_range = part_ranges[target_pi]
 
@@ -1477,6 +1516,13 @@ class LogicalScheduler:
                     items.append(('SB', target_range['B'], cfg.grSB))
 
                 for tensor, (t_start, t_end), gr_gran in items:
+                    mt_val = (
+                        cfg.pgr
+                        if (applyEpochPolicy
+                            and cfg.grEpoch == GREpochPolicy.UNIFORM_PGR2
+                            and tensor in ('A', 'B'))
+                        else ring_mt_val
+                    )
                     def _valid_k_for_unroll(k, uid):
                         nu = cfg.numUnroll.get(tensor, 1)
                         if uid >= nu:
@@ -3458,9 +3504,12 @@ class LogicalScheduler:
             self._partition_tile_range(pi)
             for pi in range(self.config.numPartitions)
         ]
-        entries = self._build_gr_list(
-            part_ranges, mt, 0, unrollId=uid)
-        entries.sort(key=self._gr_entry_sort_key)
+        entries = [
+            entry for entry in self._build_gr_list(
+                part_ranges, mt, 0, unrollId=uid,
+                applyEpochPolicy=False)
+            if entry[0] in ('A', 'B')
+        ]
 
         result = []
         for tensor, mt_val, ts, te, ks, ke, _ in entries:
@@ -3477,6 +3526,18 @@ class LogicalScheduler:
                 partition=partition,
                 unrollId=uid,
             ))
+        # Scale DTL loads publish the whole scale tensor in one request.  Do
+        # not split or duplicate them merely because the A/B data epoch is
+        # partitioned into consumer cohorts.
+        result.extend(
+            gr for gr in self._make_gr_all_tensors_uid(mt, tiles, uid)
+            if gr.tensor in ('SA', 'SB')
+        )
+        result.sort(key=lambda gr: self._preloop_gr_entry_sort_key((
+            gr.tensor, gr.mtIteration,
+            gr.tiles.tileId_start, gr.tiles.tileId_end,
+            gr.tiles.subIterK_start, gr.tiles.subIterK_end,
+            None)))
         return result
 
     def _make_depops_uid(self, cls, uid: int) -> List[BaseOp]:
@@ -3498,8 +3559,9 @@ class LogicalScheduler:
     def _make_preloop_mt1_grs(self) -> List[GRPlacement]:
         """Create MT1 GRs for the PGR=2 preloop, ordered to match the mainloop.
 
-        Covers partitions 0..offsetPartition-1 with proper deduplication.
-        Each unique (tensor, uid, tile-range, k-range) appears exactly once.
+        Covers partitions 0..offsetPartition-1 in legacy mode.  Uniform PGR2
+        mode seeds a complete second A/B epoch while retaining the independent
+        legacy scale range.  Each unique tensor/range appears exactly once.
 
         For multi-DU data tensors (numUnroll > 1), each uid only emits GRs
         for the K slots that belong to it (uid u → k in [u*grGran.k, (u+1)*grGran.k)).
@@ -3510,8 +3572,13 @@ class LogicalScheduler:
         seen = set()
         result = []
         maxUnroll = max(cfg.numUnroll.values()) if cfg.numUnroll else 1
+        preloop_partitions = (
+            range(cfg.numPartitions)
+            if cfg.grEpoch == GREpochPolicy.UNIFORM_PGR2
+            else range(cfg.offsetPartition)
+        )
         for uid in range(maxUnroll):
-            for pi in range(cfg.offsetPartition):
+            for pi in preloop_partitions:
                 target_range = self._partition_tile_range(pi)
                 for slot in self._partitions[0]:
                     k = slot.mfma.subIterK
@@ -3521,6 +3588,10 @@ class LogicalScheduler:
                         items.append(('SA', target_range['A'], cfg.grSA))
                         items.append(('SB', target_range['B'], cfg.grSB))
                     for tensor, (t_start, t_end), gr_gran in items:
+                        if (cfg.grEpoch == GREpochPolicy.UNIFORM_PGR2
+                                and tensor in ('SA', 'SB')
+                                and pi >= cfg.offsetPartition):
+                            continue
                         nUnroll = cfg.numUnroll.get(tensor, 1)
                         if uid >= nUnroll:
                             continue
@@ -3558,7 +3629,12 @@ class LogicalScheduler:
 
         seen = set()
         result = []
-        for pi in range(cfg.offsetPartition):
+        preloop_partitions = (
+            range(cfg.numPartitions)
+            if cfg.grEpoch == GREpochPolicy.UNIFORM_PGR2
+            else range(cfg.offsetPartition)
+        )
+        for pi in preloop_partitions:
             target_range = self._partition_tile_range(pi)
             for slot in self._partitions[0]:
                 k = slot.mfma.subIterK
@@ -3568,6 +3644,10 @@ class LogicalScheduler:
                     items.append(('SA', target_range['A'], cfg.grSA))
                     items.append(('SB', target_range['B'], cfg.grSB))
                 for tensor, (t_start, t_end), gr_gran in items:
+                    if (cfg.grEpoch == GREpochPolicy.UNIFORM_PGR2
+                            and tensor in ('SA', 'SB')
+                            and pi >= cfg.offsetPartition):
+                        continue
                     nUnroll = cfg.numUnroll.get(tensor, 1)
                     if uid >= nUnroll:
                         continue
@@ -3608,6 +3688,40 @@ class LogicalScheduler:
             return initVgprTilesToZero(emitter.writer, emitter.kernel,
                                        emitter.dtileInfo)
         return InlineModuleOp(build=_build_initC, label="initC_overlap")
+
+    def _wait_gr_counts_for_ops(self, ops) -> WaitGRCounts:
+        """Count atomic requests in an operation sequence."""
+        counts = WaitGRCounts()
+        for op in ops:
+            if not isinstance(op, GRPlacement):
+                continue
+            setattr(counts, op.tensor,
+                    getattr(counts, op.tensor) + self._count_gr_atoms(op))
+        return counts
+
+    @staticmethod
+    def _make_internal_label_op(name: str) -> InlineModuleOp:
+        """Create a local label used to join guarded preloop wait paths."""
+        def _build_label(_emitter):
+            from rocisa.code import Label, Module
+            module = Module()
+            module.add(Label(name, ""))
+            return module
+        return InlineModuleOp(build=_build_label, label=name)
+
+    @staticmethod
+    def _make_internal_branch_op(target: str) -> InlineModuleOp:
+        """Create an unconditional branch between guarded preloop paths."""
+        def _build_branch(_emitter):
+            from rocisa.code import Label, Module
+            from rocisa.instruction import SBranch
+            module = Module()
+            module.add(SBranch(
+                labelName=Label(target, "").getLabelName(),
+                comment="join guarded preloop wait paths"))
+            return module
+        return InlineModuleOp(build=_build_branch,
+                              label=f"branch_{target}")
 
     def build_preloop(self) -> EmittedSchedule:
         """Build preloop: pipeline initialization sequence before mainloop.
@@ -3693,7 +3807,48 @@ class LogicalScheduler:
                     gl2_preloop_ops.append(GL2PrefetchIncOp())
                     gl2_preloop_ops.append(GL2PrefetchOp())
             maxUnroll = max(cfg.numUnroll.values()) if cfg.numUnroll else 1
-            if maxUnroll > 1:
+            if cfg.grEpoch == GREpochPolicy.UNIFORM_PGR2:
+                initial_epoch = []
+                second_epoch = []
+                for uid in range(maxUnroll):
+                    initial_epoch.extend(
+                        self._make_preloop_initial_grs_uid(
+                            0, all_tiles, uid))
+                    initial_epoch.extend(
+                        self._make_depops_uid(GRIncOp, uid))
+                    second_epoch.extend(
+                        self._make_preloop_mt1_grs_uid(uid))
+
+                deferred = [
+                    op for op in initial_epoch
+                    if (isinstance(op, GRPlacement)
+                        and not self._preloop_gr_is_initially_required(op))
+                ]
+                deferred_counts = self._wait_gr_counts_for_ops(deferred)
+                no_second_epoch = "SubtilePreloopNoSecondEpoch"
+                wait_done = "SubtilePreloopInitialWaitDone"
+                emitted = self._to_emitted([
+                    *initial_epoch,
+                    initC_op,
+                    # The normal path publishes only P0's initial cohort.  The
+                    # NLL path cannot rely on later partition frontiers, so it
+                    # takes the cold full-drain branch before the same barrier.
+                    SkipOp(compare='LE', value=1, target=no_second_epoch,
+                           rawLabel=True,
+                           branchComment="full-drain initial epoch on NLL path"),
+                    WaitGROp(wait_gr_counts=deferred_counts),
+                    self._make_internal_branch_op(wait_done),
+                    self._make_internal_label_op(no_second_epoch),
+                    WaitGROp(wait_gr_counts=WaitGRCounts()),
+                    self._make_internal_label_op(wait_done),
+                    SyncOp(),
+                    *self._make_lr_all_tensors(lr_tiles),
+                    SkipOp(compare='LE', value=1, target='NLL'),
+                    *second_epoch,
+                    *gl2_preloop_ops,
+                    SkipOp(compare='LE', value=2, target='NGLL'),
+                ])
+            elif maxUnroll > 1:
                 preloop_ops = []
                 for uid in range(maxUnroll):
                     preloop_ops.extend(
