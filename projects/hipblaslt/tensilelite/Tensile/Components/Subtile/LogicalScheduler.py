@@ -242,6 +242,12 @@ class GREpochPolicy(IntEnum):
     UNIFORM_PGR2 = 1
 
 
+class ProducerFrontierPolicy(IntEnum):
+    """Placement and synchronization policy for future LDS producers."""
+    LEGACY = 0
+    STAGED_BY_FIRST_LR = 1
+
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the MFMATile-based scheduler."""
@@ -289,6 +295,7 @@ class SchedulerConfig:
     grPlacement: GRPlacementStrategy = GRPlacementStrategy.SPREAD
     grOrdering: GROrderingPolicy = GROrderingPolicy.LEGACY
     grEpoch: GREpochPolicy = GREpochPolicy.LEGACY_RING
+    producerFrontiers: ProducerFrontierPolicy = ProducerFrontierPolicy.LEGACY
     pgl: int = 0              # Prefetch GL2 (0=off, 1 or 2 tiles ahead)
     # Dual-period MXFP8: how many data (DepthU) iterations share one 256-K scale
     # epoch.  >1 decouples the data K cadence from the scale cadence: numSubIterK
@@ -411,6 +418,8 @@ class SchedulerConfig:
             f"partitionOrder must be m-major or n-major, got {self.partitionOrder}"
         self.grOrdering = GROrderingPolicy(self.grOrdering)
         self.grEpoch = GREpochPolicy(self.grEpoch)
+        self.producerFrontiers = ProducerFrontierPolicy(
+            self.producerFrontiers)
         if self.grOrdering == GROrderingPolicy.CONSUMER_COHORT:
             assert self.prefetchNextPartition, \
                 "consumer-cohort GR ordering requires partition prefetch"
@@ -421,6 +430,9 @@ class SchedulerConfig:
                 "uniform PGR2 epochs require partition prefetch"
             assert self.grOrdering == GROrderingPolicy.CONSUMER_COHORT, \
                 "uniform PGR2 epochs require consumer-cohort ordering"
+        if self.producerFrontiers == ProducerFrontierPolicy.STAGED_BY_FIRST_LR:
+            assert self.grEpoch == GREpochPolicy.UNIFORM_PGR2, \
+                "staged producer frontiers require uniform PGR2 epochs"
 
         # plr=-1 auto-derives from pgr (legacy: 0 when pgr==0, else 1).
         if self.plr == -1:
@@ -636,6 +648,7 @@ class BaseOp(Emittable):
 class WaitGROp(BaseOp):
     """Wait for global reads to complete. Optionally includes a sync barrier."""
     wait_gr_counts: Optional[WaitGRCounts] = None
+    wait_gr_counts_by_unroll: Optional[Tuple[WaitGRCounts, ...]] = None
     has_sync: bool = False
     adjustVmcnt: bool = True
     # When True the emitter ignores wait_gr_counts and forces a full vmcnt(0)
@@ -649,6 +662,11 @@ class WaitGROp(BaseOp):
         self.kind = 'wait_gr'
 
     def __str__(self):
+        if self.wait_gr_counts_by_unroll:
+            return (f"{self.kind}("
+                    + ",".join(str(c)
+                               for c in self.wait_gr_counts_by_unroll)
+                    + ")")
         if self.wait_gr_counts:
             return f"{self.kind}({self.wait_gr_counts})"
         return self.kind
@@ -962,9 +980,40 @@ class LogicalScheduler:
 
         if cfg.dualPeriodScale:
             self._place_scale_LRs_epoch(partitions)
+        if (cfg.producerFrontiers
+                == ProducerFrontierPolicy.STAGED_BY_FIRST_LR):
+            self._advance_wrap_data_reads(partitions)
 
         self._partitions = partitions
         return partitions
+
+    def _advance_wrap_data_reads(self, partitions):
+        """Move next-body A/B reads one partition ahead of the ring wrap.
+
+        The final partition still supplies a full compute window in which the
+        reads can mature, while the producer VMEM frontier and barrier move to
+        the preceding partition.  This is derived from the generated ring,
+        not from a fixed P2/P3 index.
+        """
+        if len(partitions) < 2:
+            return
+        source = partitions[-1][0]
+        destination_pi = len(partitions) - 2
+        destination = partitions[destination_pi][0]
+        moved = [
+            lr for lr in source.lrs
+            if (lr.tensor in ('A', 'B')
+                and lr.mtIteration > 0
+                and lr.targetPartition == 0)
+        ]
+        source.lrs = [lr for lr in source.lrs if lr not in moved]
+        for lr in moved:
+            lr.partition = destination_pi
+            lr.subIterK_slot = 0
+        destination.lrs.extend(sorted(
+            moved, key=lambda lr: (
+                0 if lr.tensor == 'B' else 1,
+                lr.tiles.tileId_start)))
 
     def _place_scale_LRs_epoch(self, partitions):
         """Place the per-epoch scale LRs for the dual-period MXFP8 path.
@@ -1736,6 +1785,55 @@ class LogicalScheduler:
                         partition=pi,
                         unrollId=uid))
 
+    def _place_staged_consumer_grs(self, gr_list, unrollId=0):
+        """Place one future producer cohort at each first-LR frontier.
+
+        Data cohorts are assigned to the compute partition where their tile
+        range is first consumed.  Scale DTL requests publish the whole scale
+        tensor once and share partition zero's frontier.
+        """
+        cfg = self.config
+        data_entries = sorted(
+            (entry for entry in gr_list if entry[0] in ('A', 'B')),
+            key=self._gr_entry_sort_key)
+        for tensor, mt_val, ts, te, ks, ke, _ in data_entries:
+            tiles = MFMATileRange(ks, ke, ts, te)
+            pi = self._first_consumer_partition(tensor, tiles)
+            slot = self._partitions[pi][0]
+            placed = slot.grs_by_unroll.setdefault(unrollId, [])
+            if (placed
+                    and placed[-1].tensor == tensor
+                    and placed[-1].mtIteration == mt_val
+                    and placed[-1].tiles.subIterK_start == ks
+                    and placed[-1].tiles.subIterK_end == ke
+                    and placed[-1].tiles.tileId_end == ts):
+                placed[-1].tiles = MFMATileRange(
+                    ks, ke, placed[-1].tiles.tileId_start, te)
+            else:
+                placed.append(GRPlacement(
+                    tensor=tensor,
+                    mtIteration=mt_val,
+                    tiles=tiles,
+                    subIterK_slot=0,
+                    partition=pi,
+                    unrollId=unrollId,
+                ))
+
+        if cfg.hasScale and unrollId == 0:
+            slot = self._partitions[0][0]
+            placed = slot.grs_by_unroll.setdefault(unrollId, [])
+            for tensor, gran, num_tiles in (
+                    ('SA', cfg.grSA, cfg.numMFMATilesM),
+                    ('SB', cfg.grSB, cfg.numMFMATilesN)):
+                placed.append(GRPlacement(
+                    tensor=tensor,
+                    mtIteration=cfg.pgr,
+                    tiles=MFMATileRange(0, gran.k, 0, num_tiles),
+                    subIterK_slot=0,
+                    partition=0,
+                    unrollId=unrollId,
+                ))
+
     @pipeline_pass(Pass.GR)
     def place_GRs(self) -> PartitionSchedule:
         """Place Global Reads by iterating MFMAs across partitions.
@@ -1775,7 +1873,11 @@ class LogicalScheduler:
                                           self.config.offsetPartition, unrollId=uid)
             if self.config.grOrdering == GROrderingPolicy.CONSUMER_COHORT:
                 gr_list.sort(key=self._gr_entry_sort_key)
-            if uid > 0 and last_uid_slot is not None:
+            if (self.config.producerFrontiers
+                    == ProducerFrontierPolicy.STAGED_BY_FIRST_LR):
+                self._place_staged_consumer_grs(
+                    gr_list, unrollId=uid)
+            elif uid > 0 and last_uid_slot is not None:
                 self._distribute_grs(gr_list, gr_slot_bounds, unrollId=uid,
                                       allowed_slots=[last_uid_slot])
             else:
@@ -2157,6 +2259,10 @@ class LogicalScheduler:
 
     def _count_gr_atoms(self, gr: GRPlacement) -> int:
         """Count the number of atomic loads for a single GR placement."""
+        if gr.tensor in ('SA', 'SB'):
+            # Scale DTL emission publishes the complete scale tensor with one
+            # b128 request regardless of the logical tile range it covers.
+            return 1
         gr_gran = self._gr_granularity(gr.tensor)
         tiles = gr.tiles
         n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.mn
@@ -2461,6 +2567,87 @@ class LogicalScheduler:
 
         return counts
 
+    def _staged_wait_counts_by_unroll(
+            self, consumer_pi: int, consumer_slot: int,
+            dep_ref: Dep, publish_next_scales: bool = False
+            ) -> Tuple[WaitGRCounts, ...]:
+        """Derive cyclic VMEM suffixes from the final logical issue order.
+
+        The same logical graph emits scale requests only in C0.  Walking an
+        absolute flattened coordinate lets each unrolled body filter exactly
+        the scale requests that are absent from that physical copy.
+        """
+        numP = len(self._partitions)
+        numK = len(self._partitions[0])
+        flat_len = numP * numK
+        consumer_flat = consumer_pi * numK + consumer_slot
+
+        dep_flat = None
+        for p_idx, pslots in enumerate(self._partitions):
+            for k_idx, slot in enumerate(pslots):
+                if any(gr is dep_ref.ref for gr in slot.grs):
+                    dep_flat = p_idx * numK + k_idx
+                    break
+            if dep_flat is not None:
+                break
+        if dep_flat is None:
+            return (WaitGRCounts(),)
+
+        wraps = abs(dep_ref.mt_offset)
+        consumer_coord = consumer_flat
+        dep_coord = dep_flat - wraps * flat_len
+        if dep_coord >= consumer_coord:
+            dep_coord -= flat_len
+
+        num_bodies = (
+            self.config.scaleReuse if self.config.dualPeriodScale else 1)
+        result = []
+        for unroll_iter in range(num_bodies):
+            stop_ref = dep_ref.ref
+            if (publish_next_scales
+                    and self.config.dualPeriodScale
+                    and unroll_iter == num_bodies - 1):
+                dep_pi, dep_si = divmod(dep_flat, numK)
+                scale_producers = [
+                    gr for gr in self._partitions[dep_pi][dep_si].grs
+                    if gr.tensor in ('SA', 'SB')
+                ]
+                if scale_producers:
+                    # The final data body must also publish the scale epoch
+                    # consumed by the next C0; stop through the last scale
+                    # request rather than leaving it in the younger suffix.
+                    stop_ref = max(
+                        scale_producers, key=self._gr_sort_key)
+            counts = WaitGRCounts()
+            found = False
+            for coord in range(consumer_coord - 1, dep_coord - 1, -1):
+                pos = coord % flat_len
+                pi, si = divmod(pos, numK)
+                body_offset = coord // flat_len
+                body_unroll = (unroll_iter + body_offset) % num_bodies
+                for gr in sorted(
+                        self._partitions[pi][si].grs,
+                        key=self._gr_sort_key, reverse=True):
+                    if coord == dep_coord and gr is stop_ref:
+                        found = True
+                        break
+                    if (gr.tensor in ('SA', 'SB')
+                            and self.config.dualPeriodScale
+                            and body_unroll != 0):
+                        continue
+                    setattr(
+                        counts, gr.tensor,
+                        getattr(counts, gr.tensor)
+                        + self._count_gr_atoms(gr))
+                if found:
+                    break
+            if not found:
+                raise ValueError(
+                    "staged producer frontier could not reach its GR "
+                    f"dependency at P{consumer_pi}:K{consumer_slot}")
+            result.append(counts)
+        return tuple(result)
+
     @pipeline_pass(Pass.REMOVE_DEPS)
     def remove_cross_deps(self):
         """Replace cross-subIterK deps with wait preOps.
@@ -2474,6 +2661,27 @@ class LogicalScheduler:
 
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
+                staged_frontier_lr = None
+                staged_frontier_dep = None
+                if (self.config.producerFrontiers
+                        == ProducerFrontierPolicy.STAGED_BY_FIRST_LR):
+                    staged_candidates = [
+                        (lr, dep)
+                        for lr in slot.lrs if lr.tensor in ('A', 'B')
+                        for dep in lr.deps
+                        if isinstance(dep.ref, GRPlacement)
+                    ]
+                    if staged_candidates:
+                        staged_frontier_lr = staged_candidates[0][0]
+                        # Wait through the last producer in a multi-tensor
+                        # cohort (A-low follows B-low under B-before-A issue).
+                        staged_frontier_dep = max(
+                            (dep for _, dep in staged_candidates),
+                            key=lambda dep: (
+                                dep.ref.partition,
+                                dep.ref.subIterK_slot,
+                                self._gr_sort_key(dep.ref)))
+
                 # ── MFMA ──
                 if slot.mfma:
                     same, cross = self._split_deps(slot.mfma.deps, pi, slot.subIterK)
@@ -2493,7 +2701,30 @@ class LogicalScheduler:
                     lr.preOps = []
                     if gr_deps:
                         dep = gr_deps[0]
-                        if self._is_multi_du():
+                        if (self.config.producerFrontiers
+                                == ProducerFrontierPolicy.STAGED_BY_FIRST_LR
+                                and lr is staged_frontier_lr):
+                            counts_by_unroll = \
+                                self._staged_wait_counts_by_unroll(
+                                    pi, lr.subIterK_slot,
+                                    staged_frontier_dep,
+                                    publish_next_scales=any(
+                                        candidate_lr.mtIteration > 0
+                                        and candidate_lr.targetPartition == 0
+                                        for candidate_lr, _
+                                        in staged_candidates))
+                            lr.preOps.append(WaitGROp(
+                                wait_gr_counts=counts_by_unroll[0],
+                                wait_gr_counts_by_unroll=counts_by_unroll,
+                                has_sync=True,
+                                adjustVmcnt=True))
+                        elif (self.config.producerFrontiers
+                                == ProducerFrontierPolicy.STAGED_BY_FIRST_LR
+                                and staged_frontier_lr is not None):
+                            # One generated frontier publishes every LR cohort
+                            # in this slot.
+                            pass
+                        elif self._is_multi_du():
                             wait_dep = self._wait_gr_dep_for_lr(lr, dep)
                             is_cross = (wait_dep.ref.partition != pi
                                         or wait_dep.ref.subIterK_slot != lr.subIterK_slot)
@@ -2535,7 +2766,16 @@ class LogicalScheduler:
                     has_lr_dep = any(
                         isinstance(d.ref, LRPlacement)
                         for d in same + cross)
-                    gr.preOps = [WaitLROp(has_sync=True)] if has_lr_dep else []
+                    if (self.config.producerFrontiers
+                            == ProducerFrontierPolicy.STAGED_BY_FIRST_LR
+                            and gr.tensor in ('A', 'B')):
+                        # The partition-entry lgkmcnt proves the old data reads
+                        # complete; this partition's producer barrier is the
+                        # cross-wave overwrite publication.
+                        gr.preOps = []
+                    else:
+                        gr.preOps = (
+                            [WaitLROp(has_sync=True)] if has_lr_dep else [])
 
 
     def _per_uid_k(self, tensor: str) -> int:
@@ -2761,7 +3001,12 @@ class LogicalScheduler:
             # vmcnt and re-introduce the wrap-LR race).
             merged_force_drain = any(
                 getattr(op, 'force_drain', False) for op, _ in wait_gr_by_lr)
+            counts_by_unroll = (
+                wait_gr_by_lr[0][0].wait_gr_counts_by_unroll
+                if len(wait_gr_by_lr) == 1 else None
+            )
             result.append(WaitGROp(wait_gr_counts=merged_counts,
+                                   wait_gr_counts_by_unroll=counts_by_unroll,
                                    has_sync=has_wait_gr_sync,
                                    adjustVmcnt=adjust,
                                    force_drain=merged_force_drain))
@@ -3191,6 +3436,10 @@ class LogicalScheduler:
                     elif em.opType == 'wait_gr':
                         if src.wait_gr_counts is not None:
                             src.wait_gr_counts = WaitGRCounts()
+                        if src.wait_gr_counts_by_unroll is not None:
+                            src.wait_gr_counts_by_unroll = tuple(
+                                WaitGRCounts()
+                                for _ in src.wait_gr_counts_by_unroll)
                 part_ngll.append(self._rewire_before(new_emitted, removed))
             ngll.append(part_ngll)
 
@@ -3242,6 +3491,10 @@ class LogicalScheduler:
                 for em in new_emitted:
                     if em.opType == 'wait_gr' and em.moduleId not in removed:
                         em.source.wait_gr_counts = WaitGRCounts()
+                        if em.source.wait_gr_counts_by_unroll is not None:
+                            em.source.wait_gr_counts_by_unroll = tuple(
+                                WaitGRCounts()
+                                for _ in em.source.wait_gr_counts_by_unroll)
 
                 # Find Sync modules paired with removed wait_gr
                 for em in new_emitted:

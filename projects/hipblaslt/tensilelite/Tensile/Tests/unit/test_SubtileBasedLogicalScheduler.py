@@ -25,12 +25,14 @@ from Tensile.Components.Subtile.LogicalScheduler import (
     LogicalScheduler,
     MFMATileRange,
     Pass,
+    ProducerFrontierPolicy,
     ReadGranularity,
     SchedulerConfig,
     EmittedModule,
     LRPlacement,
     GRPlacement,
     Dep,
+    WaitGROp,
     WaitGRCounts,
     fmt_mt,
 )
@@ -558,7 +560,8 @@ class TestDualPeriodMXFP8NextPartition:
     @staticmethod
     def _make_cfg(scaleReuse=2, grSA_k=2,
                   grOrdering=GROrderingPolicy.LEGACY,
-                  grEpoch=GREpochPolicy.LEGACY_RING):
+                  grEpoch=GREpochPolicy.LEGACY_RING,
+                  producerFrontiers=ProducerFrontierPolicy.LEGACY):
         # 8-wave MT256x256: MIWT 8x4, MIWG 2x4 -> 8 M-tiles, 4 N-tiles.
         return SchedulerConfig(
             numMFMATilesM=8,
@@ -583,6 +586,7 @@ class TestDualPeriodMXFP8NextPartition:
             partitionOrder="n-major",
             grOrdering=grOrdering,
             grEpoch=grEpoch,
+            producerFrontiers=producerFrontiers,
             scaleReuse=scaleReuse,
         )
 
@@ -750,6 +754,113 @@ class TestDualPeriodMXFP8NextPartition:
                     gran.mn))
         assert sorted(second_atoms['A']) == list(range(cfg.numMFMATilesM))
         assert sorted(second_atoms['B']) == list(range(cfg.numMFMATilesN))
+
+    def test_staged_frontiers_follow_generated_2x2_geometry(self):
+        # Match the production MT256x256 logical grid: each partition owns
+        # one 4x4 quadrant, but no literal tile IDs are supplied to the policy.
+        cfg = SchedulerConfig(
+            numMFMATilesM=8,
+            numMFMATilesN=8,
+            numSubIterK=1,
+            lrA=ReadGranularity(mn=1, k=1),
+            lrB=ReadGranularity(mn=1, k=1),
+            grA=ReadGranularity(mn=1, k=1),
+            grB=ReadGranularity(mn=1, k=1),
+            lrSA=ReadGranularity(mn=2, k=1),
+            lrSB=ReadGranularity(mn=2, k=1),
+            grSA=ReadGranularity(mn=2, k=2),
+            grSB=ReadGranularity(mn=2, k=2),
+            partitionSizeM=4,
+            partitionSizeN=4,
+            pgr=2,
+            plr=0,
+            doubleBufferTensors=('A', 'B'),
+            prefetchNextPartition=True,
+            partitionOrder="n-major",
+            grOrdering=GROrderingPolicy.CONSUMER_COHORT,
+            grEpoch=GREpochPolicy.UNIFORM_PGR2,
+            producerFrontiers=ProducerFrontierPolicy.STAGED_BY_FIRST_LR,
+            scaleReuse=2,
+        )
+        sched = LogicalScheduler(cfg)
+        sched.build()
+
+        data_grs = [
+            [(gr.tensor, gr.mtIteration,
+              gr.tiles.tileId_start, gr.tiles.tileId_end)
+             for gr in slot.grs if gr.tensor in ('A', 'B')]
+            for slots in sched._partitions
+            for slot in slots
+        ]
+        assert data_grs == [
+            [('B', 2, 0, 4), ('A', 2, 0, 4)],
+            [('B', 2, 4, 8)],
+            [('A', 2, 4, 8)],
+            [],
+        ]
+
+        # The wrap cohort is prefetched in P2, one partition before the old
+        # P3 location, so P3 contains no A/B local reads.
+        wrap_lrs = [
+            [(lr.tensor, lr.mtIteration, lr.targetPartition)
+             for lr in slot.lrs
+             if lr.tensor in ('A', 'B') and lr.mtIteration > 0]
+            for slots in sched._partitions
+            for slot in slots
+        ]
+        assert wrap_lrs == [[], [], [('B', 1, 0), ('A', 1, 0)], []]
+
+        frontier_waits = []
+        for slots in sched._partitions:
+            waits = [
+                op
+                for slot in slots
+                for lr in slot.lrs
+                for op in lr.preOps
+                if isinstance(op, WaitGROp)
+                and op.wait_gr_counts_by_unroll is not None
+            ]
+            frontier_waits.append(waits)
+        assert [len(waits) for waits in frontier_waits] == [1, 1, 1, 0]
+
+        values = [
+            [(count.A, count.B, count.SA, count.SB)
+             for count in waits[0].wait_gr_counts_by_unroll]
+            for waits in frontier_waits[:3]
+        ]
+        assert values == [
+            [(12, 8, 0, 0), (12, 8, 1, 1)],
+            [(12, 12, 1, 1), (12, 12, 1, 1)],
+            [(8, 12, 1, 1), (8, 12, 0, 0)],
+        ]
+
+        # Each logical scale placement covers several scale groups, but its
+        # DTL emitter issues exactly one physical b128 request.
+        scale_grs = [
+            gr
+            for slots in sched._partitions
+            for slot in slots
+            for gr in slot.grs
+            if gr.tensor in ('SA', 'SB')
+        ]
+        assert len(scale_grs) == 2
+        assert [sched._count_gr_atoms(gr) for gr in scale_grs] == [1, 1]
+
+        # Exit-loop variants remove speculative GRs, so their per-copy wait
+        # ledgers must be drained along with the legacy scalar count.
+        sched.build_ngll()
+        sched.build_nll()
+        for variant in (sched._ngll_emitted, sched._nll_emitted):
+            for partition in variant:
+                for slot in partition:
+                    for em in slot:
+                        if (em.opType == 'wait_gr'
+                                and em.source.wait_gr_counts_by_unroll):
+                            assert all(
+                                (count.A, count.B, count.SA, count.SB)
+                                == (0, 0, 0, 0)
+                                for count
+                                in em.source.wait_gr_counts_by_unroll)
 
 
 class TestPlaceLRs:

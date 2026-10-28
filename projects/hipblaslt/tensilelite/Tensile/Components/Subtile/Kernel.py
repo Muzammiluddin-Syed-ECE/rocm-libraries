@@ -10,7 +10,8 @@ from functools import singledispatch
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 from .LogicalScheduler import (
       LogicalScheduler, SchedulerConfig as MFMASchedulerConfig,
-      ReadGranularity, GRPlacementStrategy, GROrderingPolicy, GREpochPolicy)
+      ReadGranularity, GRPlacementStrategy, GROrderingPolicy, GREpochPolicy,
+      ProducerFrontierPolicy)
 
 from ...Common import printWarning, roundUp, print2, DebugConfig, DataDirection, \
   INDEX_CHARS, IsaVersion
@@ -1468,6 +1469,9 @@ def mainLoop(writer, kernel):
           grEpoch=(GREpochPolicy.UNIFORM_PGR2
                    if schedulerPartitionPrefetch and schedulerPgr == 2
                    else GREpochPolicy.LEGACY_RING),
+          producerFrontiers=(ProducerFrontierPolicy.STAGED_BY_FIRST_LR
+                             if schedulerPartitionPrefetch and schedulerPgr == 2
+                             else ProducerFrontierPolicy.LEGACY),
           pgl=kernel.get("PrefetchGL2", 0),
           scaleReuse=(kernel.get("_ScaleReuseA", 1)
                       if kernel.get("_DualPeriodMXFP8") else 1),
