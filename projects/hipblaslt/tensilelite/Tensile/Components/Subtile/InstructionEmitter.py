@@ -209,6 +209,9 @@ class InstructionEmitter:
         """Emit LR (ds_read) instructions from LRPlacement."""
         module = Module()
         tensor = placement.tensor
+        active_bodies = getattr(placement, 'activeBodyIters', None)
+        if active_bodies is not None and unroll_iter not in active_bodies:
+            return []
         tile_map = placement.vgpr_tile_map[unroll_iter] if placement.vgpr_tile_map else {}
 
         if tensor in ('A', 'B'):
@@ -241,11 +244,12 @@ class InstructionEmitter:
         elif tensor in ('SA', 'SB'):
             # Dual-period MXFP8: one scale dword covers both K phases of the
             # epoch and lives in a globally-colored VGPR that survives across
-            # the scaleReuse-unrolled data iterations.  Read it once per epoch
-            # (unroll_iter 0); later data iterations reuse the resident dword
-            # (the MFMA selects the K-phase byte via op_sel_hi).  This keeps the
-            # steady-state epoch at exactly six scale ds_reads.
-            if getattr(self.config, 'dualPeriodScale', False) and unroll_iter > 0:
+            # the scaleReuse-unrolled data iterations.  The legacy policy
+            # reads at C0; the lifetime-staged policy supplies activeBodyIters
+            # and reloads the next epoch late in the final body copy.
+            if (active_bodies is None
+                    and getattr(self.config, 'dualPeriodScale', False)
+                    and unroll_iter > 0):
                 return []
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
             ti = self.tileInfoMap[tensor]
@@ -351,13 +355,16 @@ class InstructionEmitter:
         tensor = source.tensor
         tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
         module = Module()
+        active_bodies = getattr(source, 'activeBodyIters', None)
+        if active_bodies is not None and unroll_iter not in active_bodies:
+            return []
         # Dual-period MXFP8: the scale LDS double-buffer is driven on the 256-K
         # epoch cadence.  Toggle the scale LR read-half once per epoch
         # (unroll_iter 0) so it tracks the GR write-half swap; toggling on every
         # data iteration would net to zero over the epoch and leave the LR
         # reading the stale half.
         if tensor in ('SA', 'SB') and getattr(self.config, 'dualPeriodScale', False) \
-                and unroll_iter > 0:
+                and active_bodies is None and unroll_iter > 0:
             return []
         module.add(localReadLDSBufferSwap(tc, self.writer, self.kernel))
         return list(module.flatitems())

@@ -248,6 +248,12 @@ class ProducerFrontierPolicy(IntEnum):
     STAGED_BY_FIRST_LR = 1
 
 
+class ScaleLRPolicy(IntEnum):
+    """Cadence and lifetime policy for dual-period scale local reads."""
+    LEGACY_P0_EPOCH = 0
+    STAGED_CONSUMER_LIFETIME = 1
+
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the MFMATile-based scheduler."""
@@ -296,6 +302,7 @@ class SchedulerConfig:
     grOrdering: GROrderingPolicy = GROrderingPolicy.LEGACY
     grEpoch: GREpochPolicy = GREpochPolicy.LEGACY_RING
     producerFrontiers: ProducerFrontierPolicy = ProducerFrontierPolicy.LEGACY
+    scaleLRPolicy: ScaleLRPolicy = ScaleLRPolicy.LEGACY_P0_EPOCH
     pgl: int = 0              # Prefetch GL2 (0=off, 1 or 2 tiles ahead)
     # Dual-period MXFP8: how many data (DepthU) iterations share one 256-K scale
     # epoch.  >1 decouples the data K cadence from the scale cadence: numSubIterK
@@ -420,6 +427,7 @@ class SchedulerConfig:
         self.grEpoch = GREpochPolicy(self.grEpoch)
         self.producerFrontiers = ProducerFrontierPolicy(
             self.producerFrontiers)
+        self.scaleLRPolicy = ScaleLRPolicy(self.scaleLRPolicy)
         if self.grOrdering == GROrderingPolicy.CONSUMER_COHORT:
             assert self.prefetchNextPartition, \
                 "consumer-cohort GR ordering requires partition prefetch"
@@ -433,6 +441,11 @@ class SchedulerConfig:
         if self.producerFrontiers == ProducerFrontierPolicy.STAGED_BY_FIRST_LR:
             assert self.grEpoch == GREpochPolicy.UNIFORM_PGR2, \
                 "staged producer frontiers require uniform PGR2 epochs"
+        if self.scaleLRPolicy == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME:
+            assert self.dualPeriodScale, \
+                "staged scale LRs require a dual-period scale epoch"
+            assert self.producerFrontiers == ProducerFrontierPolicy.STAGED_BY_FIRST_LR, \
+                "staged scale LRs require staged producer frontiers"
 
         # plr=-1 auto-derives from pgr (legacy: 0 when pgr==0, else 1).
         if self.plr == -1:
@@ -568,6 +581,9 @@ class LRPlacement(Emittable):
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     postOps: List['BaseOp'] = field(default_factory=list)    # populated by insert_gr_lr_inc()
     vgpr_tile_map: List[dict] = field(default_factory=list)  # [{tileId: vgprTileId}] per unroll iter
+    activeBodyIters: Optional[Tuple[int, ...]] = None
+    scaleEpochRole: str = "current"
+    scheduleAfterMfma: bool = False
 
     def __post_init__(self):
         self.kind = 'lr'
@@ -715,6 +731,7 @@ class LRIncOp(BaseOp):
     # surfaced by print_emit_dep_order so an unroll-swap is not mistaken for a bug
     # when the following same-MT LR belongs to a different uid. Ignored by codegen.
     unrollId: int = 0
+    activeBodyIters: Optional[Tuple[int, ...]] = None
 
     def __post_init__(self):
         self.kind = 'lr_inc'
@@ -978,11 +995,24 @@ class LogicalScheduler:
                 if load[side]:
                     loaded_ranges[side] = {cur[side], nxt[side]}
 
-        if cfg.dualPeriodScale:
-            self._place_scale_LRs_epoch(partitions)
+        if cfg.scaleLRPolicy == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME:
+            # Generic partition placement treats scales like A/B and creates
+            # current/wrap reads.  The staged policy replaces that stream with
+            # one lifetime-derived next-epoch read per scale group.
+            for slots in partitions:
+                for slot in slots:
+                    slot.lrs = [
+                        lr for lr in slot.lrs
+                        if lr.tensor not in ('SA', 'SB')
+                    ]
         if (cfg.producerFrontiers
                 == ProducerFrontierPolicy.STAGED_BY_FIRST_LR):
             self._advance_wrap_data_reads(partitions)
+        if cfg.dualPeriodScale:
+            if cfg.scaleLRPolicy == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME:
+                self._place_scale_LRs_staged_lifetime(partitions)
+            else:
+                self._place_scale_LRs_epoch(partitions)
 
         self._partitions = partitions
         return partitions
@@ -1045,6 +1075,67 @@ class LogicalScheduler:
                 )
                 lr.partition = 0
                 slot0.lrs.append(lr)
+
+    def _place_scale_LRs_staged_lifetime(self, partitions):
+        """Reload next-epoch scales only after each current VGPR is dead.
+
+        Scale VMEM is issued once in C0 and published by the wrap-data
+        frontier.  The corresponding in-place scale ds_reads therefore emit
+        only in the final body copy (C1 for scaleReuse=2), no earlier than that
+        publication frontier and no earlier than the group's final MFMA use.
+        Groups whose final consumer is the placement partition are emitted
+        after that partition's last MFMA; already-dead groups can use its
+        ordinary inter-MFMA slots.
+        """
+        cfg = self.config
+        wrap_partitions = [
+            lr.partition
+            for slots in partitions
+            for slot in slots
+            for lr in slot.lrs
+            if (lr.tensor in ('A', 'B')
+                and lr.mtIteration > 0
+                and lr.targetPartition == 0)
+        ]
+        if not wrap_partitions:
+            raise ValueError(
+                "staged scale LRs require a generated wrap-data frontier")
+        publication_pi = min(wrap_partitions)
+        active_bodies = (cfg.scaleReuse - 1,)
+
+        for tensor, gran, numTiles in (
+                ('SA', cfg.lrSA, cfg.numMFMATilesM),
+                ('SB', cfg.lrSB, cfg.numMFMATilesN)):
+            side = 'A' if tensor == 'SA' else 'B'
+            for group_start in range(0, numTiles, gran.mn):
+                group_end = min(group_start + gran.mn, numTiles)
+                consumers = []
+                for pi, slots in enumerate(partitions):
+                    mfma = slots[0].mfma
+                    tile_range = mfma.tileA if side == 'A' else mfma.tileB
+                    if (group_start < tile_range.tileId_end
+                            and group_end > tile_range.tileId_start):
+                        consumers.append(pi)
+                if not consumers:
+                    raise ValueError(
+                        f"scale {tensor} group [{group_start},{group_end}) "
+                        "has no generated MFMA consumer")
+
+                last_consumer_pi = max(consumers)
+                placement_pi = max(publication_pi, last_consumer_pi)
+                lr = LRPlacement(
+                    tensor=tensor,
+                    mtIteration=1,
+                    tiles=MFMATileRange(
+                        0, cfg.numSubIterK, group_start, group_end),
+                    subIterK_slot=0,
+                    partition=placement_pi,
+                    targetPartition=0,
+                    activeBodyIters=active_bodies,
+                    scaleEpochRole="next",
+                    scheduleAfterMfma=(placement_pi == last_consumer_pi),
+                )
+                partitions[placement_pi][0].lrs.append(lr)
 
     def _create_partition_slots(self, cur: dict) -> List[SubIterKSlot]:
         """Create SubIterKSlots with MFMAs placed for one partition."""
@@ -1522,6 +1613,10 @@ class LogicalScheduler:
         self.compact_b_overlay = False
         self.unroll_factor = unroll_factor
         self.needs_unrolling = unroll_factor > 1
+        if cfg.scaleLRPolicy == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME:
+            assert self.unroll_factor == cfg.scaleReuse, \
+                (f"staged scale cadence requires unroll_factor="
+                 f"scaleReuse={cfg.scaleReuse}, got {self.unroll_factor}")
 
 
     # ── Place GRs ─────────────────────────────────────────
@@ -2887,7 +2982,8 @@ class LogicalScheduler:
                         last = last_lr[tensor]
                         last.postOps.append(
                             LRIncOp(tensor=tensor,
-                                    unrollId=last_lr_uid.get(tensor, 0)))
+                                    unrollId=last_lr_uid.get(tensor, 0),
+                                    activeBodyIters=last.activeBodyIters))
                     else:
                         first_uid = lr.tiles.subIterK_start // self._per_uid_k(tensor)
                         lr.preOps.append(LRIncOp(tensor=tensor, unrollId=first_uid))
@@ -3045,23 +3141,36 @@ class LogicalScheduler:
                     slot.lrs,
                     key=lambda lr: order.index(lr.tensor))
 
-                if len(ordered_lrs) > 1:
-                    # Merge preOps onto first LR
-                    lr_tensors = ([lr.tensor for lr in ordered_lrs]
+                # Lifetime-delayed scale reads form a separate path that must
+                # run after the partition's final MFMA.  Do not chain an early
+                # wrap/prefetch LR into that path or the whole producer
+                # frontier would be forced to the partition tail.
+                early_lrs = [
+                    lr for lr in ordered_lrs if not lr.scheduleAfterMfma]
+                late_lrs = [
+                    lr for lr in ordered_lrs if lr.scheduleAfterMfma]
+
+                def _chain_lrs(group):
+                    if len(group) <= 1:
+                        return
+                    lr_tensors = ([lr.tensor for lr in group]
                                   if self._is_multi_du() else None)
                     merged = self._merge_preops(
-                        [lr.preOps for lr in ordered_lrs],
-                        lr_tensors)
-                    ordered_lrs[0].preOps = merged
-                    for lr in ordered_lrs[1:]:
+                        [lr.preOps for lr in group], lr_tensors)
+                    group[0].preOps = merged
+                    for lr in group[1:]:
                         lr.preOps = []
+                    for i in range(1, len(group)):
+                        group[i].deps = [
+                            Dep(ref=group[i - 1], mt_offset=0)]
 
-                    # Build chain: each LR depends on the previous
-                    for i in range(1, len(ordered_lrs)):
-                        ordered_lrs[i].deps = [
-                            Dep(ref=ordered_lrs[i - 1], mt_offset=0)]
+                _chain_lrs(early_lrs)
+                _chain_lrs(late_lrs)
 
-                last_lr = ordered_lrs[-1] if ordered_lrs else None
+                # Only the ordinary LR path may feed same-partition GRs or
+                # current-body MFMAs.  The late path overwrites dead scale
+                # VGPRs after all matrix work and is emitted separately.
+                last_lr = early_lrs[-1] if early_lrs else None
 
                 # ── Phase 2: GR chain ──
                 ordered_grs = sorted(
@@ -3103,25 +3212,25 @@ class LogicalScheduler:
                 # ── Phase 3: Cross-group merge ──
                 # If any LR depends on a GR in this slot, merge into one
                 # chain: GR_group → LR_group to avoid shared parents.
-                if ordered_grs and ordered_lrs:
+                if ordered_grs and early_lrs:
                     slot_gr_set = set(id(gr) for gr in ordered_grs)
                     lr_has_gr_dep = any(
                         any(id(d.ref) in slot_gr_set for d in lr.deps)
-                        for lr in ordered_lrs if lr.deps)
+                        for lr in early_lrs if lr.deps)
                     if lr_has_gr_dep:
                         last_gr = ordered_grs[-1]
                         # Clear LR deps that point to GRs in this slot
-                        for lr in ordered_lrs:
+                        for lr in early_lrs:
                             lr.deps = [d for d in lr.deps
                                        if id(d.ref) not in slot_gr_set]
                         # First LR points to last GR
-                        ordered_lrs[0].deps = [
+                        early_lrs[0].deps = [
                             Dep(ref=last_gr, mt_offset=0)]
 
                 # ── Phase 4: Consolidate MFMA deps ──
                 # After chaining, MFMA only needs the tail of its dep chain.
                 if slot.mfma and last_lr is not None:
-                    slot_lr_set = set(id(lr) for lr in ordered_lrs)
+                    slot_lr_set = set(id(lr) for lr in early_lrs)
                     lr_deps = [d for d in slot.mfma.deps
                                if id(d.ref) in slot_lr_set]
                     if len(lr_deps) > 1:
@@ -3481,6 +3590,12 @@ class LogicalScheduler:
                         # Only multi-DU drops the MT-transition lr_inc in the NLL;
                         # single-DU PGR=2 keeps lr_inc (gr_inc is still dropped).
                         removed.add(em.moduleId)
+                    elif (em.opType == 'lr_inc'
+                          and src.activeBodyIters is not None):
+                        # Lifetime-staged scale LRs are mt=1 and are removed
+                        # from NLL; their paired LDS-half advance must leave
+                        # with them.
+                        removed.add(em.moduleId)
                     elif em.opType in ('gl2_prefetch', 'gl2_prefetch_inc'):
                         removed.add(em.moduleId)
 
@@ -3680,7 +3795,7 @@ class LogicalScheduler:
                                           unrollId=uid))
         return result
 
-    def _make_lr_all_tensors(self, tiles: dict) -> List[LRPlacement]:
+    def _make_lr_all_tensors(self, tiles: dict) -> List[Emittable]:
         """Create LR placements for first partition.
 
         tiles: per-tensor MFMATileRange, e.g. {'A': MFMATileRange(0, k, mn0, mn1), ...}
@@ -3697,8 +3812,31 @@ class LogicalScheduler:
                 tiles=tiles[tensor],
                 subIterK_slot=0, partition=0)
             if tensor in first_mfma.vgpr_tile_maps:
-                lr.vgpr_tile_map = copy.deepcopy(first_mfma.vgpr_tile_maps[tensor])
+                if (tensor in ('SA', 'SB')
+                        and self.config.scaleLRPolicy
+                        == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME):
+                    # The staged main loop has no C0 scale LR, so bootstrap
+                    # every scale group here.  Merge the globally-colored
+                    # scale maps from all generated partitions.
+                    merged = [
+                        {} for _ in
+                        range(len(first_mfma.vgpr_tile_maps[tensor]))
+                    ]
+                    for part_slots in self._partitions:
+                        maps = part_slots[0].mfma.vgpr_tile_maps.get(tensor, [])
+                        for ui, tile_map in enumerate(maps):
+                            merged[ui].update(tile_map)
+                    lr.vgpr_tile_map = copy.deepcopy(merged)
+                else:
+                    lr.vgpr_tile_map = copy.deepcopy(
+                        first_mfma.vgpr_tile_maps[tensor])
             placements.append(lr)
+        if (self.config.scaleLRPolicy
+                == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME):
+            placements.extend([
+                LRIncOp(tensor='SA', activeBodyIters=(0,)),
+                LRIncOp(tensor='SB', activeBodyIters=(0,)),
+            ])
         return placements
 
     def _make_depops_all_tensors(self, cls) -> List[BaseOp]:
@@ -3813,8 +3951,9 @@ class LogicalScheduler:
         """Create MT1 GRs for the PGR=2 preloop, ordered to match the mainloop.
 
         Covers partitions 0..offsetPartition-1 in legacy mode.  Uniform PGR2
-        mode seeds a complete second A/B epoch while retaining the independent
-        legacy scale range.  Each unique tensor/range appears exactly once.
+        mode seeds a complete second A/B epoch.  The legacy scale policy also
+        retains its independent scale range; lifetime staging leaves the next
+        scale epoch to C0.  Each unique tensor/range appears exactly once.
 
         For multi-DU data tensors (numUnroll > 1), each uid only emits GRs
         for the K slots that belong to it (uid u → k in [u*grGran.k, (u+1)*grGran.k)).
@@ -3843,7 +3982,9 @@ class LogicalScheduler:
                     for tensor, (t_start, t_end), gr_gran in items:
                         if (cfg.grEpoch == GREpochPolicy.UNIFORM_PGR2
                                 and tensor in ('SA', 'SB')
-                                and pi >= cfg.offsetPartition):
+                                and (cfg.scaleLRPolicy
+                                     == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME
+                                     or pi >= cfg.offsetPartition)):
                             continue
                         nUnroll = cfg.numUnroll.get(tensor, 1)
                         if uid >= nUnroll:
@@ -3899,7 +4040,9 @@ class LogicalScheduler:
                 for tensor, (t_start, t_end), gr_gran in items:
                     if (cfg.grEpoch == GREpochPolicy.UNIFORM_PGR2
                             and tensor in ('SA', 'SB')
-                            and pi >= cfg.offsetPartition):
+                            and (cfg.scaleLRPolicy
+                                 == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME
+                                 or pi >= cfg.offsetPartition)):
                         continue
                     nUnroll = cfg.numUnroll.get(tensor, 1)
                     if uid >= nUnroll:
@@ -4022,8 +4165,19 @@ class LogicalScheduler:
             'B':  MFMATileRange(0, cfg.lrB.k, *part0['B']),
         }
         if cfg.hasScale:
-            lr_tiles['SA'] = MFMATileRange(0, cfg.lrSA.k, *part0['A'])
-            lr_tiles['SB'] = MFMATileRange(0, cfg.lrSB.k, *part0['B'])
+            if cfg.scaleLRPolicy == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME:
+                # With C0 scale LRs removed, preloop must seed every current
+                # scale VGPR and advance the scale read half for the late C1
+                # next-epoch reload.
+                lr_tiles['SA'] = MFMATileRange(
+                    0, cfg.lrSA.k, 0, cfg.numMFMATilesM)
+                lr_tiles['SB'] = MFMATileRange(
+                    0, cfg.lrSB.k, 0, cfg.numMFMATilesN)
+            else:
+                lr_tiles['SA'] = MFMATileRange(
+                    0, cfg.lrSA.k, *part0['A'])
+                lr_tiles['SB'] = MFMATileRange(
+                    0, cfg.lrSB.k, *part0['B'])
 
         initC_op = self._make_initC_op()
 
@@ -4067,8 +4221,17 @@ class LogicalScheduler:
                     initial_epoch.extend(
                         self._make_preloop_initial_grs_uid(
                             0, all_tiles, uid))
-                    initial_epoch.extend(
-                        self._make_depops_uid(GRIncOp, uid))
+                    initial_incs = self._make_depops_uid(GRIncOp, uid)
+                    if (cfg.scaleLRPolicy
+                            == ScaleLRPolicy.STAGED_CONSUMER_LIFETIME):
+                        # Keep the scale SRD/write half on epoch n until C0:
+                        # C0's normal GRInc then advances exactly once to n+1
+                        # before issuing the sole next-scale DTL request.
+                        initial_incs = [
+                            op for op in initial_incs
+                            if op.tensor not in ('SA', 'SB')
+                        ]
+                    initial_epoch.extend(initial_incs)
                     second_epoch.extend(
                         self._make_preloop_mt1_grs_uid(uid))
 

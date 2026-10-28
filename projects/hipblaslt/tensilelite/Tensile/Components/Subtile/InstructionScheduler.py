@@ -496,6 +496,8 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
       - Before dependencies are respected at module order level.
       - Minimm distance between ds_read and it waitcnt (hardcoded for now)
       - Module-internal instruction order is preserved.
+      - Paths containing a lifetime-delayed LR are emitted after the final
+        MFMA instead of consuming an inter-MFMA slot.
       - GR path is spread as much as possible across remaining valid slots.
 
     When multiDU is False (single-DU / legacy path):
@@ -517,8 +519,25 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     mfmaIdx, pathOrders, preMfmaOrders = extractPathsFromBeforeDeps(emittedModules)
     mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
 
+    postMfmaOrders = []
+    regularOrders = []
+    for order in pathOrders:
+        if any(getattr(emittedModules[mid].source,
+                       "scheduleAfterMfma", False)
+               for mid in order):
+            postMfmaOrders.append(order)
+        else:
+            regularOrders.append(order)
+    pathOrders = regularOrders
+
     def _emitPreMfma(result):
         for order in preMfmaOrders:
+            for mid in order:
+                for inst in emittedModules[mid].instructions:
+                    result.add(inst)
+
+    def _emitPostMfma(result):
+        for order in postMfmaOrders:
             for mid in order:
                 for inst in emittedModules[mid].instructions:
                     result.add(inst)
@@ -533,6 +552,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
             for mid in order:
                 for inst in emittedModules[mid].instructions:
                     result.add(inst)
+        _emitPostMfma(result)
         return result
 
     paths = _classifyPaths(pathOrders, emittedModules)
@@ -565,6 +585,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
     scheduled = Module()
     _emitPreMfma(scheduled)
     scheduled.add(placer.assemble(mfmas))
+    _emitPostMfma(scheduled)
 
     # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
     # that the scheduler placed before it within this subIterK.

@@ -27,6 +27,7 @@ from Tensile.Components.Subtile.LogicalScheduler import (
     Pass,
     ProducerFrontierPolicy,
     ReadGranularity,
+    ScaleLRPolicy,
     SchedulerConfig,
     EmittedModule,
     LRPlacement,
@@ -561,7 +562,8 @@ class TestDualPeriodMXFP8NextPartition:
     def _make_cfg(scaleReuse=2, grSA_k=2,
                   grOrdering=GROrderingPolicy.LEGACY,
                   grEpoch=GREpochPolicy.LEGACY_RING,
-                  producerFrontiers=ProducerFrontierPolicy.LEGACY):
+                  producerFrontiers=ProducerFrontierPolicy.LEGACY,
+                  scaleLRPolicy=ScaleLRPolicy.LEGACY_P0_EPOCH):
         # 8-wave MT256x256: MIWT 8x4, MIWG 2x4 -> 8 M-tiles, 4 N-tiles.
         return SchedulerConfig(
             numMFMATilesM=8,
@@ -587,6 +589,7 @@ class TestDualPeriodMXFP8NextPartition:
             grOrdering=grOrdering,
             grEpoch=grEpoch,
             producerFrontiers=producerFrontiers,
+            scaleLRPolicy=scaleLRPolicy,
             scaleReuse=scaleReuse,
         )
 
@@ -619,6 +622,188 @@ class TestDualPeriodMXFP8NextPartition:
         # scaleReuse=1 is the legacy single-period behavior (not dual-period).
         cfg = self._make_cfg(scaleReuse=1, grSA_k=1)
         assert cfg.dualPeriodScale is False
+
+    @staticmethod
+    def _staged_scale_kwargs():
+        return dict(
+            grOrdering=GROrderingPolicy.CONSUMER_COHORT,
+            grEpoch=GREpochPolicy.UNIFORM_PGR2,
+            producerFrontiers=ProducerFrontierPolicy.STAGED_BY_FIRST_LR,
+            scaleLRPolicy=ScaleLRPolicy.STAGED_CONSUMER_LIFETIME,
+        )
+
+    def test_staged_scale_lrs_follow_group_lifetimes_8x4(self):
+        cfg = self._make_cfg(**self._staged_scale_kwargs())
+        sched = LogicalScheduler(cfg)
+        sched.build()
+
+        got = []
+        for pi, slots in enumerate(sched._partitions):
+            for lr in slots[0].lrs:
+                if lr.tensor in ('SA', 'SB'):
+                    got.append((
+                        pi, lr.tensor,
+                        lr.tiles.tileId_start, lr.tiles.tileId_end,
+                        lr.mtIteration, lr.activeBodyIters,
+                        lr.scheduleAfterMfma))
+
+        # The C1 P2 data frontier publishes both scale tensors.  SA-low is
+        # already dead after P1 and may issue in P2 slots; SB-low remains live
+        # through P2, while every high group remains live through P3.
+        assert got == [
+            (2, 'SA', 0, 2, 1, (1,), False),
+            (2, 'SA', 2, 4, 1, (1,), False),
+            (2, 'SB', 0, 2, 1, (1,), True),
+            (3, 'SA', 4, 6, 1, (1,), True),
+            (3, 'SA', 6, 8, 1, (1,), True),
+            (3, 'SB', 2, 4, 1, (1,), True),
+        ]
+
+    def test_staged_scale_lrs_generalize_to_8x8(self):
+        cfg = SchedulerConfig(
+            numMFMATilesM=8,
+            numMFMATilesN=8,
+            numSubIterK=1,
+            lrA=ReadGranularity(mn=1, k=1),
+            lrB=ReadGranularity(mn=1, k=1),
+            grA=ReadGranularity(mn=1, k=1),
+            grB=ReadGranularity(mn=1, k=1),
+            lrSA=ReadGranularity(mn=2, k=1),
+            lrSB=ReadGranularity(mn=2, k=1),
+            grSA=ReadGranularity(mn=2, k=2),
+            grSB=ReadGranularity(mn=2, k=2),
+            partitionSizeM=4,
+            partitionSizeN=4,
+            pgr=2,
+            plr=0,
+            doubleBufferTensors=('A', 'B'),
+            prefetchNextPartition=True,
+            partitionOrder="n-major",
+            scaleReuse=2,
+            **self._staged_scale_kwargs(),
+        )
+        sched = LogicalScheduler(cfg)
+        sched.build()
+
+        got = [
+            (pi, lr.tensor, lr.tiles.tileId_start, lr.scheduleAfterMfma)
+            for pi, slots in enumerate(sched._partitions)
+            for lr in slots[0].lrs
+            if lr.tensor in ('SA', 'SB')
+        ]
+        assert got == [
+            (2, 'SA', 0, False),
+            (2, 'SA', 2, False),
+            (2, 'SB', 0, True),
+            (2, 'SB', 2, True),
+            (3, 'SA', 4, True),
+            (3, 'SA', 6, True),
+            (3, 'SB', 4, True),
+            (3, 'SB', 6, True),
+        ]
+
+    def test_staged_scale_lrs_generalize_to_transposed_4x8(self):
+        cfg = SchedulerConfig(
+            numMFMATilesM=4,
+            numMFMATilesN=8,
+            numSubIterK=1,
+            lrA=ReadGranularity(mn=1, k=1),
+            lrB=ReadGranularity(mn=1, k=1),
+            grA=ReadGranularity(mn=1, k=1),
+            grB=ReadGranularity(mn=1, k=1),
+            lrSA=ReadGranularity(mn=2, k=1),
+            lrSB=ReadGranularity(mn=2, k=1),
+            grSA=ReadGranularity(mn=2, k=2),
+            grSB=ReadGranularity(mn=2, k=2),
+            partitionSizeM=2,
+            partitionSizeN=4,
+            pgr=2,
+            plr=0,
+            doubleBufferTensors=('A', 'B'),
+            prefetchNextPartition=True,
+            partitionOrder="n-major",
+            scaleReuse=2,
+            **self._staged_scale_kwargs(),
+        )
+        sched = LogicalScheduler(cfg)
+        sched.build()
+
+        got = [
+            (pi, lr.tensor, lr.tiles.tileId_start, lr.scheduleAfterMfma)
+            for pi, slots in enumerate(sched._partitions)
+            for lr in slots[0].lrs
+            if lr.tensor in ('SA', 'SB')
+        ]
+        assert got == [
+            (2, 'SA', 0, False),
+            (2, 'SB', 0, True),
+            (2, 'SB', 2, True),
+            (3, 'SA', 2, True),
+            (3, 'SB', 4, True),
+            (3, 'SB', 6, True),
+        ]
+
+    def test_staged_scale_preloop_bootstraps_full_epoch_and_advances(self):
+        cfg = self._make_cfg(**self._staged_scale_kwargs())
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        preloop = sched.build_preloop()[0][0]
+
+        scale_grs = [
+            em.source for em in preloop
+            if em.opType == 'gr' and em.source.tensor in ('SA', 'SB')
+        ]
+        # Only current epoch n is fetched in the preloop.  C0 owns the first
+        # scale-pointer advance and the sole request for epoch n+1.
+        assert [(gr.tensor, gr.mtIteration) for gr in scale_grs] == [
+            ('SA', 0), ('SB', 0)]
+        assert not any(
+            em.opType == 'gr_inc'
+            and em.source.tensor in ('SA', 'SB')
+            for em in preloop)
+
+        scale_lrs = [
+            em.source for em in preloop
+            if em.opType == 'lr' and em.source.tensor in ('SA', 'SB')
+        ]
+        assert [
+            (lr.tensor, lr.tiles.tileId_start, lr.tiles.tileId_end)
+            for lr in scale_lrs
+        ] == [('SA', 0, 8), ('SB', 0, 4)]
+        assert [set(lr.vgpr_tile_map[0]) for lr in scale_lrs] == [
+            {0, 2, 4, 6}, {0, 2}]
+
+        scale_incs = [
+            em.source for em in preloop
+            if em.opType == 'lr_inc'
+            and em.source.tensor in ('SA', 'SB')
+        ]
+        assert [(op.tensor, op.activeBodyIters) for op in scale_incs] == [
+            ('SA', (0,)), ('SB', (0,))]
+
+    def test_staged_scale_exit_variants_keep_inc_with_its_lr(self):
+        cfg = self._make_cfg(**self._staged_scale_kwargs())
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.build_ngll()
+        sched.build_nll()
+
+        nll_ops = [
+            em
+            for partition in sched._nll_emitted
+            for slot in partition
+            for em in slot
+        ]
+        assert not any(
+            em.opType == 'lr'
+            and em.source.tensor in ('SA', 'SB')
+            and em.source.mtIteration == 1
+            for em in nll_ops)
+        assert not any(
+            em.opType == 'lr_inc'
+            and em.source.tensor in ('SA', 'SB')
+            and em.source.activeBodyIters is not None
+            for em in nll_ops)
 
     def test_consumer_cohort_mainloop_order_is_geometry_derived(self):
         cfg = self._make_cfg(

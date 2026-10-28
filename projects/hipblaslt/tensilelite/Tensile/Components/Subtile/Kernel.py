@@ -11,7 +11,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 from .LogicalScheduler import (
       LogicalScheduler, SchedulerConfig as MFMASchedulerConfig,
       ReadGranularity, GRPlacementStrategy, GROrderingPolicy, GREpochPolicy,
-      ProducerFrontierPolicy)
+      ProducerFrontierPolicy, ScaleLRPolicy)
 
 from ...Common import printWarning, roundUp, print2, DebugConfig, DataDirection, \
   INDEX_CHARS, IsaVersion
@@ -1472,6 +1472,11 @@ def mainLoop(writer, kernel):
           producerFrontiers=(ProducerFrontierPolicy.STAGED_BY_FIRST_LR
                              if schedulerPartitionPrefetch and schedulerPgr == 2
                              else ProducerFrontierPolicy.LEGACY),
+          scaleLRPolicy=(ScaleLRPolicy.STAGED_CONSUMER_LIFETIME
+                         if (schedulerPartitionPrefetch
+                             and schedulerPgr == 2
+                             and kernel.get("_DualPeriodMXFP8"))
+                         else ScaleLRPolicy.LEGACY_P0_EPOCH),
           pgl=kernel.get("PrefetchGL2", 0),
           scaleReuse=(kernel.get("_ScaleReuseA", 1)
                       if kernel.get("_DualPeriodMXFP8") else 1),
