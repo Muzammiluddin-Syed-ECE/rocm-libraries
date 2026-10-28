@@ -217,6 +217,20 @@ class GRPlacementStrategy(IntEnum):
     BUNCHED = 1
 
 
+class GROrderingPolicy(IntEnum):
+    """Issue order for direct-to-LDS global-read atoms.
+
+    LEGACY preserves the historical MT-first A/B/scale ordering.
+    CONSUMER_COHORT orders A/B atoms by the first generated compute
+    partition that consumes their LDS range.  The policy is cyclic: an n+2
+    atom needed by partition zero precedes an n+1 atom first needed by a
+    later partition.  This is the ordering required for useful counted
+    producer frontiers.
+    """
+    LEGACY = 0
+    CONSUMER_COHORT = 1
+
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the MFMATile-based scheduler."""
@@ -262,6 +276,7 @@ class SchedulerConfig:
     # c00,c01,c10,c11 order (N varies fastest).
     partitionOrder: str = "m-major"
     grPlacement: GRPlacementStrategy = GRPlacementStrategy.SPREAD
+    grOrdering: GROrderingPolicy = GROrderingPolicy.LEGACY
     pgl: int = 0              # Prefetch GL2 (0=off, 1 or 2 tiles ahead)
     # Dual-period MXFP8: how many data (DepthU) iterations share one 256-K scale
     # epoch.  >1 decouples the data K cadence from the scale cadence: numSubIterK
@@ -382,6 +397,10 @@ class SchedulerConfig:
         self._prefixN = self._build_prefix(self._partitionSizesN)
         assert self.partitionOrder in ("m-major", "n-major"), \
             f"partitionOrder must be m-major or n-major, got {self.partitionOrder}"
+        self.grOrdering = GROrderingPolicy(self.grOrdering)
+        if self.grOrdering == GROrderingPolicy.CONSUMER_COHORT:
+            assert self.prefetchNextPartition, \
+                "consumer-cohort GR ordering requires partition prefetch"
 
         # plr=-1 auto-derives from pgr (legacy: 0 when pgr==0, else 1).
         if self.plr == -1:
@@ -817,6 +836,39 @@ class LogicalScheduler:
         piM, piN = cfg.partition_coords(pi)
         return {'A': (cfg._prefixM[piM], cfg._prefixM[piM + 1]),
                 'B': (cfg._prefixN[piN], cfg._prefixN[piN + 1])}
+
+    def _first_consumer_partition(self, tensor: str,
+                                  tiles: MFMATileRange) -> int:
+        """Return the first generated partition consuming an A/B tile range."""
+        assert tensor in ('A', 'B')
+        for pi in range(self.config.numPartitions):
+            start, end = self._partition_tile_range(pi)[tensor]
+            if tiles.tileId_start < end and start < tiles.tileId_end:
+                return pi
+        raise ValueError(
+            f"GR {tensor} tiles {tiles.fmt_tiles()} have no compute consumer")
+
+    def _consumer_cohort_key(self, tensor: str, mtIteration: int,
+                             tiles: MFMATileRange, unrollId: int = 0) -> tuple:
+        """Sort A/B by first consumer, using B-before-A inside one cohort.
+
+        Scales intentionally remain after the data cohorts in the data-only
+        ordering phase.  Their cadence and lifetime-aware placement are a
+        separate policy because a scale write can alias LDS and VGPR values
+        that remain live much longer than the corresponding data operand.
+        """
+        if tensor in ('A', 'B'):
+            rank = self._first_consumer_partition(tensor, tiles)
+            tensor_rank = 0 if tensor == 'B' else 1
+            return (0, rank, tensor_rank, mtIteration,
+                    tiles.subIterK_start, unrollId, tiles.tileId_start)
+        return (1, self._TENSOR_ORDER[tensor], mtIteration,
+                tiles.subIterK_start, unrollId, tiles.tileId_start)
+
+    def _gr_entry_sort_key(self, entry: tuple) -> tuple:
+        tensor, mt, ts, te, ks, ke, _ = entry
+        tiles = MFMATileRange(ks, ke, ts, te)
+        return self._consumer_cohort_key(tensor, mt, tiles)
 
     @pipeline_pass(Pass.LR)
     def place_LRs(self) -> LogicalSchedule:
@@ -1675,6 +1727,8 @@ class LogicalScheduler:
         for uid in range(maxUnroll):
             gr_list = self._build_gr_list(part_ranges, offsetMT,
                                           self.config.offsetPartition, unrollId=uid)
+            if self.config.grOrdering == GROrderingPolicy.CONSUMER_COHORT:
+                gr_list.sort(key=self._gr_entry_sort_key)
             if uid > 0 and last_uid_slot is not None:
                 self._distribute_grs(gr_list, gr_slot_bounds, unrollId=uid,
                                       allowed_slots=[last_uid_slot])
@@ -2590,17 +2644,17 @@ class LogicalScheduler:
     _TENSOR_ORDER = {'A': 0, 'B': 1, 'SA': 2, 'SB': 3}
     _LR_GR_ORDER = ['A', 'B', 'SA', 'SB']
 
-    @staticmethod
-    def _gr_sort_key(gr: GRPlacement) -> tuple:
+    def _gr_sort_key(self, gr: GRPlacement) -> tuple:
         """Sort key for deterministic GR ordering within a subIterK slot.
 
-        Priority (most significant first):
-          1. MT iteration      — earlier MT loads first (n+1 before n+2)
-          2. subIterK start    — lower min K first
-          3. Tensor            — A, B, SA, SB (hardcoded order)
-          4. Unroll id         — lower uid first
-          5. Tile id start     — lower tile range first
+        Legacy priority is MT, K, tensor, uid, tile.  Consumer-cohort mode
+        instead keeps the cyclic first-consumer order established before
+        distribution, including n+2-before-n+1 when partition zero consumes
+        the n+2 range first.
         """
+        if self.config.grOrdering == GROrderingPolicy.CONSUMER_COHORT:
+            return self._consumer_cohort_key(
+                gr.tensor, gr.mtIteration, gr.tiles, gr.unrollId)
         return (gr.mtIteration,
                 gr.tiles.subIterK_start,
                 LogicalScheduler._TENSOR_ORDER[gr.tensor],
@@ -3383,6 +3437,48 @@ class LogicalScheduler:
                                       unrollId=uid))
         return result
 
+    def _make_preloop_initial_grs_uid(self, mt: int, tiles: dict,
+                                       uid: int) -> List[GRPlacement]:
+        """Create one preloop epoch in the configured physical issue order.
+
+        Consumer-cohort mode derives atomic ranges from the generated
+        partition geometry instead of splitting at a fixed tile index.  The
+        ``tiles`` argument remains part of the interface to mirror the legacy
+        helper; the preloop callers pass the complete macrotile.
+        """
+        if self.config.grOrdering != GROrderingPolicy.CONSUMER_COHORT:
+            return self._make_gr_all_tensors_uid(mt, tiles, uid)
+
+        assert tiles['A'].tileId_start == 0
+        assert tiles['A'].tileId_end == self.config.numMFMATilesM
+        assert tiles['B'].tileId_start == 0
+        assert tiles['B'].tileId_end == self.config.numMFMATilesN
+
+        part_ranges = [
+            self._partition_tile_range(pi)
+            for pi in range(self.config.numPartitions)
+        ]
+        entries = self._build_gr_list(
+            part_ranges, mt, 0, unrollId=uid)
+        entries.sort(key=self._gr_entry_sort_key)
+
+        result = []
+        for tensor, mt_val, ts, te, ks, ke, _ in entries:
+            tr = MFMATileRange(ks, ke, ts, te)
+            partition = (
+                self._first_consumer_partition(tensor, tr)
+                if tensor in ('A', 'B') else 0
+            )
+            result.append(GRPlacement(
+                tensor=tensor,
+                mtIteration=mt_val,
+                tiles=tr,
+                subIterK_slot=ks,
+                partition=partition,
+                unrollId=uid,
+            ))
+        return result
+
     def _make_depops_uid(self, cls, uid: int) -> List[BaseOp]:
         """Create a BaseOp subclass instance for a single uid across all tensors.
 
@@ -3447,6 +3543,8 @@ class LogicalScheduler:
                             partition=pi,
                             unrollId=uid,
                         ))
+        if cfg.grOrdering == GROrderingPolicy.CONSUMER_COHORT:
+            result.sort(key=self._gr_sort_key)
         return result
 
     def _make_preloop_mt1_grs_uid(self, uid: int) -> List[GRPlacement]:
@@ -3492,6 +3590,8 @@ class LogicalScheduler:
                         partition=pi,
                         unrollId=uid,
                     ))
+        if cfg.grOrdering == GROrderingPolicy.CONSUMER_COHORT:
+            result.sort(key=self._gr_sort_key)
         return result
 
     def _make_initC_op(self) -> InlineModuleOp:
@@ -3565,7 +3665,8 @@ class LogicalScheduler:
             if maxUnroll > 1:
                 preloop_ops = []
                 for uid in range(maxUnroll):
-                    preloop_ops.extend(self._make_gr_all_tensors_uid(0, all_tiles, uid))
+                    preloop_ops.extend(
+                        self._make_preloop_initial_grs_uid(0, all_tiles, uid))
                     preloop_ops.extend(self._make_depops_uid(GRIncOp, uid))
                 emitted = self._to_emitted([
                     *preloop_ops,
@@ -3577,7 +3678,7 @@ class LogicalScheduler:
                 ])
             else:
                 emitted = self._to_emitted([
-                    *self._make_gr_all_tensors(0, all_tiles),
+                    *self._make_preloop_initial_grs_uid(0, all_tiles, 0),
                     initC_op,
                     WaitGROp(wait_gr_counts=WaitGRCounts()),
                     SyncOp(),
@@ -3595,7 +3696,8 @@ class LogicalScheduler:
             if maxUnroll > 1:
                 preloop_ops = []
                 for uid in range(maxUnroll):
-                    preloop_ops.extend(self._make_gr_all_tensors_uid(0, all_tiles, uid))
+                    preloop_ops.extend(
+                        self._make_preloop_initial_grs_uid(0, all_tiles, uid))
                     preloop_ops.extend(self._make_depops_uid(GRIncOp, uid))
                 mt1_ops = []
                 for uid in range(maxUnroll):
@@ -3614,7 +3716,7 @@ class LogicalScheduler:
                 ])
             else:
                 emitted = self._to_emitted([
-                    *self._make_gr_all_tensors(0, all_tiles),
+                    *self._make_preloop_initial_grs_uid(0, all_tiles, 0),
                     *self._make_depops_all_tensors(GRIncOp),
                     initC_op,
                     WaitGROp(wait_gr_counts=WaitGRCounts()),

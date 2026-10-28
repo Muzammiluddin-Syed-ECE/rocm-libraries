@@ -20,6 +20,7 @@ from Tensile.Components.Subtile.Kernel import (
 )
 from Tensile.Components.Subtile.LogicalScheduler import (
     GRPlacementStrategy,
+    GROrderingPolicy,
     LogicalScheduler,
     MFMATileRange,
     Pass,
@@ -554,7 +555,8 @@ class TestDualPeriodMXFP8NextPartition:
     """
 
     @staticmethod
-    def _make_cfg(scaleReuse=2, grSA_k=2):
+    def _make_cfg(scaleReuse=2, grSA_k=2,
+                  grOrdering=GROrderingPolicy.LEGACY):
         # 8-wave MT256x256: MIWT 8x4, MIWG 2x4 -> 8 M-tiles, 4 N-tiles.
         return SchedulerConfig(
             numMFMATilesM=8,
@@ -577,6 +579,7 @@ class TestDualPeriodMXFP8NextPartition:
             doubleBufferTensors=('A', 'B'),
             prefetchNextPartition=True,
             partitionOrder="n-major",
+            grOrdering=grOrdering,
             scaleReuse=scaleReuse,
         )
 
@@ -609,6 +612,67 @@ class TestDualPeriodMXFP8NextPartition:
         # scaleReuse=1 is the legacy single-period behavior (not dual-period).
         cfg = self._make_cfg(scaleReuse=1, grSA_k=1)
         assert cfg.dualPeriodScale is False
+
+    def test_consumer_cohort_mainloop_order_is_geometry_derived(self):
+        cfg = self._make_cfg(
+            grOrdering=GROrderingPolicy.CONSUMER_COHORT)
+        sched = LogicalScheduler(cfg)
+        sched.build(stop_after=Pass.GR)
+
+        atoms = []
+        for slots in sched._partitions:
+            for slot in slots:
+                for gr in sorted(slot.grs, key=sched._gr_sort_key):
+                    if gr.tensor not in ('A', 'B'):
+                        continue
+                    gran = cfg.grA if gr.tensor == 'A' else cfg.grB
+                    atoms.extend(
+                        (gr.tensor, gr.mtIteration, tile)
+                        for tile in range(
+                            gr.tiles.tileId_start,
+                            gr.tiles.tileId_end,
+                            gran.mn)
+                    )
+
+        # N-major 8x4 grid split 4x2:
+        # next P0 low data (n+2), then P1 B-high, then P2 A-high.
+        assert atoms == [
+            ('B', 2, 0), ('B', 2, 1),
+            ('A', 2, 0), ('A', 2, 1), ('A', 2, 2), ('A', 2, 3),
+            ('B', 1, 2), ('B', 1, 3),
+            ('A', 1, 4), ('A', 1, 5), ('A', 1, 6), ('A', 1, 7),
+        ]
+
+    def test_consumer_cohort_preloop_splits_full_epoch_by_first_use(self):
+        cfg = self._make_cfg(
+            grOrdering=GROrderingPolicy.CONSUMER_COHORT)
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        preloop = sched.build_preloop()[0][0]
+
+        data_ranges = [
+            (em.source.tensor,
+             em.source.tiles.tileId_start,
+             em.source.tiles.tileId_end)
+            for em in preloop
+            if em.opType == 'gr' and em.source.tensor in ('A', 'B')
+        ]
+        assert data_ranges[:4] == [
+            ('B', 0, 2),
+            ('A', 0, 4),
+            ('B', 2, 4),
+            ('A', 4, 8),
+        ]
+        mt1_ranges = [
+            (em.source.tensor,
+             em.source.tiles.tileId_start,
+             em.source.tiles.tileId_end)
+            for em in preloop
+            if (em.opType == 'gr'
+                and em.source.tensor in ('A', 'B')
+                and em.source.mtIteration == 1)
+        ]
+        assert mt1_ranges == [('B', 0, 2), ('A', 0, 4)]
 
 
 class TestPlaceLRs:
