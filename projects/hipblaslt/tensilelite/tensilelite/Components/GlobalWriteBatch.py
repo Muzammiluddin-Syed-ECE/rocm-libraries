@@ -2623,31 +2623,6 @@ class GlobalWriteBatchWriter:
                 aAddr = self.ss.elementAddr[prevSba0Idx]
                 aS0   = self.ss.elementSumIdx[prevSba0Idx]
                 aS1   = self.ss.elementSumIdx[prevSba1Idx]
-
-                # Runtime size gate: fold is only profitable when BOTH free dims > 4096.
-                # This replaces the compile-time DPPStoreFold solution parameter — every
-                # eligible subtile kernel (MIWT[0]==8, permlane16) compiles both paths and
-                # the branch below selects at dispatch time.  Both SizesFree+0 (M) and
-                # SizesFree+1 (N) are live SGPRs throughout the kernel.
-                # The non-fold fallback is the existing _emitGuardedPairedNoRepack path.
-                DPPSF_RUNTIME_MIN_DIM = 4096
-                rtFoldAfterL = Label(self.parentWriter.labels.getNameInc("subtile_rtfold_after"),
-                                     f"after runtime fold decision tt0={tt0}")
-                rtFoldFbL    = Label(self.parentWriter.labels.getNameInc("subtile_rtfold_nofold"),
-                                     f"runtime no-fold (M or N <= {DPPSF_RUNTIME_MIN_DIM}) tt0={tt0}")
-                # M check: SCC = (M > 4096)
-                storeCodeModule.add(_scmpGtU32(self.parentWriter, sgpr("SizesFree+0"),
-                                               DPPSF_RUNTIME_MIN_DIM,
-                                               comment=f"fold gate: M > {DPPSF_RUNTIME_MIN_DIM}?"))
-                storeCodeModule.add(SCBranchSCC0(labelName=rtFoldFbL.getLabelName(),
-                                                 comment="M <= threshold -> non-fold path"))
-                # N check: SCC = (N > 4096)
-                storeCodeModule.add(_scmpGtU32(self.parentWriter, sgpr("SizesFree+1"),
-                                               DPPSF_RUNTIME_MIN_DIM,
-                                               comment=f"fold gate: N > {DPPSF_RUNTIME_MIN_DIM}?"))
-                storeCodeModule.add(SCBranchSCC0(labelName=rtFoldFbL.getLabelName(),
-                                                 comment="N <= threshold -> non-fold path"))
-
                 if guardMSgpr is not None and not self._fusedFullTileNoGuards():
                   afterL = Label(self.parentWriter.labels.getNameInc("subtile_after_fold"), f"after fold tt0={tt0}")
                   fbL    = Label(self.parentWriter.labels.getNameInc("subtile_fold_fallback"), f"fold fallback tt0={tt0}")
@@ -2674,14 +2649,6 @@ class GlobalWriteBatchWriter:
                   storeCodeModule.add(self._emit16bitSubtilePairedStoreRepack(aAddr, aS0, aS1, prefixOffset,
                                         sumIdx0, sumIdx1, partnerAddrCalc, lowBlockM, blockIdxM=lowBlockM, blockIdxN=blockIdxN,
                                         weavePairB=wpB, forceSlc=fusedA2APushPass))
-                # Runtime fold fallback: M or N <= 4096 -> emit unfolded paired stores.
-                # Reached by the two scalar branches above; jumps over the fold repack.
-                storeCodeModule.add(SBranch(labelName=rtFoldAfterL.getLabelName(),
-                                            comment="fold completed -> skip non-fold fallback"))
-                storeCodeModule.add(rtFoldFbL)
-                self._emitGuardedPairedNoRepack(storeCodeModule, prevSba0Idx, prevSba1Idx, prefixOffset, blockIdxN, forceSlc=fusedA2APushPass)
-                self._emitGuardedPairedNoRepack(storeCodeModule, partnerElementIdx, elementIdx, prefixOffset, blockIdxN, forceSlc=fusedA2APushPass)
-                storeCodeModule.add(rtFoldAfterL)
                 if skipLabel is not None:
                   storeCodeModule.add(skipLabel)
                 self.storesIssued += 1

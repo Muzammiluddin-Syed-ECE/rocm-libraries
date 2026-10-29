@@ -15663,10 +15663,51 @@ class KernelWriterAssembly(KernelWriter):
     savedNoAct = self.states.subtileFusedStoreNoActivation
     self.states.subtileFusedStoreNoActivation = bool(self.states.subtileStoreTt1PerStage) \
         and self._plsinStagedArmNoActivation(kernel)
+    # Runtime fold gate: one scalar branch per kernel dispatch selects the fold
+    # (DPP quad_perm blend, 2 coalesced full-line stores) vs. the non-fold
+    # (original paired half-line stores) post-loop body.  Both are compiled into
+    # every eligible subtile kernel (UseSubtileImpl + MIWT[0]==8 + permlane16);
+    # no separate solution parameter or library tuning run is needed.
+    # SizesFree+0 = M, SizesFree+1 = N -- live SGPRs throughout the kernel.
+    DPPSF_RUNTIME_MIN_DIM = 4096
+    foldAfterL = Label(self.labels.getNameInc("subtile_fold_postloop_after"),
+                       "after fold/nofold postloop split")
+    nofoldL    = Label(self.labels.getNameInc("subtile_nofold_postloop"),
+                       f"non-fold postloop (M or N <= {DPPSF_RUNTIME_MIN_DIM})")
+    # M > 4096?
+    module.add(SCmpKGtU32(src=sgpr("SizesFree+0"), simm16=DPPSF_RUNTIME_MIN_DIM,
+                          comment=f"fold gate: M > {DPPSF_RUNTIME_MIN_DIM}?"))
+    module.add(SCBranchSCC0(labelName=nofoldL.getLabelName(),
+                            comment="M <= threshold -> non-fold postloop"))
+    # N > 4096?
+    module.add(SCmpKGtU32(src=sgpr("SizesFree+1"), simm16=DPPSF_RUNTIME_MIN_DIM,
+                          comment=f"fold gate: N > {DPPSF_RUNTIME_MIN_DIM}?"))
+    module.add(SCBranchSCC0(labelName=nofoldL.getLabelName(),
+                            comment="N <= threshold -> non-fold postloop"))
+
+    # ── FOLD path: DPP repack, 2 coalesced full-line stores ──────────────────
     storeModule, _ = self.globalWriteElements(
       kernel, tPA, tPB,
       [fullVws[0]], [fullVws_1[0]], [elements[0]], [elements_1[0]],
       noGSUBranch=True, applyAlpha=False, betas=[False], edge=False)
+    module.add(storeModule)
+    module.add(SBranch(labelName=foldAfterL.getLabelName(),
+                       comment="fold done -> skip non-fold postloop"))
+
+    # ── NOFOLD path: original paired half-line stores ─────────────────────────
+    module.add(nofoldL)
+    savedFoldAllocated = self.cvtVgprStruct.foldAllocated
+    self.cvtVgprStruct = self.cvtVgprStruct._replace(foldAllocated=False)
+    nofoldModule, _ = self.globalWriteElements(
+      kernel, tPA, tPB,
+      [fullVws[0]], [fullVws_1[0]], [elements[0]], [elements_1[0]],
+      noGSUBranch=True, applyAlpha=False, betas=[False], edge=False)
+    self.cvtVgprStruct = self.cvtVgprStruct._replace(foldAllocated=savedFoldAllocated)
+    module.add(nofoldModule)
+    module.add(foldAfterL)
+
+    # (storeModule is used below only for the weave seam -- use the fold path's
+    # module since both paths have identical structure at that level)
     self.states.subtileFusedStoreNoActivation = savedNoAct
     self.states.subtileFusedWeave = savedWeave
     # Remember where the store body sits so the scheduler can lift it out and split it
@@ -15675,7 +15716,7 @@ class KernelWriterAssembly(KernelWriter):
     self.states.subtileStagedStoreSeam = module.itemsSize() if self.states.subtileStoreTt1PerStage else None
     self.states.subtileStoreTt1PerStage = 0
     self.states.subtileStoreTt0PerStage = 0
-    module.add(storeModule)
+    # storeModule and nofoldModule are already added above inside the runtime branch.
     self.cleanupGlobalWrite(kernel)
     self.states.bpeCexternal = savedBpeCext
 
