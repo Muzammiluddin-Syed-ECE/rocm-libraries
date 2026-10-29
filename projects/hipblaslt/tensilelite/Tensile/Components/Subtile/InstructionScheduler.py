@@ -13,26 +13,22 @@ from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstru
     LocalReadInstruction, GlobalReadInstruction, CommonInstruction
 
 
-# Prototype policy: advance the final partition's complete interleaving stream
-# into otherwise-empty intervals at the end of the preceding partition.  Each
-# experiment changes only this distance, while the relocation mechanism and
-# its safety checks remain fixed.
-_FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS = 3
-# Experiment 33: move the preceding partition's native DTL bundles as late as
-# possible without colliding with the advanced final-partition suffix.
+# Advance the final partition's entry anchor by this many MFMA intervals.
+# For a 16-MFMA preceding partition, the exclusive right-alignment cutoff is
+# 16 - 1 - 3 = 12, leaving follower groups 12 through 15 free.  This value is
+# an anchor distance, not the number of follower groups reserved.
+_FINAL_ENTRY_ANCHOR_ADVANCE_MFMAS = 3
+# Move the preceding partition's native DTL bundles as late as possible
+# without colliding with the advanced final-partition entry anchor.
 _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX = True
-# Experiment 34: retain at most the CMS-sized five-load cohort in the
-# preceding partition.  Once advancing another DTL load would exceed the cap,
-# keep that complete load group and the ordered suffix in the final partition.
-_MAX_PREVIOUS_PARTITION_DTL_LOADS = 5
-# Experiment 35: the final-partition entry LDS drain is redundant when the
+# The final-partition entry LDS drain is redundant when the
 # preceding partition already completed a full drain and issued no younger
 # LGKM-producing instruction.  Keep its former placement as a seam anchor so
 # the retained P2 DTL cohort does not otherwise move.
 _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
-# Experiment 36 isolates the final-partition phase reorder from the following
-# seam-advance experiment.  Keep every real P3 follower in P3 for this
-# checkpoint; the removed LGKM wait still supplies the empty seam anchor.
+# Keep every real final-partition follower in that partition.  The removed
+# LGKM wait still supplies the empty seam anchor for preceding-partition DTL
+# right alignment.
 _ADVANCE_FINAL_PARTITION_FOLLOWERS = False
 
 

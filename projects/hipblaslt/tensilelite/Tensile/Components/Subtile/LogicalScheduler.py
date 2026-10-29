@@ -265,6 +265,10 @@ class SchedulerConfig:
     # scale cadence.  The preloop correspondingly seeds a complete n+1 A/B
     # epoch so the first steady-state wrap has a producer.
     uniformPgrEpoch: bool = False
+    # Maximum number of atomic A/B VMEM requests in each non-frontier uniform
+    # epoch cohort.  The same policy controls the partition-zero overwrite
+    # cohort and the retained DTL cohort at the final-partition seam.
+    uniformEpochVmemCohortSize: int = 5
     # Physical traversal of the 2-D partition grid.  "m-major" preserves the
     # legacy order (M varies fastest).  "n-major" matches FlyDSL's
     # c00,c01,c10,c11 order (N varies fastest).
@@ -338,6 +342,8 @@ class SchedulerConfig:
                 "uniformPgrEpoch currently requires PrefetchGlobalRead=2"
             assert self.prefetchNextPartition, \
                 "uniformPgrEpoch requires partition-directed prefetch"
+        assert self.uniformEpochVmemCohortSize >= 1, \
+            "uniformEpochVmemCohortSize must be >= 1"
 
         assert self.scaleReuse >= 1, f"scaleReuse must be >= 1, got {self.scaleReuse}"
         # Dual-period MXFP8: the scale epoch (256 K) spans scaleReuse data
@@ -945,14 +951,14 @@ class LogicalScheduler:
         return partitions
 
     def _move_uniform_epoch_p0_overwrite_reads(self, partitions):
-        """Make the first five future writes legal in partition zero.
+        """Make the first future-write cohort legal in partition zero.
 
         Uniform epochs are ordered canonically as A then B.  The first
-        CMS-sized cohort is therefore the first five atomic A/B requests.
+        cohort is therefore the first configured number of atomic A/B requests.
         Pull any current-epoch local-read placement overlapping that cohort
         into partition zero.  The instruction scheduler can then issue those
-        reads, drain LDS, and place the overwrite barrier before the five
-        global reads instead of deferring the whole cohort to partition one.
+        reads, drain LDS, and place the overwrite barrier before the global
+        reads instead of deferring the whole cohort to partition one.
 
         A logical LR may cover more than one atomic GR tile.  Split at the
         selected GR boundaries and hoist only the overlapping segment.  VGPR
@@ -965,14 +971,15 @@ class LogicalScheduler:
             return
 
         first_atoms = []
+        cohortSize = cfg.uniformEpochVmemCohortSize
         for tensor, gran, num_tiles in (
                 ('A', cfg.grA, cfg.numMFMATilesM),
                 ('B', cfg.grB, cfg.numMFMATilesN)):
             for tile in range(0, num_tiles, gran.mn):
                 first_atoms.append((tensor, tile, tile + gran.mn))
-                if len(first_atoms) == 5:
+                if len(first_atoms) == cohortSize:
                     break
-            if len(first_atoms) == 5:
+            if len(first_atoms) == cohortSize:
                 break
 
         selected = {}
@@ -1770,7 +1777,7 @@ class LogicalScheduler:
                 # wait.  Limit the chunk further for small partitions.
                 nonfrontier_chunk = max(
                     1,
-                    min(5, min(
+                    min(cfg.uniformEpochVmemCohortSize, min(
                         mfma_per_partition[s // numK]
                         for s in dist_slots[:-1]
                     ))) if len(dist_slots) > 1 else nAtoms
@@ -1908,10 +1915,10 @@ class LogicalScheduler:
             # post-adjustment accounts for those same-slot requests.  This is
             # the CMS ordering: final future loads, vmcnt+barrier, then the
             # first next-epoch LDS reads.
-            # The first five future writes and every overlapping current read
-            # are now co-located in partition zero.  Include that slot so its
-            # LR→GR dependency emits the overwrite barrier there, then retain
-            # CMS-sized five-request cohorts in the later partitions.
+            # The first configured future-write cohort and every overlapping
+            # current read are now co-located in partition zero.  Include that
+            # slot so its LR→GR dependency emits the overwrite barrier there,
+            # then retain the same cohort bound in later partitions.
             epoch_start = 0
             uniform_slots = list(range(epoch_start, frontier + 1))
         last_uid_slot = None
@@ -4075,8 +4082,7 @@ class LogicalScheduler:
             _DtlIntervalCapacityError,
             _ADVANCE_FINAL_PARTITION_FOLLOWERS,
             _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT,
-            _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
-            _MAX_PREVIOUS_PARTITION_DTL_LOADS,
+            _FINAL_ENTRY_ANCHOR_ADVANCE_MFMAS,
             _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX,
             advancePartitionInterleave,
             eliminateRedundantLgkmDrains,
@@ -4169,11 +4175,11 @@ class LogicalScheduler:
                         advancePartitionInterleave(
                             previous_schedule[0],
                             scheduled,
-                            _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
+                            _FINAL_ENTRY_ANCHOR_ADVANCE_MFMAS,
                             rightAlignPreviousDtl=(
                                 _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX),
                             maxPreviousDtlLoads=(
-                                _MAX_PREVIOUS_PARTITION_DTL_LOADS),
+                                self.config.uniformEpochVmemCohortSize),
                             dropRedundantFinalLgkm=(
                                 _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT),
                             advanceFinalFollowers=(

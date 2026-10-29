@@ -432,6 +432,32 @@ def make_writer_and_tileinfos(kernel, fp4=False):
     return writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo
 
 
+def _emit_du128_mxfp8_mainloops(cfg=None):
+    """Emit both concrete production-style main-loop copies for tests."""
+    kernel = create_kernel_mxfp8()
+    writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = \
+        make_writer_and_tileinfos(kernel, fp4=True)
+    if cfg is None:
+        cfg = replace(make_cfg_du128_4wave(), uniformPgrEpoch=True)
+    sched = LogicalScheduler(cfg)
+    sched.build()
+    sched.allocVgprTiles(
+        writer, tiA, tiB,
+        scaleTileInfoA=scaleTiA,
+        scaleTileInfoB=scaleTiB)
+    try:
+        sched.populate_instructions(
+            writer, kernel,
+            tileInfoA=tiA,
+            tileInfoB=tiB,
+            dtileInfo=dTileInfo,
+            scaleTileInfoA=scaleTiA,
+            scaleTileInfoB=scaleTiB)
+        return str(sched.emitMainAndExitLoops(writer, kernel))
+    finally:
+        sched.deallocVgprTiles(writer)
+
+
 # ── Assertion helpers ─────────────────────────────────────────
 
 def _get_lr(slot, tensor):
@@ -2391,6 +2417,60 @@ class TestUniformPgrEpoch:
                 if slot.grs:
                     assert pi * cfg.numSubIterK + slot.subIterK <= frontier
 
+    def test_cohort_size_must_be_positive(self):
+        with pytest.raises(
+                AssertionError,
+                match="uniformEpochVmemCohortSize must be >= 1"):
+            self._cfg(uniformEpochVmemCohortSize=0)
+
+    def test_three_request_cohort_reaches_all_policy_consumers(
+            self, monkeypatch):
+        # A two-tile GR atom makes the third request overlap the next
+        # partition, so the partition-zero overwrite selector must split and
+        # hoist exactly that configured boundary.
+        logical_cfg = self._cfg(
+            grA=ReadGranularity(mn=2, k=1),
+            uniformEpochVmemCohortSize=3)
+        sched = LogicalScheduler(logical_cfg)
+        sched.build(stop_after=Pass.LR)
+        hoisted = [
+            (lr.tensor, lr.tiles.tileId_start, lr.tiles.tileId_end)
+            for slot in sched._partitions[0]
+            for lr in slot.lrs
+            if lr.mustPrecedeP0Overwrite
+        ]
+        assert hoisted == [("A", 4, 6)]
+
+        sched = LogicalScheduler(logical_cfg)
+        sched.build(stop_after=Pass.GR)
+        counts = [
+            sum(
+                sched._count_gr_atoms(gr)
+                for slot in partition
+                for gr in slot.grs
+                if gr.tensor in ("A", "B")
+            )
+            for partition in sched._partitions
+        ]
+        assert counts == [3, 3, 3, 3]
+
+        # The physical P2/P3 seam must consume the same field rather than an
+        # independent literal.
+        from Tensile.Components.Subtile import InstructionScheduler
+
+        observed_caps = []
+        advance = InstructionScheduler.advancePartitionInterleave
+
+        def capture_cap(*args, **kwargs):
+            observed_caps.append(kwargs["maxPreviousDtlLoads"])
+            return advance(*args, **kwargs)
+
+        monkeypatch.setattr(
+            InstructionScheduler, "advancePartitionInterleave", capture_cap)
+        physical_cfg = self._cfg(uniformEpochVmemCohortSize=3)
+        _emit_du128_mxfp8_mainloops(physical_cfg)
+        assert observed_caps == [3, 3]
+
     def test_partition_zero_gets_five_writes_and_only_required_hoisted_read(self):
         cfg = self._cfg()
         sched = LogicalScheduler(cfg)
@@ -3451,50 +3531,29 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
     def test_mt256x256_c0_c1_match_clean_baseline(self):
         import hashlib
 
-        kernel = create_kernel_mxfp8()
-        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = \
-            make_writer_and_tileinfos(kernel, fp4=True)
-        cfg = replace(make_cfg_du128_4wave(), uniformPgrEpoch=True)
-        sched = LogicalScheduler(cfg)
-        sched.build()
-        sched.allocVgprTiles(
-            writer, tiA, tiB,
-            scaleTileInfoA=scaleTiA,
-            scaleTileInfoB=scaleTiB)
-        try:
-            sched.populate_instructions(
-                writer, kernel,
-                tileInfoA=tiA,
-                tileInfoB=tiB,
-                dtileInfo=dTileInfo,
-                scaleTileInfoA=scaleTiA,
-                scaleTileInfoB=scaleTiB)
-            assembly = str(sched.emitMainAndExitLoops(writer, kernel))
+        assembly = _emit_du128_mxfp8_mainloops()
+        for copy_index, (expected_lines, expected_hash) in \
+                self._EXPECTED.items():
+            normalized = self._normalize(assembly, copy_index)
+            lines = normalized.splitlines()
+            assert len(lines) == expected_lines
+            assert hashlib.sha256(
+                normalized.encode()).hexdigest() == expected_hash
+            assert sum(
+                line.startswith("partition=") for line in lines) == 4
 
-            for copy_index, (expected_lines, expected_hash) in \
-                    self._EXPECTED.items():
-                normalized = self._normalize(assembly, copy_index)
-                lines = normalized.splitlines()
-                assert len(lines) == expected_lines
-                assert hashlib.sha256(
-                    normalized.encode()).hexdigest() == expected_hash
-                assert sum(
-                    line.startswith("partition=") for line in lines) == 4
-
-                instructions = [
-                    line for line in lines
-                    if not line.startswith("partition=")
-                ]
-                pending_m0_setup = False
-                for line in instructions:
-                    if line.startswith(("s_add_u32 m0,", "s_mov_b32 m0,")):
-                        assert not pending_m0_setup
-                        pending_m0_setup = True
-                    elif line.startswith("buffer_load") and pending_m0_setup:
-                        pending_m0_setup = False
-                assert not pending_m0_setup
-        finally:
-            sched.deallocVgprTiles(writer)
+            instructions = [
+                line for line in lines
+                if not line.startswith("partition=")
+            ]
+            pending_m0_setup = False
+            for line in instructions:
+                if line.startswith(("s_add_u32 m0,", "s_mov_b32 m0,")):
+                    assert not pending_m0_setup
+                    pending_m0_setup = True
+                elif line.startswith("buffer_load") and pending_m0_setup:
+                    pending_m0_setup = False
+            assert not pending_m0_setup
 
 
 class TestInstructionSchedulerWrapPrefetch:
