@@ -18315,20 +18315,21 @@ class KernelWriterAssembly(KernelWriter):
         # voffset blend (vVoff) and the quad_perm blend temp (vBlend).  The blended store data
         # is NOT a dedicated register -- it reuses a dead ValuC slot (see
         # _emit16bitSubtilePairedStoreRepack).  This cvt footprint is absorbed by the
-        # DPPStoreFold-driven operand lend (see _selectPlsinFusedStorePolicy), so the high-water
+        # fold's operand lend (see _selectPlsinFusedStorePolicy), so the high-water
         # does not grow.
         #
         # Gate: MIWaveTile[0]==8 is the ONLY config the repack's row/half-line geometry is
         # validated for.  Admit only that -- dropping the earlier `miwt[0]>=4` reg-fit escape,
         # which shipped an UNPROVEN codegen path to 4/6-high tiles -- and only when the cvt block
         # actually fits (footprint derived from the layout, not a bare literal).
+        # The fold is compiled into every eligible subtile kernel; at dispatch time a runtime
+        # branch on M,N > 4096 (in GlobalWriteBatch) selects the fold or non-fold store path.
         FOLD_MIWT_PROVEN = 8
         miwt = kernel.get("MIWaveTile", [0, 0])
         maxVgpr = self.states.regCaps["MaxVgpr"]
         foldCvtTotal = base + 2   # shared staging window (base) + foldVoff + foldBlend
         foldFits = (self.vgprPool.size() + foldCvtTotal) <= maxVgpr
-        isSubtileFold = bool(kernel.get("DPPStoreFold")
-                             and kernel.get("UseSubtileImpl")
+        isSubtileFold = bool(kernel.get("UseSubtileImpl")
                              and len(miwt) >= 2 and miwt[0] == FOLD_MIWT_PROVEN
                              and foldFits)
         foldVoff = foldBlend = -1

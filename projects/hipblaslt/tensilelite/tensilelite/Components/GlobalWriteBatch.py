@@ -46,7 +46,6 @@ from rocisa.functions import scalarUInt32DivideAndRemainder, vectorStaticMultipl
 from ..Common import DataDirection, SemanticVersion, isSubtileMultiDU, \
     isMxf4SubtilePath
 from ..Common.DataType import DataType
-from ..Common.RegisterLease import DeadRegisterLease
 from ..Component import GlobalWriteComponents
 from ..Component import Component
 from ..SolutionStructs import Solution
@@ -2624,6 +2623,31 @@ class GlobalWriteBatchWriter:
                 aAddr = self.ss.elementAddr[prevSba0Idx]
                 aS0   = self.ss.elementSumIdx[prevSba0Idx]
                 aS1   = self.ss.elementSumIdx[prevSba1Idx]
+
+                # Runtime size gate: fold is only profitable when BOTH free dims > 4096.
+                # This replaces the compile-time DPPStoreFold solution parameter — every
+                # eligible subtile kernel (MIWT[0]==8, permlane16) compiles both paths and
+                # the branch below selects at dispatch time.  Both SizesFree+0 (M) and
+                # SizesFree+1 (N) are live SGPRs throughout the kernel.
+                # The non-fold fallback is the existing _emitGuardedPairedNoRepack path.
+                DPPSF_RUNTIME_MIN_DIM = 4096
+                rtFoldAfterL = Label(self.parentWriter.labels.getNameInc("subtile_rtfold_after"),
+                                     f"after runtime fold decision tt0={tt0}")
+                rtFoldFbL    = Label(self.parentWriter.labels.getNameInc("subtile_rtfold_nofold"),
+                                     f"runtime no-fold (M or N <= {DPPSF_RUNTIME_MIN_DIM}) tt0={tt0}")
+                # M check: SCC = (M > 4096)
+                storeCodeModule.add(_scmpGtU32(self.parentWriter, sgpr("SizesFree+0"),
+                                               DPPSF_RUNTIME_MIN_DIM,
+                                               comment=f"fold gate: M > {DPPSF_RUNTIME_MIN_DIM}?"))
+                storeCodeModule.add(SCBranchSCC0(labelName=rtFoldFbL.getLabelName(),
+                                                 comment="M <= threshold -> non-fold path"))
+                # N check: SCC = (N > 4096)
+                storeCodeModule.add(_scmpGtU32(self.parentWriter, sgpr("SizesFree+1"),
+                                               DPPSF_RUNTIME_MIN_DIM,
+                                               comment=f"fold gate: N > {DPPSF_RUNTIME_MIN_DIM}?"))
+                storeCodeModule.add(SCBranchSCC0(labelName=rtFoldFbL.getLabelName(),
+                                                 comment="N <= threshold -> non-fold path"))
+
                 if guardMSgpr is not None and not self._fusedFullTileNoGuards():
                   afterL = Label(self.parentWriter.labels.getNameInc("subtile_after_fold"), f"after fold tt0={tt0}")
                   fbL    = Label(self.parentWriter.labels.getNameInc("subtile_fold_fallback"), f"fold fallback tt0={tt0}")
@@ -2650,6 +2674,14 @@ class GlobalWriteBatchWriter:
                   storeCodeModule.add(self._emit16bitSubtilePairedStoreRepack(aAddr, aS0, aS1, prefixOffset,
                                         sumIdx0, sumIdx1, partnerAddrCalc, lowBlockM, blockIdxM=lowBlockM, blockIdxN=blockIdxN,
                                         weavePairB=wpB, forceSlc=fusedA2APushPass))
+                # Runtime fold fallback: M or N <= 4096 -> emit unfolded paired stores.
+                # Reached by the two scalar branches above; jumps over the fold repack.
+                storeCodeModule.add(SBranch(labelName=rtFoldAfterL.getLabelName(),
+                                            comment="fold completed -> skip non-fold fallback"))
+                storeCodeModule.add(rtFoldFbL)
+                self._emitGuardedPairedNoRepack(storeCodeModule, prevSba0Idx, prevSba1Idx, prefixOffset, blockIdxN, forceSlc=fusedA2APushPass)
+                self._emitGuardedPairedNoRepack(storeCodeModule, partnerElementIdx, elementIdx, prefixOffset, blockIdxN, forceSlc=fusedA2APushPass)
+                storeCodeModule.add(rtFoldAfterL)
                 if skipLabel is not None:
                   storeCodeModule.add(skipLabel)
                 self.storesIssued += 1
@@ -4662,21 +4694,32 @@ class GlobalWriteBatchWriter:
     vAddrScratch = self.cvtVgprStruct.vgprAddrScratch
     addrDVgpr    = addrCalc.addrDVgpr
 
-    # ValuC-slot reuse: batchA's accumulator slots become dead the moment packPair(vPack,
-    # batchA) consumes them -- batchA (the earlier pair) is stored ONLY by this fold, so its
-    # two sba elements' 4-slot windows are never read again.  For subtile kernels the whole
-    # ValuC block is pool-RESERVED, so reuse those slots for the batchB pack (vPack2) and the
-    # blended store src (vSD) instead of fresh cvt scratch -- never grows the high-water.
-    # Lease the two reuse windows from a DeadRegisterLease over batchA's two dead 4-slot
-    # windows rather than asserting safety by hand: the pool rejects overlapping windows at
-    # construction, and lease(align=2) both enforces the dwordx4 2-alignment and physically
-    # cannot return a window overlapping the first.  So the old hazard (e.g. sumIdx1==sumIdx0+2,
-    # which passes a parity check but aliases regs sumIdx0+2..+3 and corrupts the store) is now
-    # impossible by construction, and an unaligned or too-close window fails loud instead.
+    # ValuC-slot reuse: batchA's two accumulator windows go dead from their LAST read -- the
+    # batchA packs below, which copy them into vPack -- onward.  Reusing them for the batchB
+    # pack (vPack2) and the blended store src (vSD) instead of fresh cvt scratch costs zero
+    # high-water.  Three facts make it safe:
+    #   (a) batchA (the earlier pair) is stored ONLY by this fold, so nothing reads these slots
+    #       again after the packs;
+    #   (b) on the subtile path the whole ValuC block is pool-RESERVED, so no checkOut can ever
+    #       hand these registers to another consumer; and
+    #   (c) batchA's accumulation is COMPLETE at the fold (it is being stored), so the last-K
+    #       MFMAs the weave interleaves into the store gaps -- which target other, not-yet-stored
+    #       tiles -- never write batchA's slots after the pack.  (If a future weave moved an MFMA
+    #       that writes these accumulators past the pack, the reuse would silently corrupt D.)
+    # The read-before-write that (a) relies on is an EMISSION-ORDER guarantee; see the ORDERING
+    # INVARIANT at the packPair sequence below.
+    # The reuse writes two 4-register windows: [sumIdx0 .. sumIdx0+3] (vPack2) and
+    # [sumIdx1 .. sumIdx1+3] (vSD).  Correctness needs them 2-aligned (dwordx4 store) AND
+    # mutually DISJOINT -- the real hazard is overlap, not parity.  e.g. sumIdx1==sumIdx0+2
+    # passes a parity check but makes the windows alias at regs sumIdx0+2..+3, corrupting the
+    # store silently.  Require >= one full window apart.
     FOLD_VALUC_WINDOW = 4
-    valuCReuse = DeadRegisterLease([(sumIdx0, FOLD_VALUC_WINDOW), (sumIdx1, FOLD_VALUC_WINDOW)])
-    vPack2     = valuCReuse.lease(FOLD_VALUC_WINDOW, align=2)  # batchA dead slots -> batchB packed data
-    vSD        = valuCReuse.lease(FOLD_VALUC_WINDOW, align=2)  # batchA dead slots -> blended store src
+    assert sumIdx0 % 2 == 0 and sumIdx1 % 2 == 0 \
+           and abs(sumIdx1 - sumIdx0) >= FOLD_VALUC_WINDOW, \
+      f"ValuC reuse needs 2-aligned, disjoint {FOLD_VALUC_WINDOW}-reg batchA windows " \
+      f"(sumIdx0={sumIdx0}, sumIdx1={sumIdx1})"
+    vPack2       = sumIdx0   # batchA sba0's 4 dead ValuC slots  -> batchB packed data
+    vSD          = sumIdx1   # batchA sba1's 4 dead ValuC slots  -> blended store src
 
     permlane16 = getattr(self, "_permlane16Active", False)
 
@@ -4695,6 +4738,12 @@ class GlobalWriteBatchWriter:
       phase1Mod.add(VCvtPkF32to16(dst=vgpr(dst), src0=src0, src1=src1, comment=f"{comment} -> {typeStr}"))
 
     partnerTt0 = tt0 + 2
+    # ORDERING INVARIANT (load-bearing): the four batchA packs MUST be emitted before the four
+    # batchB packs.  vPack2 aliases sumIdx0 and vSD aliases sumIdx1 -- batchA's OWN ValuC slots --
+    # so the batchA packs below are the last reads of those registers.  The batchB packs then
+    # overwrite vPack2=sumIdx0, and the phase2 blend overwrites vSD=sumIdx1.  Interleaving the two
+    # batches, or hoisting any batchB pack / the blend ahead of batchA's reads, would clobber a
+    # live source and silently corrupt the store.  Keep batchA-first; do not reorder.
     phase1Mod.addComment1(f"DPP repack tt0={tt0}+{partnerTt0}: pack batchA -> v[{vPack}:{vPack+3}], batchB -> v[{vPack2}:{vPack2+3}]")
     packPair(vPack+0, vc(sumIdx0, 0), vc(sumIdx0, 1), f"batchA sba=0 tt0={tt0}[0:1]")
     packPair(vPack+1, vc(sumIdx0, 2), vc(sumIdx0, 3), f"batchA sba=0 tt0={tt0}[2:3]")
