@@ -1079,10 +1079,18 @@ def _rightAlignDtlBundlesBefore(followers, endExclusive):
     return rewritten
 
 
-def _isLgkmOnlyDrain(inst) -> bool:
-    """Whether inst is a full LDS/SMEM drain with no other counter effect."""
+def _drainsLgkm(inst) -> bool:
+    """Whether inst proves that every older LDS/SMEM request completed."""
     return (
         isinstance(inst, SWaitCnt)
+        and (inst.dscnt == 0 or getattr(inst, "waitAll", False))
+    )
+
+
+def _isLgkmOnlyDrain(inst) -> bool:
+    """Whether inst is a removable full LDS/SMEM-only drain."""
+    return (
+        _drainsLgkm(inst)
         and inst.dscnt == 0
         and inst.vlcnt < 0
         and inst.vscnt < 0
@@ -1108,11 +1116,51 @@ def _endsWithDrainedLgkm(schedule) -> bool:
     """Prove that no LGKM request remains after the schedule completes."""
     drained = False
     for inst in schedule.flatitems():
-        if _isLgkmOnlyDrain(inst):
+        if _drainsLgkm(inst):
             drained = True
         elif _isLgkmProducer(inst):
             drained = False
     return drained
+
+
+def eliminateRedundantLgkmDrains(schedule) -> int:
+    """Remove dominated full LGKM-only drains from a straight-line schedule.
+
+    Logical dependency lowering may independently add a read-completion wait
+    and a later consumer-readiness wait. Once physical placement is final, the
+    latter is redundant when a full drain dominates it and no intervening
+    LDS/SMEM instruction can have made LGKM outstanding again.
+
+    Keep waits that also affect another counter: their non-LGKM effect may
+    still be required. Such waits nevertheless establish the known-drained
+    LGKM state. Starting in the unknown state deliberately preserves the first
+    wait in a loop body; this pass does not reason across a backedge.
+    """
+    drained = False
+    removed = 0
+
+    def rewrite(module):
+        nonlocal drained, removed
+        rewritten = []
+        for inst in module.items():
+            if isinstance(inst, Module):
+                rewrite(inst)
+                rewritten.append(inst)
+                continue
+
+            if _isLgkmOnlyDrain(inst) and drained:
+                removed += 1
+                continue
+
+            if _drainsLgkm(inst):
+                drained = True
+            elif _isLgkmProducer(inst):
+                drained = False
+            rewritten.append(inst)
+        module.setItems(rewritten)
+
+    rewrite(schedule)
+    return removed
 
 
 def compactWrapSeam(
@@ -2074,4 +2122,9 @@ def instructionScheduleLoop(
             firstMfmaCount,
         )
         _setEntryWaitLrCount(firstModules, safeCount)
+        # Dependency lowering creates correctness waits independently. Once
+        # every cell has final physical placement, remove a later full
+        # LGKM-only drain when an earlier full drain dominates it and no
+        # LDS/SMEM producer intervenes.
+        eliminateRedundantLgkmDrains(result)
     return result
