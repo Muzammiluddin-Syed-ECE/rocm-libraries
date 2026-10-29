@@ -2384,16 +2384,17 @@ class TestUniformPgrEpoch:
                 granularity.mn)
         ]
 
-    def test_production_dual_period_pgr2_selects_uniform_epoch(
-            self, monkeypatch):
+    @staticmethod
+    def _production_fixture(mt_m=256, mt_n=256):
         import importlib
 
         kernel_module = importlib.import_module(
             "Tensile.Components.Subtile.Kernel")
-        kernel = create_kernel_mxfp8()
+        kernel = create_kernel_mxfp8(mt_m, mt_n)
         kernel["PrefetchGlobalRead"] = 2
         kernel["PrefetchLocalRead"] = 0
-        writer, *_ = make_writer_and_tileinfos(kernel, fp4=True)
+        fixture = make_writer_and_tileinfos(kernel, fp4=True)
+        writer = fixture[0]
         writer.tPA = None
         writer.tPB = None
 
@@ -2406,15 +2407,70 @@ class TestUniformPgrEpoch:
             selected.update(kwargs)
             raise SelectionCaptured
 
-        monkeypatch.setattr(
-            kernel_module, "MFMASchedulerConfig", capture_config)
-        with pytest.raises(SelectionCaptured):
-            kernel_module.mainLoop(writer, kernel)
+        original_config = kernel_module.MFMASchedulerConfig
+        kernel_module.MFMASchedulerConfig = capture_config
+        try:
+            with pytest.raises(SelectionCaptured):
+                kernel_module.mainLoop(writer, kernel)
+        finally:
+            kernel_module.MFMASchedulerConfig = original_config
+        return kernel, fixture, SchedulerConfig(**selected)
 
-        assert selected["pgr"] == 2
-        assert selected["prefetchNextPartition"]
-        assert selected["uniformPgrEpoch"]
-        assert selected["uniformEpochVmemCohortSize"] == 5
+    def test_production_dual_period_pgr2_selects_uniform_epoch(self):
+        _kernel, _fixture, selected = self._production_fixture()
+
+        assert selected.pgr == 2
+        assert selected.prefetchNextPartition
+        assert selected.uniformPgrEpoch
+        assert selected.uniformEpochVmemCohortSize == 5
+
+    @pytest.mark.parametrize(
+        "mt_m,mt_n", [(256, 256), (256, 320), (320, 256)])
+    def test_production_geometries_use_three_phase_p0_for_c0_c1(
+            self, monkeypatch, mt_m, mt_n):
+        import importlib
+
+        instruction_scheduler = importlib.import_module(
+            "Tensile.Components.Subtile.InstructionScheduler")
+        kernel, fixture, cfg = self._production_fixture(mt_m, mt_n)
+        writer, ti_a, ti_b, ti_sa, ti_sb, dest = fixture
+        scheduler = LogicalScheduler(cfg)
+        scheduler.build()
+        scheduler.allocVgprTiles(
+            writer, ti_a, ti_b,
+            scaleTileInfoA=ti_sa, scaleTileInfoB=ti_sb)
+
+        split_results = []
+        split_p0 = instruction_scheduler._splitPartitionZeroPrefetch
+
+        def record_split(*args, **kwargs):
+            result = split_p0(*args, **kwargs)
+            split_results.append(result is not None)
+            return result
+
+        monkeypatch.setattr(
+            instruction_scheduler,
+            "_splitPartitionZeroPrefetch",
+            record_split)
+        assert not hasattr(instruction_scheduler, "_splitItemsAfterHalf")
+        try:
+            scheduler.populate_instructions(
+                writer, kernel,
+                tileInfoA=ti_a,
+                tileInfoB=ti_b,
+                dtileInfo=dest,
+                scaleTileInfoA=ti_sa,
+                scaleTileInfoB=ti_sb)
+            assert len(scheduler._emitted_per_unroll) == 2
+            for body, emitted in enumerate(scheduler._emitted_per_unroll):
+                begin = len(split_results)
+                scheduler._emitLoop(
+                    writer, kernel, f"MAINLOOP_C{body}", emitted)
+                # Exactly the partition-zero cell in each body has a
+                # successful split, so production takes three-phase placement.
+                assert split_results[begin:].count(True) == 1
+        finally:
+            scheduler.deallocVgprTiles(writer)
 
     def test_complete_n2_epoch_precedes_first_n1_consumer(self):
         cfg = self._cfg()
