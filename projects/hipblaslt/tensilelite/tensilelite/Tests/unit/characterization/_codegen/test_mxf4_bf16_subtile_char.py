@@ -366,6 +366,61 @@ def test_paired_store_repack_is_scoped():
     )
 
 
+def test_coalesce_size_gate_is_emitted_on_the_plain_path():
+    """The DPP store-coalesce is size-gated at runtime.
+
+    The coalesce is always compiled into an eligible MXF4->bf16 subtile kernel; the
+    plain post-loop store then chooses coalesce-vs-plain at runtime on problem size.
+    So the in-scope kernel must carry all three parts of that gate -- the size
+    predicate (computed once per batch in ``_emitSubtileGuards``), at least one gate
+    branch at a plain-path coalesce site, and the coalesced stores themselves -- while
+    the fp32 control, which is outside the subtile-coalesce path, carries none of them.
+
+    This pins the fix for the earlier dispatch that called notLocalSplitUGlobalWrite
+    twice: that corrupted the register pool and dropped epilogue kernels; the gate now
+    lives inside a single store build.
+    """
+    in_scope = "\n".join(src for _b, src, _e in _emit(_IN_SCOPE))
+    control = "\n".join(src for _b, src, _e in _emit(_CONTROL))
+
+    assert re.search(r"coalesce size gate: sizeOk", in_scope), (
+        "the size predicate is not computed for the coalesce-eligible kernel"
+    )
+    assert re.search(r"coalesce size gate: M,N below threshold", in_scope), (
+        "no runtime size-gate branch at the plain-path coalesce site"
+    )
+    assert re.search(r"quad_perm:\[0,0,2,2\]", in_scope), (
+        "the coalesced store is not emitted"
+    )
+
+    assert "coalesce size gate" not in control, (
+        "fp32 control is outside the coalesce path but carries the size gate"
+    )
+    assert not re.search(r"quad_perm:\[0,0,2,2\]", control), (
+        "fp32 control is outside the coalesce path but carries a coalesced store"
+    )
+
+
+def test_coalesce_size_gate_shares_one_predicate_across_sites():
+    """The gate is one shared compare feeding cheap per-site branches, not a per-store
+    comparison.
+
+    The whole point of computing the predicate in ``_emitSubtileGuards`` is that the M,N
+    threshold is evaluated a handful of times (once per batch) and then only *branched*
+    on at each coalesce site. If a refactor pushed the comparison back down to the store
+    site, the compute count would rise to meet the branch count -- which is exactly the
+    per-pair shape this design avoids. So assert strictly more branches than computes.
+    """
+    in_scope = "\n".join(src for _b, src, _e in _emit(_IN_SCOPE))
+    computes = len(re.findall(r"coalesce size gate: sizeOk = 1 iff", in_scope))
+    branches = len(re.findall(r"coalesce size gate: M,N below threshold", in_scope))
+    assert computes >= 1, "the size predicate is never computed"
+    assert branches > computes, (
+        f"expected one shared predicate feeding many per-site branches, got "
+        f"{computes} computes / {branches} branches"
+    )
+
+
 def test_preloop_wait_is_partial_and_drains_the_first_batch():
     """The pre-loop waits on half its loads, and on exactly the right half.
 
