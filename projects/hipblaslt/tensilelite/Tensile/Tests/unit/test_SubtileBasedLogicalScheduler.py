@@ -3619,11 +3619,12 @@ class TestInstructionSchedulerWrapPrefetch:
             GlobalReadInstruction, LocalReadInstruction, MFMAInstruction,
             SBarrier, SWaitCnt, VXorB32)
         from Tensile.Components.Subtile.InstructionScheduler import (
-            packFinalPartitionCoexecTail)
+            finalPartitionNeedsWrapSpace, packFinalPartitionCoexecTail)
 
         self._schedule()
         schedule = self._coexec_tail_schedule()
 
+        assert finalPartitionNeedsWrapSpace(schedule)
         assert packFinalPartitionCoexecTail(schedule)
 
         prefix = []
@@ -3681,7 +3682,7 @@ class TestInstructionSchedulerWrapPrefetch:
     def test_final_partition_coexec_tail_leaves_balanced_schedule_unchanged(self):
         from rocisa.code import TextBlock
         from Tensile.Components.Subtile.InstructionScheduler import (
-            packFinalPartitionCoexecTail)
+            finalPartitionNeedsWrapSpace, packFinalPartitionCoexecTail)
 
         self._schedule()
         schedule = self._coexec_tail_schedule(overloaded=False)
@@ -3691,6 +3692,7 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         before = snapshot()
 
+        assert not finalPartitionNeedsWrapSpace(schedule)
         assert not packFinalPartitionCoexecTail(schedule)
         assert snapshot() == before
 

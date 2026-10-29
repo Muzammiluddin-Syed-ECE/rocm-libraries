@@ -1339,6 +1339,27 @@ def compactWrapSeam(
     return True
 
 
+def finalPartitionNeedsWrapSpace(schedule) -> bool:
+    """Return whether the final partition has a clustered DTL cohort.
+
+    A balanced final partition issues at most one DTL load in each MFMA
+    shadow. Two or more loads in one shadow are the structural pressure that
+    the final-partition tail repacker is designed to spread. Only schedules
+    with that pressure should borrow empty shadows from the preceding
+    partition at the cyclic wrap seam.
+    """
+    followers = []
+    for inst in schedule.flatitems():
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            followers.append([])
+        elif followers:
+            followers[-1].append(inst)
+    return any(
+        sum(_isDtlLoad(inst) for inst in group) > 1
+        for group in followers
+    )
+
+
 def packFinalPartitionCoexecTail(schedule):
     """Repack an overloaded final-partition read/DTL tail.
 
@@ -1373,9 +1394,7 @@ def packFinalPartitionCoexecTail(schedule):
 
     if len(mfmas) < 4:
         return False
-    if not any(
-            sum(_isDtlLoad(inst) for inst in group) > 1
-            for group in followers):
+    if not finalPartitionNeedsWrapSpace(schedule):
         return False
 
     barriers = [
@@ -2274,8 +2293,9 @@ def instructionScheduleLoop(
                         seamPolicy,
                         maxPrecedingDtlLoads=(
                             context.uniformPgrCohortSize))
-                compactWrapSeam(
-                    previousSchedule[0], scheduled, policy=seamPolicy)
+                if finalPartitionNeedsWrapSpace(scheduled):
+                    compactWrapSeam(
+                        previousSchedule[0], scheduled, policy=seamPolicy)
                 packFinalPartitionCoexecTail(scheduled)
             result.add(scheduled)
             if context.derivePartialLrWaits:
