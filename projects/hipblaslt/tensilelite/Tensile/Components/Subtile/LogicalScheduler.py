@@ -4078,6 +4078,7 @@ class LogicalScheduler:
             _MAX_PREVIOUS_PARTITION_DTL_LOADS,
             _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX,
             advancePartitionInterleave,
+            eliminateRedundantLgkmDrains,
             instructionSchedule,
             safeOutstandingLocalReadSuffix,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
@@ -4197,6 +4198,12 @@ class LogicalScheduler:
                 first_mfma_count,
             )
             _set_entry_wait_lr_count(first_em_list, safe_count)
+        if use_partial_lr_waits:
+            # Dependency lowering creates correctness waits independently.
+            # Once every partition has its final physical placement, remove a
+            # later full LGKM-only drain when an earlier full drain dominates
+            # it and no LDS/SMEM producer intervenes.
+            eliminateRedundantLgkmDrains(module)
         if use_pap_preloop_skip and skipping_first_gr_group and not first_gr_group_done:
             module.add(pap_merge_label)
             module.add(SMovB32(dst=sgpr("PersistentPrefetchState"), src=0,

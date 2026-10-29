@@ -4040,6 +4040,85 @@ class TestInstructionSchedulerWrapPrefetch:
                     if inst.comment == f"{prefix}-gr{suffix}")
                 assert load == setup + 1
 
+    def test_lgkm_drain_elimination_crosses_partition_modules(self):
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, sgpr, vgpr
+        from rocisa.instruction import (
+            BufferLoadB128, DSLoadB128, SBarrier, SWaitCnt)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            eliminateRedundantLgkmDrains)
+
+        self._schedule()
+
+        body = Module()
+        partition_one = Module()
+        partition_one.add(DSLoadB128(
+            dst=vgpr(0, 4), src=vgpr(1), ds=DSModifiers(offset=0),
+            comment="p1-read"))
+        partition_one.add(SWaitCnt(
+            dscnt=0, comment="p1-overwrite-drain"))
+        partition_one.add(SBarrier(comment="p1-barrier"))
+        partition_one.add(BufferLoadB128(
+            dst=None, vaddr=vgpr(2), saddr=sgpr(0, 4), soffset=0,
+            comment="future-dtl-load"))
+        body.add(partition_one)
+
+        partition_two = Module()
+        partition_two.add(SWaitCnt(
+            dscnt=0, comment="p2-consumer-drain"))
+        body.add(partition_two)
+
+        assert eliminateRedundantLgkmDrains(body) == 1
+        assert [
+            inst.comment for inst in body.flatitems()
+            if isinstance(inst, SWaitCnt)
+        ] == ["p1-overwrite-drain"]
+
+    def test_lgkm_producer_prevents_drain_elimination(self):
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.instruction import DSLoadB128, SWaitCnt
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            eliminateRedundantLgkmDrains)
+
+        self._schedule()
+
+        body = Module()
+        body.add(SWaitCnt(dscnt=0, comment="first-drain"))
+        body.add(DSLoadB128(
+            dst=vgpr(0, 4), src=vgpr(1), ds=DSModifiers(offset=0),
+            comment="younger-read"))
+        body.add(SWaitCnt(dscnt=0, comment="required-drain"))
+
+        assert eliminateRedundantLgkmDrains(body) == 0
+        assert [
+            inst.comment for inst in body.flatitems()
+            if isinstance(inst, SWaitCnt)
+        ] == ["first-drain", "required-drain"]
+
+    def test_combined_wait_is_preserved_but_establishes_lgkm_drain(self):
+        from rocisa.code import Module
+        from rocisa.instruction import SWaitCnt
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            eliminateRedundantLgkmDrains)
+
+        self._schedule()
+
+        body = Module()
+        body.add(SWaitCnt(
+            dscnt=0, vlcnt=0, comment="combined-drain"))
+        body.add(SWaitCnt(
+            dscnt=0, comment="redundant-lgkm-only-drain"))
+
+        assert eliminateRedundantLgkmDrains(body) == 1
+        waits = [
+            inst for inst in body.flatitems()
+            if isinstance(inst, SWaitCnt)
+        ]
+        assert len(waits) == 1
+        assert waits[0].comment == "combined-drain"
+        assert waits[0].vlcnt == 0
+
     def test_data_only_partition_zero_prefetch_is_recognized(self):
         import shutil
         from types import SimpleNamespace
