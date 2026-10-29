@@ -10,7 +10,7 @@ with pluggable scheduling rules.
 from typing import List, Tuple, Optional
 from rocisa.code import Module, TextBlock
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
-    LocalReadInstruction, GlobalReadInstruction, CommonInstruction
+    LocalReadInstruction, GlobalReadInstruction, CommonInstruction, VXorB32
 
 
 # Prototype policy: advance the final partition's complete interleaving stream
@@ -34,6 +34,10 @@ _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
 # seam-advance experiment.  Keep every real P3 follower in P3 for this
 # checkpoint; the removed LGKM wait still supplies the empty seam anchor.
 _ADVANCE_FINAL_PARTITION_FOLLOWERS = False
+# Coexecute independent local-read address swaps in one MFMA shadow, then use
+# the recovered intervals to start local reads earlier and right-align an
+# overloaded final DTL cohort one request per MFMA.
+_PACK_FINAL_PARTITION_COEXEC_TAIL = True
 
 
 class _DtlIntervalCapacityError(RuntimeError):
@@ -1308,6 +1312,180 @@ def advancePartitionInterleave(
         [],
         finalMfmas,
         combinedFollowers[boundary:]))
+    return True
+
+
+def packFinalPartitionCoexecTail(schedule):
+    """Repack an overloaded final-partition read/DTL tail.
+
+    This transform is selected from schedule structure rather than macrotile
+    dimensions. It applies only when all four independent local-read address
+    XORs, the ordered local reads, and an overloaded DTL cohort can be placed
+    without moving waits or barriers:
+
+      * the four XORs share the first empty MFMA shadow after the barrier;
+      * local reads begin in the following shadow, with at most three reads in
+        the first shadow and two in each subsequent non-DTL shadow;
+      * the final DTL requests are right-aligned one per MFMA shadow, each
+        following one ordered local read.
+
+    Returns True and mutates ``schedule`` when the complete rewrite is legal.
+    Returns False without mutation for balanced or unsupported schedules.
+    """
+    isMfma = lambda inst: isinstance(
+        inst, (MFMAInstruction, MXMFMAInstruction))
+
+    prefix = []
+    mfmas = []
+    followers = []
+    for inst in schedule.flatitems():
+        if isMfma(inst):
+            mfmas.append(inst)
+            followers.append([])
+        elif not mfmas:
+            prefix.append(inst)
+        else:
+            followers[-1].append(inst)
+
+    if len(mfmas) < 4:
+        return False
+    if not any(
+            sum(_isDtlLoad(inst) for inst in group) > 1
+            for group in followers):
+        return False
+
+    barriers = [
+        groupIndex
+        for groupIndex, group in enumerate(followers)
+        for inst in group
+        if _isBarrier(inst)
+    ]
+    if len(barriers) != 1:
+        return False
+    barrierIndex = barriers[0]
+
+    xors = [
+        inst for group in followers for inst in group
+        if isinstance(inst, VXorB32)
+    ]
+    if len(xors) != 4:
+        return False
+    xorDst = {str(inst.dst) for inst in xors}
+
+    def isIndependentXor(inst):
+        srcs = list(inst.srcs)
+        return (
+            len(srcs) == 2
+            and str(srcs[0]) == str(inst.dst)
+            and str(srcs[1]) not in xorDst
+        )
+
+    if (
+            len(xorDst) != len(xors)
+            or not all(isIndependentXor(inst) for inst in xors)):
+        return False
+    xorPayload = [
+        inst
+        for group in followers
+        if any(isinstance(item, VXorB32) for item in group)
+        for inst in group
+        if isinstance(inst, (TextBlock, VXorB32))
+    ]
+
+    reads = [
+        inst for group in followers for inst in group
+        if _isDsRead(inst)
+    ]
+    if not reads:
+        return False
+
+    dtlBundles = []
+    pairedSetupIds = set()
+    for group in followers:
+        for index, inst in enumerate(group):
+            if not _isDtlLoad(inst):
+                continue
+            if index == 0 or not _isM0Update(group[index - 1]):
+                return False
+            setup = group[index - 1]
+            if id(setup) in pairedSetupIds:
+                return False
+            pairedSetupIds.add(id(setup))
+            dtlBundles.append((setup, inst))
+    if len(dtlBundles) < 2 or len(reads) < len(dtlBundles):
+        return False
+
+    xorTarget = barrierIndex + 1
+    readStart = xorTarget + 1
+    dtlStart = len(mfmas) - 1 - len(dtlBundles)
+    dtlTargets = list(range(dtlStart, len(mfmas) - 1))
+    readOnlyTargets = list(range(readStart, dtlStart))
+    if (
+            xorTarget >= len(mfmas) - 1
+            or not readOnlyTargets
+            or len(dtlTargets) != len(dtlBundles)):
+        return False
+
+    # Reserve one ordered read for every late DTL interval. The remaining
+    # reads are left-aligned to maximize latency hiding.
+    earlyReads = reads[:-len(dtlBundles)]
+    lateReads = reads[-len(dtlBundles):]
+    readPlan = []
+    remaining = list(earlyReads)
+    for targetIndex, target in enumerate(readOnlyTargets):
+        capacity = 3 if targetIndex == 0 else 2
+        cohort = remaining[:capacity]
+        remaining = remaining[capacity:]
+        readPlan.append((target, cohort))
+    if remaining or not readPlan[0][1]:
+        return False
+    readPlan.extend(zip(dtlTargets, ([read] for read in lateReads)))
+
+    movedIds = {
+        id(inst)
+        for inst in [*xorPayload, *reads]
+    }
+    movedIds.update(
+        id(inst)
+        for bundle in dtlBundles
+        for inst in bundle
+    )
+    rewritten = [
+        [inst for inst in group if id(inst) not in movedIds]
+        for group in followers
+    ]
+    targetGroups = {
+        xorTarget,
+        *(target for target, _ in readPlan),
+    }
+    if any(
+            any(not isinstance(inst, TextBlock) for inst in rewritten[target])
+            for target in targetGroups):
+        return False
+
+    rewritten[xorTarget].extend(xorPayload)
+    for target, cohort in readPlan:
+        rewritten[target].extend(cohort)
+    for target, bundle in zip(dtlTargets, dtlBundles):
+        rewritten[target].extend(bundle)
+
+    def physicalCount(group):
+        return sum(not isinstance(inst, TextBlock) for inst in group)
+
+    if any(
+            physicalCount(group) > (4 if index == xorTarget else 3)
+            for index, group in enumerate(rewritten)):
+        return False
+    if any(
+            sum(_isDtlLoad(inst) for inst in group) > 1
+            for group in rewritten):
+        return False
+
+    items = list(prefix)
+    for mfma, group in zip(mfmas, rewritten):
+        items.append(mfma)
+        items.extend(group)
+    schedule.setItems(items)
     return True
 
 
