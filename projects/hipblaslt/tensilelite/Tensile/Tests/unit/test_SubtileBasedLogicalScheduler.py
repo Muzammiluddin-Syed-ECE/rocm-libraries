@@ -17,7 +17,8 @@ Organized by pass:
 import pytest
 from dataclasses import replace
 from Tensile.Components.Subtile.Kernel import (
-    TileInfo, AB_B8, AB_B16, AB_B16_W32, AB_B4, MXSA_B4, MXSB_B4, CD_F32, CD_F32_W32,
+    TileInfo, AB_B8, AB_B16, AB_B16_W32, AB_B4, MXSA_B4, MXSB_B4,
+    MXSA_B8, MXSB_B8, CD_F32, CD_F32_W32,
 )
 from Tensile.Components.Subtile.LogicalScheduler import (
     GRPlacementStrategy,
@@ -40,15 +41,19 @@ from rocisa.code import Module
 
 def makeTileInfo(tc, kernel):
     """Compatibility wrapper: select geometry from kernel config and return TileInfo."""
-    fp4 = kernel["ProblemType"].get("MXBlockA", 0) > 0
+    has_mx = kernel["ProblemType"].get("MXBlockA", 0) > 0
+    is_mxfp8 = (
+        has_mx
+        and kernel["ProblemType"]["DataTypeA"].is8bitFloat()
+    )
     wave32 = kernel.get("WavefrontSize", 64) == 32
     ab_bf16 = AB_B16_W32 if wave32 else AB_B16
     cd_f32 = CD_F32_W32 if wave32 else CD_F32
     _geo = {
-        'A': AB_B4 if fp4 else ab_bf16,
-        'B': AB_B4 if fp4 else ab_bf16,
-        'MXSA': MXSA_B4,
-        'MXSB': MXSB_B4,
+        'A': AB_B8 if is_mxfp8 else AB_B4 if has_mx else ab_bf16,
+        'B': AB_B8 if is_mxfp8 else AB_B4 if has_mx else ab_bf16,
+        'MXSA': MXSA_B8 if is_mxfp8 else MXSA_B4,
+        'MXSB': MXSB_B8 if is_mxfp8 else MXSB_B4,
         'D': cd_f32,
     }
     # TDM path queries writer.states.subtileLdsSwizzle in TileInfo.__init__.
@@ -129,6 +134,30 @@ def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None,
     if fp4:
         kernel["_DepthUMXSA"] = depthU // mxblock
         kernel["_DepthUMXSB"] = depthU // mxblock
+    return kernel
+
+
+def create_kernel_mxfp8(MT0=256, MT1=256, depthU=128,
+                         miWaveGroup=None):
+    """Create the production dual-period MXFP8 PGR2 kernel fixture."""
+    kernel = create_kernel(
+        MT0, MT1, fp4=True, depthU=depthU,
+        miWaveGroup=miWaveGroup or [2, 2])
+    dtype = _mock_dtype(1)
+    kernel["ProblemType"]["DataTypeA"] = dtype
+    kernel["ProblemType"]["DataTypeB"] = dtype
+    kernel.update({
+        "MatrixInstK": 128,
+        "MIInputPerThreadA": 32,
+        "MIInputPerThreadB": 32,
+        "_DualPeriodMXFP8": True,
+        "_ScalePeriodUA": 2 * depthU,
+        "_ScalePeriodUB": 2 * depthU,
+        "_ScaleReuseA": 2,
+        "_ScaleReuseB": 2,
+        "_DepthUMXSA": 2 * depthU // 32,
+        "_DepthUMXSB": 2 * depthU // 32,
+    })
     return kernel
 
 
@@ -3380,6 +3409,93 @@ class TestGetNumVgpr:
 # ══════════════════════════════════════════════════════════════
 # Integration tests
 # ══════════════════════════════════════════════════════════════
+
+class TestDualPeriodMXFP8ScheduleFingerprint:
+    """Pin Experiment 36's complete MT256x256 C0/C1 instruction order.
+
+    Searchable baseline text is retained at:
+    /home/muzasyed/Journey/Workspace/MXFP8VsFP8/du128-pgr2-scheduling/
+    exp36-productization-2026-10-29/baseline/mainloop-c{0,1}.s
+    """
+
+    _EXPECTED = {
+        0: (180, "ca4f07114f874f89cc6fd8802f837240fc8be0278f377ba574cab1e35e07ab56"),
+        1: (150, "93518cec9c744055c8c49aae5f23e8a9cf5f71216d5c0ea1b5f514f52e99da91"),
+    }
+
+    @staticmethod
+    def _normalize(assembly, copy_index):
+        """Retain partition boundaries, opcodes, operands, and issue order."""
+        import re
+
+        begin = f"/* MAINLOOP_C{copy_index} start */"
+        end = f"/* MAINLOOP_C{copy_index} end */"
+        region = assembly[
+            assembly.index(begin) + len(begin):assembly.index(end)
+        ]
+        normalized = []
+        for raw in region.splitlines():
+            line = raw.strip()
+            marker = re.fullmatch(
+                r"/\* partition=(\d+) subIterK=(\d+) \*/", line)
+            if marker:
+                normalized.append(
+                    f"partition={marker.group(1)} subIterK={marker.group(2)}")
+                continue
+            line = line.split("//", 1)[0].strip()
+            if not line or line.startswith("/*"):
+                continue
+            normalized.append(" ".join(line.split()))
+        return "\n".join(normalized) + "\n"
+
+    def test_mt256x256_c0_c1_match_clean_baseline(self):
+        import hashlib
+
+        kernel = create_kernel_mxfp8()
+        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = \
+            make_writer_and_tileinfos(kernel, fp4=True)
+        cfg = replace(make_cfg_du128_4wave(), uniformPgrEpoch=True)
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.allocVgprTiles(
+            writer, tiA, tiB,
+            scaleTileInfoA=scaleTiA,
+            scaleTileInfoB=scaleTiB)
+        try:
+            sched.populate_instructions(
+                writer, kernel,
+                tileInfoA=tiA,
+                tileInfoB=tiB,
+                dtileInfo=dTileInfo,
+                scaleTileInfoA=scaleTiA,
+                scaleTileInfoB=scaleTiB)
+            assembly = str(sched.emitMainAndExitLoops(writer, kernel))
+
+            for copy_index, (expected_lines, expected_hash) in \
+                    self._EXPECTED.items():
+                normalized = self._normalize(assembly, copy_index)
+                lines = normalized.splitlines()
+                assert len(lines) == expected_lines
+                assert hashlib.sha256(
+                    normalized.encode()).hexdigest() == expected_hash
+                assert sum(
+                    line.startswith("partition=") for line in lines) == 4
+
+                instructions = [
+                    line for line in lines
+                    if not line.startswith("partition=")
+                ]
+                pending_m0_setup = False
+                for line in instructions:
+                    if line.startswith(("s_add_u32 m0,", "s_mov_b32 m0,")):
+                        assert not pending_m0_setup
+                        pending_m0_setup = True
+                    elif line.startswith("buffer_load") and pending_m0_setup:
+                        pending_m0_setup = False
+                assert not pending_m0_setup
+        finally:
+            sched.deallocVgprTiles(writer)
+
 
 class TestInstructionSchedulerWrapPrefetch:
     """Partition-prefetch LRs must not delay independent MFMAs."""
