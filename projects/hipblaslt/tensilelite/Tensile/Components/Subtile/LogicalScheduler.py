@@ -4072,6 +4072,7 @@ class LogicalScheduler:
         for interleaving. When schedule=False, emits instructions sequentially.
         """
         from .InstructionScheduler import (
+            _DtlIntervalCapacityError,
             _ADVANCE_FINAL_PARTITION_FOLLOWERS,
             _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT,
             _FINAL_PARTITION_INTERLEAVE_ADVANCE_MFMAS,
@@ -4139,13 +4140,25 @@ class LogicalScheduler:
                             current_mfma_count,
                         )
                         _set_entry_wait_lr_count(em_list, safe_count)
-                    scheduled = instructionSchedule(
-                        em_list,
-                        multiDU=self._is_multi_du(),
-                        minGapDsReadToWait=minGapDsReadToWait,
-                        partitionPrefetch=self.config.prefetchNextPartition,
-                        limitDtlBundlesPerMfma=self.config.dualPeriodScale,
-                        uniformPgrEpoch=self.config.uniformPgrEpoch)
+                    try:
+                        scheduled = instructionSchedule(
+                            em_list,
+                            multiDU=self._is_multi_du(),
+                            minGapDsReadToWait=minGapDsReadToWait,
+                            partitionPrefetch=self.config.prefetchNextPartition,
+                            limitDtlBundlesPerMfma=self.config.dualPeriodScale,
+                            uniformPgrEpoch=self.config.uniformPgrEpoch)
+                    except _DtlIntervalCapacityError:
+                        # Dependency windows can make the simple request-count
+                        # capacity check optimistic. Retry only this cell with
+                        # the prior legal density policy.
+                        scheduled = instructionSchedule(
+                            em_list,
+                            multiDU=self._is_multi_du(),
+                            minGapDsReadToWait=minGapDsReadToWait,
+                            partitionPrefetch=self.config.prefetchNextPartition,
+                            limitDtlBundlesPerMfma=False,
+                            uniformPgrEpoch=self.config.uniformPgrEpoch)
                     if (
                             self.config.uniformPgrEpoch
                             and self.config.numSubIterK == 1

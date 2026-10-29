@@ -4385,6 +4385,64 @@ class TestInstructionSchedulerWrapPrefetch:
                 isinstance(inst, MXMFMAInstruction)
                 for inst in items[setup_position + 1:load_position])
 
+    def test_dtl_density_falls_back_when_geometry_has_too_few_intervals(self):
+        import shutil
+        from types import SimpleNamespace
+        from rocisa import rocIsa
+        from rocisa.container import accvgpr, mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, MXMFMAInstruction, SAddU32)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            instructionSchedule)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        mfmas = [
+            MXMFMAInstruction(
+                instType=InstType.INST_F8, accType=InstType.INST_F32,
+                variant=[16, 16, 128, 1], acc=accvgpr(0, 4),
+                a=vgpr(0, 8), b=vgpr(8, 8), acc2=accvgpr(0, 4),
+                mxsa=vgpr(16), mxsb=vgpr(17), block=32,
+                comment=f"mfma{index}")
+            for index in range(4)
+        ]
+        requests = []
+        for index in range(6):
+            requests.extend([
+                SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"m0-{index}"),
+                BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"gr-{index}"),
+            ])
+        modules = [
+            EmittedModule(
+                moduleId=0, instructions=mfmas,
+                source=SimpleNamespace(kind="mfma")),
+            EmittedModule(
+                moduleId=1, instructions=requests,
+                source=SimpleNamespace(kind="gr")),
+        ]
+
+        items = list(instructionSchedule(
+            modules,
+            partitionPrefetch=True,
+            limitDtlBundlesPerMfma=True,
+        ).flatitems())
+
+        assert [
+            inst.comment for inst in items
+            if isinstance(inst, BufferLoadB128)
+        ] == [f"gr-{index}" for index in range(6)]
+        assert sum(
+            isinstance(inst, MXMFMAInstruction) for inst in items
+        ) == len(mfmas)
+
     def test_vmem_bundles_follow_first_consumer_rank(self):
         import shutil
         from types import SimpleNamespace
