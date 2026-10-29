@@ -717,23 +717,6 @@ def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
     return None
 
 
-def _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules):
-    """Leave up to 15 current-partition reads outstanding at p0's wait."""
-    order = _findPartitionZeroPrefetchOrder(
-        preMfmaOrders, emittedModules)
-    if order is None:
-        return
-    for mid in order:
-        em = emittedModules[mid]
-        if em.opType != "wait_lr":
-            continue
-        for inst in em.instructions:
-            if _isWaitCnt(inst) and getattr(inst, "dscnt", -1) == 0:
-                inst.dscnt = 15
-                inst.comment = \
-                    "Wait for prior LR; leave p0 prefetch reads in flight"
-
-
 def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     """Move p0's full LR drain before its independent younger reads.
 
@@ -1470,8 +1453,6 @@ def instructionSchedule(
     if isMx8Cycle:
         p0Split = _splitPartitionZeroPrefetch(
             preMfmaOrders, emittedModules)
-    if p0Split is None:
-        _setPartitionZeroPrefetchWait(preMfmaOrders, emittedModules)
     partitionPrefetchPolicy = (
         isMx8Cycle
         and not multiDU

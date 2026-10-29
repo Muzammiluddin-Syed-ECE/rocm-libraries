@@ -1367,46 +1367,31 @@ class TestAssignVgprTiles:
 
 class TestPlaceGRs:
 
-    def test_du128_moves_only_vgpr_safe_wrap_a_to_p2(self):
+    def test_nonuniform_gr_placement_does_not_rewrite_lr_geometry(self):
+        """The generic non-uniform path keeps the LR placement pass intact."""
         cfg = make_cfg_du128_4wave()
-        sched = LogicalScheduler(cfg)
-        parts = sched.build(stop_after=Pass.GR)
 
-        moved = [
-            lr for lr in parts[2][0].lrs
-            if lr.tensor == 'A' and lr.mtIteration == 1
-        ]
-        assert len(moved) == 1
-        assert (moved[0].tiles.tileId_start,
-                moved[0].tiles.tileId_end) == (0, 4)
-        assert moved[0].targetPartition == 0
+        def lr_geometry(stop_after):
+            parts = LogicalScheduler(cfg).build(stop_after=stop_after)
+            return [
+                (
+                    pi, slot.subIterK, lr.tensor, lr.mtIteration,
+                    lr.targetPartition, lr.tiles.subIterK_start,
+                    lr.tiles.subIterK_end, lr.tiles.tileId_start,
+                    lr.tiles.tileId_end,
+                )
+                for pi, partition in enumerate(parts)
+                for slot in partition
+                for lr in slot.lrs
+            ]
 
-        p3_wrap = {
-            lr.tensor for lr in parts[3][0].lrs
-            if lr.mtIteration == 1
-        }
-        assert p3_wrap == {'B', 'SA', 'SB'}
-
-        p2_a_vgprs = {
-            value
-            for tile_map in parts[2][0].mfma.vgpr_tile_maps['A']
-            for value in tile_map.values()
-        }
-        wrap_a_vgprs = {
-            value
-            for tile_map in moved[0].vgpr_tile_map
-            for value in tile_map.values()
-        }
-        assert p2_a_vgprs.isdisjoint(wrap_a_vgprs)
-
-        inc_parts = LogicalScheduler(cfg).build(stop_after=Pass.GR_INC)
-        moved_with_inc = [
-            lr for lr in inc_parts[2][0].lrs
-            if lr.tensor == 'A' and lr.mtIteration == 1
-        ]
-        assert len(moved_with_inc) == 1
-        assert any(op.kind == 'lr_inc' and op.tensor == 'A'
-                   for op in moved_with_inc[0].preOps)
+        before_gr = lr_geometry(Pass.LR)
+        after_gr = lr_geometry(Pass.GR)
+        assert after_gr == before_gr
+        assert [
+            item for item in after_gr
+            if item[2] == 'A' and item[3] == 1
+        ] == [(3, 0, 'A', 1, 0, 0, 1, 0, 4)]
 
     def test_1x1_k1_DU256(self):
         """256x256, DU256, FP4. GR order: A, B, SA, SB.
@@ -2398,6 +2383,38 @@ class TestUniformPgrEpoch:
                 gr.tiles.tileId_end,
                 granularity.mn)
         ]
+
+    def test_production_dual_period_pgr2_selects_uniform_epoch(
+            self, monkeypatch):
+        import importlib
+
+        kernel_module = importlib.import_module(
+            "Tensile.Components.Subtile.Kernel")
+        kernel = create_kernel_mxfp8()
+        kernel["PrefetchGlobalRead"] = 2
+        kernel["PrefetchLocalRead"] = 0
+        writer, *_ = make_writer_and_tileinfos(kernel, fp4=True)
+        writer.tPA = None
+        writer.tPB = None
+
+        selected = {}
+
+        class SelectionCaptured(Exception):
+            pass
+
+        def capture_config(**kwargs):
+            selected.update(kwargs)
+            raise SelectionCaptured
+
+        monkeypatch.setattr(
+            kernel_module, "MFMASchedulerConfig", capture_config)
+        with pytest.raises(SelectionCaptured):
+            kernel_module.mainLoop(writer, kernel)
+
+        assert selected["pgr"] == 2
+        assert selected["prefetchNextPartition"]
+        assert selected["uniformPgrEpoch"]
+        assert selected["uniformEpochVmemCohortSize"] == 5
 
     def test_complete_n2_epoch_precedes_first_n1_consumer(self):
         cfg = self._cfg()

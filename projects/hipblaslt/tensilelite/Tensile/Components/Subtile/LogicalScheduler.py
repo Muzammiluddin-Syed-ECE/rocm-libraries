@@ -1848,42 +1848,6 @@ class LogicalScheduler:
                         partition=pi,
                         unrollId=uid))
 
-    def _move_du128_wrap_a_to_p2(self):
-        """Move only the VGPR-safe A(n+1) wrap reads from p3 into p2."""
-        cfg = self.config
-        isTarget = (
-            cfg.dualPeriodScale
-            and cfg.pgr == 2
-            and cfg.prefetchNextPartition
-            and cfg.numSubIterK == 1
-            and cfg.partitionOrder == "n-major"
-            and cfg.partitionSizesM == [4, 4]
-            and cfg.partitionSizesN == [4, 4]
-        )
-        if not isTarget:
-            return
-
-        src = self._partitions[3][0]
-        dst = self._partitions[2][0]
-        candidates = [
-            lr for lr in src.lrs
-            if lr.tensor == "A"
-            and lr.mtIteration == 1
-            and lr.targetPartition == 0
-            and lr.tiles.subIterK_start == 0
-            and lr.tiles.subIterK_end == 1
-            and lr.tiles.tileId_start == 0
-            and lr.tiles.tileId_end == 4
-        ]
-        if len(candidates) != 1:
-            return
-
-        moved = candidates[0]
-        src.lrs.remove(moved)
-        moved.partition = 2
-        moved.subIterK_slot = 0
-        dst.lrs.append(moved)
-
     @pipeline_pass(Pass.GR)
     def place_GRs(self) -> PartitionSchedule:
         """Place Global Reads by iterating MFMAs across partitions.
@@ -1945,8 +1909,6 @@ class LogicalScheduler:
             else:
                 self._distribute_grs(gr_list, gr_slot_bounds, unrollId=uid)
 
-        if not self.config.uniformPgrEpoch:
-            self._move_du128_wrap_a_to_p2()
         return self._partitions[0]
 
     # ── Annotate dependencies ─────────────────────────────
