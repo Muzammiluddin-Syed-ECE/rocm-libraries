@@ -3696,6 +3696,41 @@ class TestInstructionSchedulerWrapPrefetch:
         assert not packFinalPartitionCoexecTail(schedule)
         assert snapshot() == before
 
+    def test_balanced_wrap_preserves_preceding_dtl_alignment(self):
+        from rocisa.instruction import (
+            GlobalReadInstruction, MFMAInstruction)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            rightAlignPrecedingDtlForWrapSeam)
+
+        self._schedule()
+        schedule = self._coexec_tail_schedule(overloaded=False)
+
+        def mfmaShadows():
+            current = -1
+            result = {}
+            for inst in schedule.flatitems():
+                if isinstance(inst, MFMAInstruction):
+                    current += 1
+                elif getattr(inst, "comment", ""):
+                    result[inst.comment] = current
+            return result
+
+        before = mfmaShadows()
+        assert rightAlignPrecedingDtlForWrapSeam(schedule)
+        after = mfmaShadows()
+
+        for comment in (
+                "vmem-wait", "barrier",
+                *(f"xor-{index}" for index in range(4))):
+            assert after[comment] == before[comment]
+        assert [
+            after[f"dtl-{index}"] for index in range(5)
+        ] == [7, 8, 9, 10, 11]
+        assert sum(
+            isinstance(inst, GlobalReadInstruction)
+            for inst in schedule.flatitems()
+        ) == 5
+
     def test_final_partition_coexec_tail_rejects_insufficient_capacity(self):
         from rocisa.code import TextBlock
         from Tensile.Components.Subtile.InstructionScheduler import (

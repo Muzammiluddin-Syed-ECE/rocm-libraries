@@ -1360,6 +1360,49 @@ def finalPartitionNeedsWrapSpace(schedule) -> bool:
     )
 
 
+def rightAlignPrecedingDtlForWrapSeam(
+        schedule,
+        policy: WrapSeamPolicy = CMS_ANALOGUE_WRAP_SEAM) -> bool:
+    """Preserve preceding-partition DTL placement without advancing the seam.
+
+    ``compactWrapSeam`` reserves a suffix of the preceding partition for the
+    wrap synchronization stream, then right-aligns complete DTL bundles before
+    it. When a balanced final partition does not need that borrowed capacity,
+    retain the same DTL placement while leaving the reserved suffix empty.
+    This isolates the decision to advance the wrap stream from the independent
+    DTL-alignment policy.
+    """
+    prefix = []
+    mfmas = []
+    followers = []
+    for inst in schedule.flatitems():
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            mfmas.append(inst)
+            followers.append([])
+        elif not mfmas:
+            prefix.append(inst)
+        else:
+            followers[-1].append(inst)
+
+    reservedMfmas = max(
+        policy.streamAdvanceMfmas + 1,
+        policy.syncAdvanceMfmas,
+    )
+    endExclusive = len(mfmas) - reservedMfmas
+    if not mfmas or endExclusive < 0:
+        return False
+    rewritten = _rightAlignDtlBundlesBefore(followers, endExclusive)
+    if rewritten is None:
+        return False
+
+    items = list(prefix)
+    for mfma, group in zip(mfmas, rewritten):
+        items.append(mfma)
+        items.extend(group)
+    schedule.setItems(items)
+    return True
+
+
 def packFinalPartitionCoexecTail(schedule):
     """Repack an overloaded final-partition read/DTL tail.
 
@@ -2296,6 +2339,9 @@ def instructionScheduleLoop(
                 if finalPartitionNeedsWrapSpace(scheduled):
                     compactWrapSeam(
                         previousSchedule[0], scheduled, policy=seamPolicy)
+                elif seamPolicy.rightAlignPrecedingDtl:
+                    rightAlignPrecedingDtlForWrapSeam(
+                        previousSchedule[0], policy=seamPolicy)
                 packFinalPartitionCoexecTail(scheduled)
             result.add(scheduled)
             if context.derivePartialLrWaits:
