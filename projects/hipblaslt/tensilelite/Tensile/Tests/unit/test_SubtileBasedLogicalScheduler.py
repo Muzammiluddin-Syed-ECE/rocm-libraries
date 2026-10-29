@@ -3513,6 +3513,75 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         return modules, list(instructionSchedule(modules).flatitems())
 
+    @staticmethod
+    def _coexec_tail_schedule(read_count=20, dtl_count=5, overloaded=True):
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, DSLoadB128, MFMAInstruction, SAddU32,
+            SBarrier, SWaitCnt, VXorB32)
+
+        def mfma(index):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=f"mfma-{index}")
+
+        schedule = Module()
+        schedule.add(SWaitCnt(dscnt=0, comment="entry-wait"))
+        reads = [
+            DSLoadB128(
+                dst=vgpr(80 + 4 * index, 4),
+                src=vgpr(65 + index % 4),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"read-{index}")
+            for index in range(read_count)
+        ]
+        bundles = [
+            (
+                SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"setup-{index}"),
+                BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"dtl-{index}"),
+            )
+            for index in range(dtl_count)
+        ]
+        xors = [
+            VXorB32(
+                dst=vgpr(65 + 2 * index),
+                src0=vgpr(65 + 2 * index),
+                src1=vgpr(66 + 2 * index),
+                comment=f"xor-{index}")
+            for index in range(4)
+        ]
+
+        for index in range(16):
+            schedule.add(mfma(index))
+            if index == 0:
+                schedule.add(SWaitCnt(vlcnt=15, comment="vmem-wait"))
+            elif index == 1:
+                schedule.add(SBarrier(comment="barrier"))
+                schedule.addComment0("A address swaps")
+                schedule.add(xors[0])
+            elif 2 <= index <= 4:
+                if index == 3:
+                    schedule.addComment0("B address swaps")
+                schedule.add(xors[index - 1])
+            if index == 14:
+                schedule.addItems(reads)
+                if overloaded:
+                    for setup, load in bundles:
+                        schedule.add(setup)
+                        schedule.add(load)
+            if not overloaded and 10 <= index < 10 + len(bundles):
+                setup, load = bundles[index - 10]
+                schedule.add(setup)
+                schedule.add(load)
+        return schedule
+
     def test_wrap_payload_starts_after_second_mfma(self):
         from rocisa.instruction import (
             LocalReadInstruction, MFMAInstruction, SBarrier)
@@ -3543,6 +3612,103 @@ class TestInstructionSchedulerWrapPrefetch:
             if isinstance(inst, LocalReadInstruction)
         ] == [f"ds{i}" for i in range(16)]
         assert sum(len(em.instructions) for em in modules) == len(items)
+
+    def test_final_partition_coexec_tail_repacking(self):
+        from rocisa.code import TextBlock
+        from rocisa.instruction import (
+            GlobalReadInstruction, LocalReadInstruction, MFMAInstruction,
+            SBarrier, SWaitCnt, VXorB32)
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            packFinalPartitionCoexecTail)
+
+        self._schedule()
+        schedule = self._coexec_tail_schedule()
+
+        assert packFinalPartitionCoexecTail(schedule)
+
+        prefix = []
+        followers = []
+        for inst in schedule.flatitems():
+            if isinstance(inst, MFMAInstruction):
+                followers.append([])
+            elif not followers:
+                prefix.append(inst)
+            else:
+                followers[-1].append(inst)
+
+        assert [inst.comment for inst in prefix] == ["entry-wait"]
+        assert [
+            inst.comment for inst in followers[0]
+            if isinstance(inst, SWaitCnt)
+        ] == ["vmem-wait"]
+        assert [
+            inst.comment for inst in followers[1]
+            if isinstance(inst, SBarrier)
+        ] == ["barrier"]
+        assert [
+            inst.comment for inst in followers[2]
+            if isinstance(inst, VXorB32)
+        ] == [f"xor-{index}" for index in range(4)]
+        assert [
+            str(inst).strip() for inst in followers[2]
+            if isinstance(inst, TextBlock)
+        ] == ["/* A address swaps */", "/* B address swaps */"]
+
+        assert [
+            sum(isinstance(inst, LocalReadInstruction) for inst in group)
+            for group in followers
+        ] == [0, 0, 0, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0]
+        assert [
+            sum(isinstance(inst, GlobalReadInstruction) for inst in group)
+            for group in followers
+        ] == [0] * 10 + [1] * 5 + [0]
+        assert [
+            inst.comment for group in followers for inst in group
+            if isinstance(inst, LocalReadInstruction)
+        ] == [f"read-{index}" for index in range(20)]
+        assert [
+            inst.comment for group in followers for inst in group
+            if isinstance(inst, GlobalReadInstruction)
+        ] == [f"dtl-{index}" for index in range(5)]
+        for group in followers[10:15]:
+            physical = [
+                inst for inst in group
+                if type(inst).__name__ != "TextBlock"
+            ]
+            assert isinstance(physical[0], LocalReadInstruction)
+            assert isinstance(physical[-1], GlobalReadInstruction)
+
+    def test_final_partition_coexec_tail_leaves_balanced_schedule_unchanged(self):
+        from rocisa.code import TextBlock
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            packFinalPartitionCoexecTail)
+
+        self._schedule()
+        schedule = self._coexec_tail_schedule(overloaded=False)
+        snapshot = lambda: [
+            (type(inst), str(inst), None if isinstance(inst, TextBlock) else id(inst))
+            for inst in schedule.flatitems()
+        ]
+        before = snapshot()
+
+        assert not packFinalPartitionCoexecTail(schedule)
+        assert snapshot() == before
+
+    def test_final_partition_coexec_tail_rejects_insufficient_capacity(self):
+        from rocisa.code import TextBlock
+        from Tensile.Components.Subtile.InstructionScheduler import (
+            packFinalPartitionCoexecTail)
+
+        self._schedule()
+        schedule = self._coexec_tail_schedule(read_count=21)
+        snapshot = lambda: [
+            (type(inst), str(inst), None if isinstance(inst, TextBlock) else id(inst))
+            for inst in schedule.flatitems()
+        ]
+        before = snapshot()
+
+        assert not packFinalPartitionCoexecTail(schedule)
+        assert snapshot() == before
 
     def test_dense_epoch_frontier_ignores_text_and_caps_followers_at_three(self):
         from rocisa.code import TextBlock
