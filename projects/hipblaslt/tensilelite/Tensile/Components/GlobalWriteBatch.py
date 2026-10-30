@@ -55,9 +55,6 @@ from ..KernelWriterModules import hasSequentialValuC
 from math import ceil, log2
 
 
-import os as _os
-
-
 def _plsinStoreGate(name: str, default: bool = False) -> bool:
     """Read a PLSIN store optimization gate at emission time.
 

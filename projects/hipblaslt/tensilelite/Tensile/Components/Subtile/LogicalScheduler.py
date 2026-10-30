@@ -29,7 +29,6 @@ from bisect import bisect_left
 import copy
 import io
 import math
-import os
 
 from rocisa.code import Module
 from .ScheduleTypes import (
@@ -4030,46 +4029,6 @@ class LogicalScheduler:
         # exceeds the +-simm16 short-branch range, so force 32-bit long branches.
         module.add(writer.emitFusedStoreGuard(kernel, plainLabel, longBranch=True))
         return module
-
-    def _inject_fused_drain(self, writer, kernel, emitted_3d):
-        """Insert the FUSED-NLL drain module (write-index/cvt materialization) right
-        after the NLL's global-read drain (wait_gr), in the FUSED copy only.
-
-        Mirrors emitMainAndExitLoops.inject_pap_after_nll_drain: find the wait_gr
-        EmittedModule, then place a new EmittedModule after it (and after any sync
-        that chains off it) by re-pointing that drain's before-consumers at the new
-        module. The module is built eagerly (like the PAP module) so it lands as
-        already-emitted instructions with source=None. Step 4c uses
-        buildSubtileFusedDrainProbe to measure VGPR headroom at the drain; Step 4d
-        swaps in the real materialization. Caller passes a deepcopy, so this mutates
-        in place. Returns emitted_3d unchanged if no drain is found."""
-        drain_module = writer.buildSubtileFusedDrainProbe(kernel)
-
-        def insert_after_drain(em_list):
-            wait_gr = next((em for em in em_list if em.opType == 'wait_gr'), None)
-            if wait_gr is None:
-                return False
-            tail_id = wait_gr.moduleId
-            sync = next((em for em in em_list
-                         if em.opType == 'sync' and em.before == tail_id), None)
-            if sync is not None:
-                tail_id = sync.moduleId
-
-            new_id = max(em.moduleId for em in em_list) + 1
-            consumers = [em for em in em_list if em.before == tail_id]
-            em_list.append(EmittedModule(moduleId=new_id,
-                                         instructions=[drain_module],
-                                         before=tail_id,
-                                         source=None))
-            for consumer in consumers:
-                consumer.before = new_id
-            return True
-
-        for partition_emitted in emitted_3d:
-            for em_list in partition_emitted:
-                if insert_after_drain(em_list):
-                    return emitted_3d
-        return emitted_3d
 
     def emitMainAndExitLoops(self, writer, kernel, tensorParametersA=None, tensorParametersB=None):
         """Emit preloop + mainloop + NGLL + NLL exit paths (no tail).

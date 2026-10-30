@@ -13710,7 +13710,7 @@ class KernelWriterAssembly(KernelWriter):
             generalBatchedGemmLoad = Label(label="GeneralBatchedGemmLoad"+matL, comment="Computing the Batch Matrix's base address for General Batched GEMM")
             generalBatchedGemmLoad_End = Label(label="GeneralBatchedGemmLoad"+matL+"_End", comment="End of label GeneralBatchedGemmLoad"+matL)
             argTypeChecks = Label(label="ArgTypeChecks"+matL, comment="Checks for ArgType to General Batched or non-General Batched")
-            stridedBatchedGemmLoad = Label(label="StridedBatchedGemmLoad"+matL, comment="Computing the Batch Matrix's base address for Strided Batched GEMM")            
+            stridedBatchedGemmLoad = Label(label="StridedBatchedGemmLoad"+matL, comment="Computing the Batch Matrix's base address for Strided Batched GEMM")
             bpe = self.states.bpeCinternal if mat =="Bias" else (self.states.bpeE if mat == "E" else self.states.bpeCexternal)
             if mat == "Gate":
               bpe = self.states.bpeGate
@@ -14095,41 +14095,12 @@ class KernelWriterAssembly(KernelWriter):
     remainder = flat[i:]
     return units, remainder
 
-  def buildSubtileFusedDrainProbe(self, kernel):
-    """Step 4c measurement probe: reserve the paired-store's arch-VGPR footprint at
-    the FUSED NLL drain to measure whether it spills past the VGPR ceiling.
-
-    The fused 256x256 kernel already sits near the unified VGPR ceiling (arch +
-    AGPR accumulators). The NLL's terminal-subIterK MFMAs keep the LR tile VGPRs
-    live, and DirectToLds means there are no large G2L destination VGPRs to
-    reclaim — so the injected paired store adds arch-VGPR pressure on top of the
-    live tiles. This probe checks out a representative store footprint (cvt vPack +
-    coord/coutRowPtr + addr scratch), forces it onto the high-water via a dummy
-    write, then checks it back in. It emits no functional work and self-cleans, so
-    the FUSED copy stays dead code and the post-loop path is untouched — only the
-    reported .vgpr_count/.vgpr_spill_count change, quantifying the headroom before
-    the real materialization + GR-offset reclaim lands."""
-    module = Module("SubtileFusedDrainProbe")
-    module.addComment0("PostLoopStoreInNll 4c PROBE: measure paired-store VGPR footprint at NLL drain")
-    # cvtVgprStruct.vgprBf16Temp (vPack): 4 VGPRs, 4-aligned for buffer_store_dwordx4.
-    vPack = self.vgprPool.checkOutAligned(4, 4, tag="fusedDrainProbe_vPack")
-    # coord0/coord1/coutRowPtrD (write indices) + address scratch held to the store.
-    vIdx  = self.vgprPool.checkOut(3, tag="fusedDrainProbe_writeIdx")
-    vAddr = self.vgprPool.checkOutAligned(2, 2, tag="fusedDrainProbe_addr")
-    module.add(VMovB32(dst=vgpr(vPack), src=0, comment="probe: touch vPack (high-water)"))
-    module.add(VMovB32(dst=vgpr(vIdx),  src=0, comment="probe: touch write-index"))
-    module.add(VMovB32(dst=vgpr(vAddr), src=0, comment="probe: touch addr scratch"))
-    self.vgprPool.checkIn(vAddr)
-    self.vgprPool.checkIn(vIdx)
-    self.vgprPool.checkIn(vPack)
-    return module
-
   def loadFusedEpilogueStoreSgprs(self, kernel):
     """Fused-NLL epilogue kernarg loader (dispatcher).
 
     Splits the single contiguous ~13-SGPR epilogue kernarg block (see
     _loadFusedEpilogueStoreSgprsContig) into per-slot contiguous chunks
-    (scaleAB / scaleCD / SAV / bias+type+stride / factorDim / E / activation)
+    (scaleAB / scaleCD / SAV / bias / gate / factorDim / E / activation)
     so the LARGEST contiguous SGPR request drops from ~13 to <=4. That lets the
     fused store pack into the lent drain-era holes (SrdA/B/C/WS, Swap*, LocalWrite*,
     StreamKLocal*) instead of extending .sgpr_count past budget on large macro tiles
