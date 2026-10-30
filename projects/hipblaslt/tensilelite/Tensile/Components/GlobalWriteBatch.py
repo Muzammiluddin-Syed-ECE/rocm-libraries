@@ -3158,7 +3158,11 @@ class GlobalWriteBatchWriter:
     module.add(self._emit16bitSubtilePairedStorePhase2(addrCalc, tt0=tt0))
     return module
 
-  def _emit16bitSubtilePairedStorePhase1(self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, interior: bool = False) -> Module:
+  def _emit16bitSubtilePairedStorePhase1(
+      self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int,
+      tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0,
+      interior: bool = False, vPack: int = None, vAddrScratch: int = None,
+      pipeline: bool = False) -> Module:
     """Phase 1 (issue) of the paired dwordx4 store — see _emit16bitSubtilePairedStore.
 
     Emits, with NO s_barrier and NO buffer_store:
@@ -3174,7 +3178,7 @@ class GlobalWriteBatchWriter:
     between the phases, this method must not clobber any register the MFMA schedule
     depends on (it only writes the shared cvtVgpr scratch block + tmp SGPRs).
     """
-    module = Module("16bitSubtilePairedStorePhase1")
+    module = Module("pairedStoreIssue" if pipeline else "16bitSubtilePairedStorePhase1")
     isFp16 = self.kernel["ProblemType"]["DestDataType"].isHalf()
 
     # Reuse cvtVgprStruct.vgprBf16Temp..vgprBf16Inc (+0..+3) as 4 scratch vgprs.
@@ -3182,16 +3186,24 @@ class GlobalWriteBatchWriter:
     # vgprBf16Temp is at an even VGPR index, satisfying buffer_store_dwordx4's
     # alignment requirement.  The +0..+3 slots are safely overwritten here as pack/perm
     # staging for each pair.
-    vPack = self.cvtVgprStruct.vgprBf16Temp  # +0..3: packed 16bit dwords, 2-aligned
+    if vPack is None:
+      vPack = self.cvtVgprStruct.vgprBf16Temp  # +0..3: packed 16bit dwords, 2-aligned
 
     vPermAddr    = self.cvtVgprStruct.vgprPermAddr
     vLGDelta     = self.cvtVgprStruct.vgprLaneGroupDelta
-    vAddrScratch = self.cvtVgprStruct.vgprAddrScratch
+    if vAddrScratch is None:
+      vAddrScratch = self.cvtVgprStruct.vgprAddrScratch
     addrDVgpr    = addrCalc.addrDVgpr
 
     typeStr = "fp16" if isFp16 else "bf16"
     VCvtPkF32to16 = VCvtPkF32toFP16 if isFp16 else VCvtPkF32toBF16
-    module.addComment1(f"{typeStr} paired dwordx4 store tt0={tt0} (sba=0+sba=1): pack 8 f32 accvgprs -> 4 {typeStr} dwords")
+    if pipeline:
+      module.addComment1(
+        f"[pipeline] ISSUE tt0={tt0}: pack 8 f32 -> 4 {typeStr} dwords + ds_bpermute (buf v{vPack})")
+    else:
+      module.addComment1(
+        f"{typeStr} paired dwordx4 store tt0={tt0} (sba=0+sba=1): "
+        f"pack 8 f32 accvgprs -> 4 {typeStr} dwords")
 
     # Pack sba=0 subtile: ValuC+sumIdx0+{0,1} → vPack+0; ValuC+sumIdx0+{2,3} → vPack+1
     # Pack sba=1 subtile: ValuC+sumIdx1+{0,1} → vPack+2; ValuC+sumIdx1+{2,3} → vPack+3
@@ -3284,7 +3296,10 @@ class GlobalWriteBatchWriter:
       "PostLoopStoreInNll Phase1 must be barrier-free (no s_barrier in the MFMA-interleaved store)"
     return module
 
-  def _emit16bitSubtilePairedStorePhase2(self, addrCalc, tt0: int = 0, pending_lgkm=None, interior: bool = False) -> Module:
+  def _emit16bitSubtilePairedStorePhase2(
+      self, addrCalc, tt0: int = 0, pending_lgkm=None, interior: bool = False,
+      vPack: int = None, vAddrScratch: int = None, globalOffset=None,
+      explicitDscnt=None, pipeline: bool = False) -> Module:
     """Phase 2 (consume) of the paired dwordx4 store — see _emit16bitSubtilePairedStore.
 
     Emits, with NO s_barrier:
@@ -3301,19 +3316,22 @@ class GlobalWriteBatchWriter:
 
     Consumes the vPack / vgprAddrScratch / tmpS01 state produced by Phase 1.
     """
-    module = Module("16bitSubtilePairedStorePhase2")
+    module = Module("pairedStoreCommit" if pipeline else "16bitSubtilePairedStorePhase2")
 
     ntd = self.kernel["NonTemporalD"]
     isGlc = bool(ntd & 0x1)
     isSlc = bool(ntd & 0x2)
     isNT  = bool(ntd & 0x4)
 
-    vPack        = self.cvtVgprStruct.vgprBf16Temp
-    vAddrScratch = self.cvtVgprStruct.vgprAddrScratch
+    if vPack is None:
+      vPack = self.cvtVgprStruct.vgprBf16Temp
+    if vAddrScratch is None:
+      vAddrScratch = self.cvtVgprStruct.vgprAddrScratch
 
     bpeCurr = self.parentWriter.states.bpeCexternal
     bpeDest = self.parentWriter.states.bpeCexternalGSU1
-    globalOffset = addrCalc.globalOffset * bpeDest // bpeCurr
+    if globalOffset is None:
+      globalOffset = addrCalc.globalOffset * bpeDest // bpeCurr
     # Must match Phase1's predicate exactly: Phase1 produces the mask in tmpS01 and this
     # is its only consumer (see the Phase1 note).
     # A fully-interior block yields exec mask -1 (no lanes disabled), and in the full-tile
@@ -3329,15 +3347,23 @@ class GlobalWriteBatchWriter:
       module.add(VPermlane16SwapB32(dst=vgpr(vPack+0), src=vgpr(vPack+2), comment="swap dwords 0↔2"))
       module.add(VPermlane16SwapB32(dst=vgpr(vPack+1), src=vgpr(vPack+3), comment="swap dwords 1↔3"))
     else:
-      if pending_lgkm is None:
+      if explicitDscnt is not None:
+        module.add(SWaitCnt(
+          dscnt=explicitDscnt,
+          comment=f"[pipeline] wait this group's ds_bpermute; "
+                  f"{explicitDscnt} younger ds in flight (tt0={tt0})"))
+      elif pending_lgkm is None:
         module.add(SWaitCnt(dscnt=0, comment="wait for ds_bpermute (lgkmcnt=0)"))
       else:
         dscnt = pending_lgkm - 4
         module.add(SWaitCnt(dscnt=dscnt, comment=f"wait for this pair's 4 ds_bpermute (lgkmcnt={dscnt})"))
 
       module.addComment1("v_permlane32_swap_b32: swap across lane-32 boundary")
-      module.add(VPermlane32SwapB32(dst=vgpr(vPack+0), src=vgpr(vPack+2), comment="swap dwords 0↔2"))
-      module.add(VPermlane32SwapB32(dst=vgpr(vPack+1), src=vgpr(vPack+3), comment="swap dwords 1↔3"))
+      swapArrow = "<->" if pipeline else "↔"
+      module.add(VPermlane32SwapB32(
+        dst=vgpr(vPack+0), src=vgpr(vPack+2), comment=f"swap dwords 0{swapArrow}2"))
+      module.add(VPermlane32SwapB32(
+        dst=vgpr(vPack+1), src=vgpr(vPack+3), comment=f"swap dwords 1{swapArrow}3"))
 
     if useAlign8:
       module.add(self.getEdgeMovInstType()(EXEC(), sgpr(self.tmpS01, self.laneSGPRC), "apply exec mask"))
@@ -3349,7 +3375,8 @@ class GlobalWriteBatchWriter:
       saddr=sgpr("SrdD", 4),
       soffset=0,
       mubuf=MUBUFModifiers(offen=True, offset12=globalOffset, glc=isGlc, slc=isSlc, nt=isNT),
-      comment=f"16bit paired dwordx4 store tt0={tt0},{tt0+1}"
+      comment=(f"[pipeline] 16bit paired dwordx4 store tt0={tt0},{tt0+1}"
+               if pipeline else f"16bit paired dwordx4 store tt0={tt0},{tt0+1}")
     ))
 
     if useAlign8:
@@ -3358,7 +3385,10 @@ class GlobalWriteBatchWriter:
     # WAR hazard: buffer_store_dwordx4 reads vPack[0:3] as source operands.
     # The next paired store's v_cvt_pk_bf16_f32 will overwrite vPack.
     # Insert nop to ensure the store has latched its source VGPRs.
-    module.add(SNop(waitState=0, comment="1 wait state: WAR hazard between store src and next pack dst"))
+    warComment = ("1 wait state: WAR store src -> next same-buffer pack dst"
+                  if pipeline
+                  else "1 wait state: WAR hazard between store src and next pack dst")
+    module.add(SNop(waitState=0, comment=warComment))
 
     assert not any(isinstance(i, SBarrier) for i in module.flatitems()), \
       "PostLoopStoreInNll Phase2 must be barrier-free (no s_barrier in the MFMA-interleaved store)"
@@ -3378,39 +3408,12 @@ class GlobalWriteBatchWriter:
     post the 4 in-place ds_bpermute, and compute the adjusted D address into
     vAddrScratch (overlaps the in-flight bpermute).  Does NOT wait/permute/store.
     Returns (module, globalOffset) — globalOffset is carried to the COMMIT half."""
-    module = Module("pairedStoreIssue")
-    isFp16 = self.kernel["ProblemType"]["DestDataType"].isHalf()
-    VCvtPkF32to16 = VCvtPkF32toFP16 if isFp16 else VCvtPkF32toBF16
-    typeStr = "fp16" if isFp16 else "bf16"
-    vPermAddr = self.cvtVgprStruct.vgprPermAddr
-    vLGDelta  = self.cvtVgprStruct.vgprLaneGroupDelta
-    addrDVgpr = addrCalc.addrDVgpr
-
-    def vc(sumIdx, vi):
-      return vgpr("ValuC+" + str(sumIdx + vi - prefixOffset))
-
-    module.addComment1(f"[pipeline] ISSUE tt0={tt0}: pack 8 f32 -> 4 {typeStr} dwords + ds_bpermute (buf v{vPack})")
-    module.add(VCvtPkF32to16(dst=vgpr(vPack+0), src0=vc(sumIdx0, 0), src1=vc(sumIdx0, 1), comment=f"sba=0 tt0={tt0}[0:1] -> {typeStr}"))
-    module.add(VCvtPkF32to16(dst=vgpr(vPack+1), src0=vc(sumIdx0, 2), src1=vc(sumIdx0, 3), comment=f"sba=0 tt0={tt0}[2:3] -> {typeStr}"))
-    module.add(VCvtPkF32to16(dst=vgpr(vPack+2), src0=vc(sumIdx1, 0), src1=vc(sumIdx1, 1), comment=f"sba=1 tt0={tt0}[0:1] -> {typeStr}"))
-    module.add(VCvtPkF32to16(dst=vgpr(vPack+3), src0=vc(sumIdx1, 2), src1=vc(sumIdx1, 3), comment=f"sba=1 tt0={tt0}[2:3] -> {typeStr}"))
-
-    module.addComment1("ds_bpermute in-place: gather packed dwords from partner lane-group")
-    for k in range(4):
-      module.add(DSBPermuteB32(dst=vgpr(vPack+k), src0=vgpr(vPermAddr), src1=vgpr(vPack+k), comment=f"perm dword {k}"))
-
+    module = self._emit16bitSubtilePairedStorePhase1(
+      addrCalc, sumIdx0, sumIdx1, prefixOffset, tt0=tt0, interior=True,
+      vPack=vPack, vAddrScratch=vAddrScratch, pipeline=True)
     bpeCurr = self.parentWriter.states.bpeCexternal
     bpeDest = self.parentWriter.states.bpeCexternalGSU1
     globalOffset = addrCalc.globalOffset * bpeDest // bpeCurr
-    addrScaleShift = int(log2(bpeCurr // bpeDest)) if bpeCurr > bpeDest else 0
-    if addrScaleShift:
-      module.add(VLShiftRightB32(dst=vgpr(vAddrScratch), shiftHex=addrScaleShift, src=vgpr(addrDVgpr),
-                                 comment=f"scale addrDVgpr bpe {bpeCurr}->{bpeDest}"))
-      module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(vAddrScratch), src1=vgpr(vLGDelta),
-                         comment="adjusted D addr = scaled addrDVgpr + lane_group*8"))
-    else:
-      module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(addrDVgpr), src1=vgpr(vLGDelta),
-                         comment="adjusted D addr = addrDVgpr + lane_group*8"))
     return module, globalOffset
 
   def _emitPairedStoreCommit(self, vPack: int, vAddrScratch: int, globalOffset: int, tt0: int, dscnt: int):
@@ -3418,27 +3421,9 @@ class GlobalWriteBatchWriter:
     (leaving `dscnt` younger ds ops in flight), do the 2 permlane swaps, and emit the
     dwordx4 store.  `dscnt` = number of ds_bpermute from LATER groups still in flight
     (4 per pipelined group; 0 at the pipeline drain)."""
-    module = Module("pairedStoreCommit")
-    ntd = self.kernel["NonTemporalD"]
-    isGlc = bool(ntd & 0x1)
-    isSlc = bool(ntd & 0x2)
-    isNT  = bool(ntd & 0x4)
-    module.add(SWaitCnt(dscnt=dscnt, comment=f"[pipeline] wait this group's ds_bpermute; {dscnt} younger ds in flight (tt0={tt0})"))
-    module.addComment1("v_permlane32_swap_b32: swap across lane-32 boundary")
-    module.add(VPermlane32SwapB32(dst=vgpr(vPack+0), src=vgpr(vPack+2), comment="swap dwords 0<->2"))
-    module.add(VPermlane32SwapB32(dst=vgpr(vPack+1), src=vgpr(vPack+3), comment="swap dwords 1<->3"))
-    module.addComment1("buffer_store_dwordx4: write 8 16bit values (4 dwords, 2-aligned src)")
-    module.add(BufferStoreB128(
-      src=vgpr(vPack, 4),
-      vaddr=vgpr(vAddrScratch),
-      saddr=sgpr("SrdD", 4),
-      soffset=0,
-      mubuf=MUBUFModifiers(offen=True, offset12=globalOffset, glc=isGlc, slc=isSlc, nt=isNT),
-      comment=f"[pipeline] 16bit paired dwordx4 store tt0={tt0},{tt0+1}"
-    ))
-    # WAR: the store reads vPack; the next same-buffer pack (2 groups later) overwrites it.
-    module.add(SNop(waitState=0, comment="1 wait state: WAR store src -> next same-buffer pack dst"))
-    return module
+    return self._emit16bitSubtilePairedStorePhase2(
+      None, tt0=tt0, interior=True, vPack=vPack, vAddrScratch=vAddrScratch,
+      globalOffset=globalOffset, explicitDscnt=dscnt, pipeline=True)
 
   def _emit16bitSubtileScalarStore(self, addrCalc, sumIdx0: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, interior: bool = False) -> Module:
     """Emit a 16bit store for an orphan subtile element with no partner.
