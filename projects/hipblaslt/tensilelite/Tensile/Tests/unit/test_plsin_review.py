@@ -397,8 +397,11 @@ def _legacy_paired_store_commit(
     return module
 
 
-def test_paired_store_pipeline_refactor_is_assembly_identical(monkeypatch):
-    """The thin pipeline driver must emit exactly the pre-refactor instruction text."""
+@pytest.mark.parametrize("full_tile", [False, True])
+def test_paired_store_pipeline_refactor_is_assembly_identical(
+    monkeypatch, full_tile,
+):
+    """The pipeline stays legacy-identical even if its caller looks fused/full-tile."""
     monkeypatch.delenv("TENSILE_PLSIN_DEBUG", raising=False)
     writer = object.__new__(GlobalWriteBatchWriter)
     writer.kernel = {
@@ -418,7 +421,7 @@ def test_paired_store_pipeline_refactor_is_assembly_identical(monkeypatch):
     )
     writer._subtileHoistedAddrDVgpr = -1
     writer._subtileHoistedAddrBlockN = -1
-    writer._fusedFullTileNoGuards = lambda: False
+    writer._fusedFullTileNoGuards = lambda: full_tile
     addr_calc = SimpleNamespace(addrDVgpr=10, globalOffset=64)
 
     actual_issue, actual_offset = writer._emitPairedStoreIssue(

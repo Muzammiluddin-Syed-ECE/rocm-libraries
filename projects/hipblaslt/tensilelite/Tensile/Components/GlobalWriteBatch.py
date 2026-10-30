@@ -3263,8 +3263,14 @@ class GlobalWriteBatchWriter:
     # four ds_bpermute and their s_waitcnt are dropped.  vPermAddr becomes dead.
     # Restricted to the full-tile fused store (see setup note): the guarded/edge
     # path keeps ds_bpermute + its align8 mask.
-    self._permlane16Active = _plsinStoreGate(
-      "PLSIN_STORE_PERMLANE16", default=True) and self._fusedFullTileNoGuards()
+    # The depth-2 pipeline driver accounts for four ds_bpermute operations per
+    # issue when it computes each relative dscnt.  Keep that contract explicit:
+    # fused full-tile store optimizations must not silently remove those LDS ops.
+    self._permlane16Active = (
+      not pipeline
+      and _plsinStoreGate("PLSIN_STORE_PERMLANE16", default=True)
+      and self._fusedFullTileNoGuards()
+    )
     if not self._permlane16Active:
       module.addComment1("ds_bpermute in-place: gather packed dwords from partner lane-group")
       for k in range(4):
@@ -3291,8 +3297,11 @@ class GlobalWriteBatchWriter:
     # standard lane_group*8 in vLGDelta.
     vRowDelta = vPermAddr if self._permlane16Active else vLGDelta
     deltaStr = "(lane_group&1)*12rows" if self._permlane16Active else "lane_group*8"
-    hoistAddr = _plsinStoreGate(
-      "PLSIN_STORE_HOIST_ADDR", default=True) and self._fusedFullTileNoGuards()
+    hoistAddr = (
+      not pipeline
+      and _plsinStoreGate("PLSIN_STORE_HOIST_ADDR", default=True)
+      and self._fusedFullTileNoGuards()
+    )
     addrAlreadyLive = (hoistAddr
                        and self._subtileHoistedAddrDVgpr == addrDVgpr
                        and self._subtileHoistedAddrBlockN == blockIdxN)
