@@ -14166,10 +14166,11 @@ class KernelWriterAssembly(KernelWriter):
     names = self.states.numStoreSgprNames
     def _present(name):
       return name in names
-    def _addChunk(cnames, csizes, extByteOff, extActType=False):
+    def _addChunk(cnames, csizes, extByteOff, extActType=False, normalOnly=False):
       dwords = sum(csizes)
       chunks.append(dict(names=cnames, sizes=csizes, dwords=dwords,
-                         packedOff=packedOff[0], extOff=extByteOff, extActType=extActType))
+                         packedOff=packedOff[0], extOff=extByteOff,
+                         extActType=extActType, normalOnly=normalOnly))
       packedOff[0] += dwords * 4
 
     # scaleA + scaleB (kept in one chunk when both present)
@@ -14194,6 +14195,19 @@ class KernelWriterAssembly(KernelWriter):
       if _present("BiasStride"): bNames.append("BiasStride"); bSizes.append(self.states.BiasStride)
       _addChunk(bNames, bSizes, extOff)
     if supportUA: extOff += ui.biasSize
+    # Gate is intentionally absent from the grouped-gemm UserArgs ABI
+    # (UserArgumentsInfo.gateSize == 0).  Keep its normal-kernarg chunks in the
+    # resource plan, but never read them through the external UserArgs pointer.
+    # The fused-store runtime guard rejects ArgType==2 for Gate kernels, so these
+    # chunks are unreachable on that arm; the normal ArgType path remains fully
+    # supported.
+    if _present("AddressGate"):
+      _addChunk(["AddressGate"], [self.states.numSgprAddressGate], extOff, normalOnly=True)
+      gNames = []; gSizes = []
+      if _present("GateType"):   gNames.append("GateType");   gSizes.append(self.states.GateType)
+      if _present("GateStride"): gNames.append("GateStride"); gSizes.append(self.states.GateStride)
+      if gNames:
+        _addChunk(gNames, gSizes, extOff, normalOnly=True)
     # factorDim
     if _present("FactorDim"): _addChunk(["FactorDim"], [1], extOff)
     if supportUA: extOff += ui.factorDimSize
@@ -14249,7 +14263,9 @@ class KernelWriterAssembly(KernelWriter):
       module.add(extReadEpilogueLabel)
       extBase = self.externalArgLoader.getOffset()
       for ch in chunks:
-        if ch["extActType"]:
+        if ch["normalOnly"]:
+          continue
+        elif ch["extActType"]:
           # ActivationType sits at the TOP of the fixed activation region; load the
           # activation args (if any) from the region base and ActivationType from
           # (base + activationSize - 4). SGPRs are contiguous (args then type).
@@ -14417,13 +14433,45 @@ class KernelWriterAssembly(KernelWriter):
       self.argLoader.setOffset(argOffset) # Restore offset
     return module, definedNames
 
+  def _fusedEpilogueResourceSpecs(self, kernel):
+    """Return transient SGPR resources required before the fused NLL store."""
+    specs = []
+    if kernel["ProblemType"]["UseScaleAB"] == "Vector":
+      specs.extend((("SrdScaleA", 4, 4), ("SrdScaleB", 4, 4)))
+    if kernel["ProblemType"]["UseScaleAlphaVec"]:
+      specs.append(("SrdScaleAlphaVec", 4, 4))
+    if self.states.useBias != DataDirection.NONE:
+      specs.append(("SrdBias", 4, 4))
+    if self.states.useGateResidual:
+      specs.extend((("SrdGate", 4, 4), ("GateNullOne", 2, 2)))
+    if kernel["ProblemType"]["UseE"]:
+      specs.append(("SrdE", 4, 4))
+    if kernel["ProblemType"]["UseScaleCD"]:
+      specs.append(("ScaleD", 2, 2))
+    return specs
+
+  def _lendSubtileFusedVgpr(self, base):
+    """Temporarily return one checked-out input tile to the fused-store pool.
+
+    A tail-path tile may already have been checked in, which is an expected
+    non-lendable case.  Any other register-pool failure indicates inconsistent
+    bookkeeping and must remain visible instead of being silently swallowed.
+    """
+    try:
+      self.vgprPool.addFromCheckOut(base)
+    except RuntimeError as exc:
+      if "never checked out" in str(exc):
+        return False
+      raise
+    return True
+
   def buildSubtileFusedStore(self, kernel, tPA, tPB):
     """4d-3a (Option B): emit the beta0/NonEdge D store INSIDE the FUSED NLL.
 
     Mirrors the restricted OptNLL store (see the NLL prefetch path ~L9860):
     globalWriteElements is called with noGSUBranch=True, applyAlpha=True,
     betas=[False], edge=False so ONLY the beta0/NonEdge paired dwordx4 stores are
-    emitted — no C load (SrdC), no beta/edge/StreamK/GSU/activation branches. The
+    emitted — no C load (SrdC), no beta/edge/StreamK/GSU store branches. The
     applyAlpha multiply carries the effective alpha (with scaleA*scaleB folded in for
     scalar UseScaleAB); the fold + StreamK Alpha save/restore happen inside
     globalWriteElements so the later PLAIN post-loop store is unaffected. That
@@ -14557,11 +14605,8 @@ class KernelWriterAssembly(KernelWriter):
     for _base, _size in (self.states.subtileFusedLendVgprs or []):
       if any((_base + _k) in _protected for _k in range(_size)):
         continue
-      try:
-        self.vgprPool.addFromCheckOut(_base)
+      if self._lendSubtileFusedVgpr(_base):
         lentVgprs.append(_base)
-      except Exception:
-        pass
 
     # --- establish store prerequisites (normally done by endSummation) ---
     self.states.serializedStore = True
@@ -14661,19 +14706,15 @@ class KernelWriterAssembly(KernelWriter):
     # (drove .sgpr_count to 105 -> overflow on MT>=256). Doing it first packs the block
     # into the low holes and keeps .sgpr_count within budget.
     fusedEpilogueArgs = []
-    # Scalar UseScaleAB also needs the epilogue kernargs loaded here: the scaleA*scaleB
-    # factor is folded into Alpha *inside* globalWriteElements (see the scale-read at
-    # ~L15655 and the Alpha fold at ~L15927), which SLoadB32s from AddressScaleA/B.
-    # Those Address* pointers are part of numStoreSgprNames that endSummation only
-    # loads AFTER the NLL, so without this the fold would read garbage. Include the
-    # scalar case so the fused store's applyAlpha=True path (below) scales correctly
-    # even for scalar-ScaleAB kernels that have no SAV/vector-ScaleAB/bias epilogue.
-    fusedNeedsEpilogue = (kernel["ProblemType"]["UseScaleAlphaVec"]
-                          or (kernel["ProblemType"]["UseScaleAB"] != 0)
-                          or self.states.useBias != DataDirection.NONE)
-    if fusedNeedsEpilogue:
+    # numStoreSgprNames is the writer's complete epilogue resource contract.
+    # Trigger from it rather than a hand-maintained feature subset: ScaleCD,
+    # E, Gate and activation-only kernels need the same early NLL load as
+    # ScaleAB/SAV/Bias.
+    if self.states.numStoreSgprToLoad:
       _epMod, fusedEpilogueArgs = self.loadFusedEpilogueStoreSgprs(kernel)
       module.add(_epMod)
+      assert set(fusedEpilogueArgs) == set(self.states.numStoreSgprNames), \
+        "fused epilogue loader must define every planned store kernarg"
 
     fusedDefinedSrdD = "SrdD" not in self.sgprs
     self.states.subtileHoistedStoreInit = None
@@ -14713,7 +14754,7 @@ class KernelWriterAssembly(KernelWriter):
       else:
         module.add(srdInitMod)
 
-    # --- transient epilogue store SRDs (Bias / ScaleAlphaVec / vector-ScaleA/B) ---
+    # --- transient epilogue resources normally defined by endSummation ---
     # These SRD *symbols* are RegSet only in endSummation (defineVariableSgprs),
     # textually AFTER this fused NLL store. Their VALUES, however, are computed inside
     # globalWriteElements below (allocPostLoopSrdSuppress etc.), which references
@@ -14725,18 +14766,27 @@ class KernelWriterAssembly(KernelWriter):
     # after the store so endSummation re-defines them for the PLAIN post-loop store.
     # (Epilogue store kernargs were already loaded above, before SrdD, so the large
     # contiguous block packs into the low lent holes -- see the note there.)
-    fusedEpilogueSrds = []
-    def _fusedDefineEpilogueSrd(name):
+    fusedEpilogueResources = []
+    def _fusedDefineEpilogueResource(name, size, align):
       if name not in self.sgprs:
-        module.add(RegSet("s", "sgpr"+name, self.defineSgprIdx(name, 4, 4)))
-        fusedEpilogueSrds.append(name)
-    if kernel["ProblemType"]["UseScaleAB"] == "Vector":
-      _fusedDefineEpilogueSrd("SrdScaleA")
-      _fusedDefineEpilogueSrd("SrdScaleB")
-    if kernel["ProblemType"]["UseScaleAlphaVec"]:
-      _fusedDefineEpilogueSrd("SrdScaleAlphaVec")
-    if self.states.useBias != DataDirection.NONE:
-      _fusedDefineEpilogueSrd("SrdBias")
+        module.add(RegSet("s", "sgpr"+name, self.defineSgprIdx(name, size, align)))
+        fusedEpilogueResources.append(name)
+    for _name, _size, _align in self._fusedEpilogueResourceSpecs(kernel):
+      _fusedDefineEpilogueResource(_name, _size, _align)
+    if kernel["ProblemType"]["UseE"]:
+      # The loaded StridesE tuple needs the same symbolic aliases that
+      # endSummation normally establishes before globalWriteElements.
+      for idx in range(kernel["ProblemType"]["NumIndicesC"]):
+        i = idx
+        idxChar = self.states.indexChars[idx]
+        if i == 0 and not kernel["ProblemType"]["UseInitialStridesCD"]:
+          module.add(ValueSet("constStrideE%s" % idxChar, 1))
+        else:
+          if not kernel["ProblemType"]["UseInitialStridesCD"]:
+            i -= 1
+          module.add(RegSet("s", "sgprStrideE%s" % idxChar, "sgprStridesE", i))
+    if kernel["ProblemType"]["UseScaleCD"]:
+      assert kernel["ProblemType"]["ComputeDataType"].isSingle()
 
     # --- deferred drain of outstanding NLL summation memory traffic (normally
     # guaranteed by endSummation before the post-loop store). The paired dwordx4
@@ -14774,6 +14824,7 @@ class KernelWriterAssembly(KernelWriter):
       self.vgprs.coord1InMT     = _hoistedIdx["coord1InMT"]
       self.vgprs.coutRowPtrE    = _hoistedIdx["coutRowPtrE"]
       self.vgprs.coutRowPtrBias = _hoistedIdx["coutRowPtrBias"]
+      self.vgprs.coutRowPtrGate = _hoistedIdx["coutRowPtrGate"]
       self.states.subtileHoistedWriteIndices = None
       # PLSIN numIter<PGR (TENSILE_PLSIN_MIN_ITER lowered the fused-store gate below
       # PGR): the PGR>=2 preloop takes SkipToNLL for numIter<PGR (e.g. K==DepthU), so
@@ -14856,7 +14907,7 @@ class KernelWriterAssembly(KernelWriter):
     # stale symbol so endSummation's defineVariableSgprs re-defines them cleanly for
     # the PLAIN post-loop store.
     _spool = self.sgprPool.getPool()
-    for _name in reversed(fusedEpilogueSrds):
+    for _name in reversed(fusedEpilogueResources):
       _idx = self.sgprs.get(_name)
       if _idx is not None and _idx < len(_spool) and \
          _spool[_idx].status == RegisterPool.Status.InUse:
@@ -16143,7 +16194,8 @@ class KernelWriterAssembly(KernelWriter):
       module.addComment1("PLSIN: precompute effective-alpha==1 (Alpha & null scaleA/B) -> PostLoopFusedStore")
 
     depthU        = kernel["DepthU"]
-    depthUPow2    = (depthU & (depthU - 1)) == 0
+    assert depthU > 1 and (depthU & (depthU - 1)) == 0, \
+      "PostLoopStoreInNll assumes DepthU is a positive power of two"
     unrollIdx     = self.states.unrollIdx
     pgr           = kernel["PrefetchGlobalRead"]
     minIter       = self._plsinMinIter(kernel)
@@ -16181,13 +16233,9 @@ class KernelWriterAssembly(KernelWriter):
         # prefetch/MFMA shadow instead of sitting on the NLL prologue critical path.
         # emitFusedStoreGuard drops its transient no-tail/numIter/alpha checks on this
         # path and reads only the flag.
-        if depthUPow2:
-          m.addComment1("PLSIN guard-hoist: fold no-tail into PostLoopFusedStore (pre-loop shadow)")
-          m.add(SAndB32(dst=sgpr(bad), src0=sgpr("SizesSum+%u" % unrollIdx), src1=depthU - 1,
-                        comment="bad = SizesSum %% DepthU (0 => NLL terminal, no tail)"))
-        else:
-          m.add(SMovB32(dst=sgpr(bad), src=0,
-                        comment="bad = 0 (no-tail fold requires power-of-2 DepthU)"))
+        m.addComment1("PLSIN guard-hoist: fold no-tail into PostLoopFusedStore (pre-loop shadow)")
+        m.add(SAndB32(dst=sgpr(bad), src0=sgpr("SizesSum+%u" % unrollIdx), src1=depthU - 1,
+                      comment="bad = SizesSum %% DepthU (0 => NLL terminal, no tail)"))
         # beta == 0 (loop-invariant). UseBeta False => nothing to test.
         if kernel["ProblemType"]["UseBeta"]:
           m.addComment1("PLSIN guard-hoist: fold beta==0 into %s (pre-loop shadow)" % flag)
@@ -16199,6 +16247,15 @@ class KernelWriterAssembly(KernelWriter):
         if useStreamK:
           m.add(SOrB32(dst=sgpr(bad), src0=sgpr("StreamKLocalStart"), src1=sgpr(bad),
                        comment="bad |= StreamKLocalStart (not start -> split contributor, not fused)"))
+        # The grouped-gemm external UserArgs ABI has no Gate fields.  A Gate kernel
+        # is still fully supported through the normal kernarg path, but its ArgType=2
+        # arm must retain the pre-existing plain-store behavior rather than entering
+        # the fused store with unavailable Gate arguments.
+        if self.states.useGateResidual and supportUA:
+          m.add(SCmpEQU32(src0=sgpr("ArgType"), src1=2,
+                           comment="Gate unavailable in external UserArgs ABI?"))
+          m.add(SCSelectB32(dst=sgpr(bad), src0=1, src1=sgpr(bad),
+                             comment="ArgType==2 Gate -> not fused"))
         return m
 
       if isScalarScale:
@@ -16301,7 +16358,7 @@ class KernelWriterAssembly(KernelWriter):
 
       # Degenerate short-K guard: require numIter >= minIter so the NLL pipeline has a
       # real iteration to drain.
-      if depthUPow2 and pgr >= 2 and minIter > 1:
+      if pgr >= 2 and minIter > 1:
         module.addComment1("PLSIN guard-hoist: fold numIter>=%u into %s (pre-loop shadow)" % (minIter, flag))
         module.add(SLShiftRightB32(dst=sgpr(off), src=sgpr("SizesSum+%u" % unrollIdx),
                                    shiftHex=hex(log2(depthU)),
@@ -16372,8 +16429,8 @@ class KernelWriterAssembly(KernelWriter):
     """
     module = Module("FusedStoreGuard")
     depthU = kernel["DepthU"]
-    assert (depthU & (depthU - 1)) == 0, \
-      "PostLoopStoreInNll assumes DepthU is a power of two"
+    assert depthU > 1 and (depthU & (depthU - 1)) == 0, \
+      "PostLoopStoreInNll assumes DepthU is a positive power of two"
     # PLSIN guard-hoist: when the pre-loop scalar-eligibility flag exists (fp32 path,
     # computePostLoopFusedStore) it already folds (no-tail) && (numIter>=PGR) &&
     # (effective alpha==1) -- all loop-invariant, computed BEFORE the main loop so the
@@ -16400,6 +16457,15 @@ class KernelWriterAssembly(KernelWriter):
       return module
     else:
       module.addComment1("Fused-store guard: FUSED iff (no tail) && beta==0 && full-tile(M,N), else -> %s" % targetLabel.getLabelName())
+      if self.states.useGateResidual and kernel["ProblemType"]["SupportUserArgs"]:
+        module.add(SCmpEQU32(src0=sgpr("ArgType"), src1=2,
+                             comment="Gate unavailable in external UserArgs ABI?"))
+        if longBranch:
+          module.add(self.longBranchScc1(targetLabel, posNeg=1,
+                                         comment="ArgType==2 Gate -> not fused (long)"))
+        else:
+          module.add(SCBranchSCC1(labelName=targetLabel.getLabelName(),
+                                  comment="ArgType==2 Gate -> not fused"))
       with self.allocTmpSgpr(1, tag="fusedStoreGuard_tail") as tmpSgprInfo:
         module.add(SAndB32(dst=sgpr(tmpSgprInfo.idx),
                            src0=sgpr("SizesSum+%u" % self.states.unrollIdx),
@@ -17354,7 +17420,11 @@ class KernelWriterAssembly(KernelWriter):
           ssslist.append("E")
           useSize.append(False)
 
-      if self.states.useGateResidual and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1 or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+      if self.states.useGateResidual and (
+          kernel["GlobalSplitU"] in (1, -1)
+          or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"
+          or kernel["StreamK"] > 0
+      ):
         if self.vgprs.coutRowPtrGate != -1:
           module.add(VMulLOU32(dst=vgpr(self.vgprs.coutRowPtrGate),
                                src0=vgpr(self.vgprs.coutRowPtrGate),

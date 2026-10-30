@@ -3627,6 +3627,7 @@ class LogicalScheduler:
                 "coord1InMT":     writer.vgprs.coord1InMT,
                 "coutRowPtrE":    writer.vgprs.coutRowPtrE,
                 "coutRowPtrBias": writer.vgprs.coutRowPtrBias,
+                "coutRowPtrGate": writer.vgprs.coutRowPtrGate,
             }
             # Weave coordInsts into the NGLL MFMA gaps: after each MFMA, drop up to
             # perGap coord instrs (round-robin, preserving their relative RAW order —

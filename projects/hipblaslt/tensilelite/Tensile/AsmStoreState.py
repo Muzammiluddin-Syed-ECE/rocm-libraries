@@ -252,11 +252,11 @@ class StoreState:
                 self.sharedColBiasVgprs = kernelWriter.vgprPool.checkOut(self.numAddrVgpr, "sharedColBiasVgprs for packed elements")
             else:
                 self.sharedColBiasVgprs = None
-            if kernel["ProblemType"]["UseE"] and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1):
+            if kernel["ProblemType"]["UseE"] and isSingleKernel:
                 self.sharedColEVgprs = kernelWriter.vgprPool.checkOut(self.numAddrVgpr, "sharedColEVgprs for packed elements")
             else:
                 self.sharedColEVgprs = None
-            if self.useGateResidual and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1 or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+            if self.useGateResidual and isSingleKernel:
                 self.sharedColGateVgprs = kernelWriter.vgprPool.checkOut(self.numAddrVgpr, "sharedColGateVgprs for packed elements")
             else:
                 self.sharedColGateVgprs = None
@@ -306,11 +306,11 @@ class StoreState:
                 self.sharedColBiasVgprs = kernelWriter.vgprPool.checkOut(1, "sharedColBiasVgprs for packed elements")
             else:
                 self.sharedColBiasVgprs = None
-            if kernel["ProblemType"]["UseE"] and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1):
+            if kernel["ProblemType"]["UseE"] and isSingleKernel:
                 self.sharedColEVgprs = kernelWriter.vgprPool.checkOut(1, "sharedColEVgprs for packed elements")
             else:
                 self.sharedColEVgprs = None
-            if self.useGateResidual and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1 or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+            if self.useGateResidual and isSingleKernel:
                 self.sharedColGateVgprs = kernelWriter.vgprPool.checkOut(1, "sharedColGateVgprs")
             else:
                 self.sharedColGateVgprs = None
@@ -369,13 +369,13 @@ class StoreState:
         # TODO STREAM-K Update numVgprsPerElement for workspace
         if kernel["GroupLoadStore"] and kernel["ProblemType"]["UseBeta"]:
             self.numVgprsPerElement += self.cfg.numVgprsPerAddr
-        if kernel["ProblemType"]["UseE"] and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1):
+        if kernel["ProblemType"]["UseE"] and isSingleKernel:
             self.numVgprsPerElement += self.cfg.numVgprsPerAddr  # E address
             # Only needed in gradient activation
             if (kernel["ProblemType"]["Gradient"] and kernel["ProblemType"]["ActivationType"] != 'none'):
                 numVgprs = int(ceil(kernel["ProblemType"]["ComputeDataType"].numRegisters()))
                 self.numVgprsPerElement += numVgprs * gwvw # Loaded data
-        if self.useGateResidual and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1 or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+        if self.useGateResidual and isSingleKernel:
             numVgprs = int(ceil(kernel["ProblemType"]["ComputeDataType"].numRegisters()))
             self.numVgprsPerElement += numVgprs * gwvw  # Loaded data
         # We will use the same vgpr + ds_offset to load the vec addr
@@ -522,6 +522,11 @@ class StoreState:
         dataType = kernel["ProblemType"]["DestDataType"]
         if isWorkspace:
             dataType = kernel["ProblemType"]["ComputeDataType"]
+        isSingleKernel = (
+            kernel["GlobalSplitU"] in (1, -1)
+            or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"
+            or (kernel["StreamK"] > 0 and not isWorkspace)
+        )
 
         biasVgprMap = {}
         scaleAVecVgprMap = {}
@@ -713,17 +718,17 @@ class StoreState:
                     addrBiasVgpr = self.sharedColBiasVgprs+elementCol
                 else:
                     addrBiasVgpr = None
-                if kernel["ProblemType"]["UseE"] and (kernel["GlobalSplitU"] == 1):
+                if kernel["ProblemType"]["UseE"] and isSingleKernel:
                     addrEVgpr = self.sharedColEVgprs+elementCol
                 else:
                     addrEVgpr = None
-                if self.useGateResidual and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1 or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+                if self.useGateResidual and isSingleKernel:
                     addrGateVgpr = self.sharedColGateVgprs+elementCol
                 else:
                     addrGateVgpr = None
                 #print ("d0=", d0, "vc0=", vc0, "elementCol=", elementCol)
 
-                if kernel["ProblemType"]["UseScaleAlphaVec"] and (kernel["GlobalSplitU"] == 1):
+                if kernel["ProblemType"]["UseScaleAlphaVec"] and isSingleKernel:
                     if self.referenceVgprDim[self.factorDim] and self.referenceVgprDim[self.factorDim][0] == "ScaleAlpha":
                         addrScaleAlphaVecVgpr = self.sharedColScaleAlphaVecVgprs+elementCol
                     else:
@@ -731,7 +736,7 @@ class StoreState:
                 else:
                     addrScaleAlphaVecVgpr = None
 
-                if (kernel["ProblemType"]["UseScaleAB"] == "Vector") and (kernel["GlobalSplitU"] == 1):
+                if (kernel["ProblemType"]["UseScaleAB"] == "Vector") and isSingleKernel:
                     if self.referenceVgprDim[0] and self.referenceVgprDim[0][0] == "ScaleA":
                         addrScaleAVecVgpr = self.sharedColScaleAVecVgprs+elementCol
                     else:
@@ -763,19 +768,19 @@ class StoreState:
                 else:
                     addrBiasVgpr = None
 
-                if kernel["ProblemType"]["UseE"] and (kernel["GlobalSplitU"] == 1):
+                if kernel["ProblemType"]["UseE"] and isSingleKernel:
                     addrEVgpr = kw.vgprPool.checkOutAligned(self.cfg.numVgprsPerAddr, \
                         int(ceil(self.cfg.numVgprsPerAddr)), "loadEBatch-addr for ei=%u"%(elementIdx), preventOverflow=not isOptNLL)
                 else:
                     addrEVgpr = None
 
-                if self.useGateResidual and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1 or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+                if self.useGateResidual and isSingleKernel:
                     # No-opt path: reuse D's addr
                     addrGateVgpr = addrDVgpr
                 else:
                     addrGateVgpr = None
 
-                if kernel["ProblemType"]["UseScaleAlphaVec"] and ((kernel["GlobalSplitU"] == 1) or (kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel")):
+                if kernel["ProblemType"]["UseScaleAlphaVec"] and isSingleKernel:
                     if self.referenceVgprDim[self.factorDim] and self.referenceVgprDim[self.factorDim][0] == "ScaleAlpha":
                         addrScaleAlphaVecVgpr = kw.vgprPool.checkOutAligned(self.cfg.numVgprsPerAddr, \
                             int(ceil(self.cfg.numVgprsPerAddr)), "loadScaleAlphaVecBatch-addr for ei=%u"%(elementIdx), preventOverflow=not isOptNLL)
@@ -784,7 +789,7 @@ class StoreState:
                 else:
                     addrScaleAlphaVecVgpr = None
 
-                if (kernel["ProblemType"]["UseScaleAB"] == "Vector") and ((kernel["GlobalSplitU"] == 1) or (kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel")):
+                if (kernel["ProblemType"]["UseScaleAB"] == "Vector") and isSingleKernel:
                     if self.referenceVgprDim[0] and self.referenceVgprDim[0][0] == "ScaleA":
                         addrScaleAVecVgpr = kw.vgprPool.checkOutAligned(self.cfg.numVgprsPerAddr, \
                             int(ceil(self.cfg.numVgprsPerAddr)), "loadScaleAVecBatch-addr for ei=%u"%(elementIdx), preventOverflow=not isOptNLL)
@@ -944,7 +949,7 @@ class StoreState:
                 dataBias = 0
             self.elementDataBias.append(dataBias)
             # Only needed in gradient activation
-            if (kernel["ProblemType"]["Gradient"] and kernel["ProblemType"]["ActivationType"] != 'none' and kernel["ProblemType"]["UseE"]) and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1):
+            if (kernel["ProblemType"]["Gradient"] and kernel["ProblemType"]["ActivationType"] != 'none' and kernel["ProblemType"]["UseE"]) and isSingleKernel:
                 numVgprs = int(ceil(kernel["ProblemType"]["ComputeDataType"].numRegisters()))
                 dataE = kw.vgprPool.checkOutAligned(int(numVgprs*self.cfg.gwvw), \
                               int(ceil(numVgprs*self.cfg.gwvw)), "e data for ei=%u"%elementIdx, preventOverflow=False)
@@ -953,7 +958,7 @@ class StoreState:
             self.elementDataE.append(dataE)
 
             # Per-element gate data VGPR
-            if self.useGateResidual and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1 or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+            if self.useGateResidual and isSingleKernel:
                 numVgprs = int(ceil(kernel["ProblemType"]["ComputeDataType"].numRegisters()))
                 dataGate = kw.vgprPool.checkOutAligned(int(numVgprs*self.cfg.gwvw), \
                               int(ceil(numVgprs*self.cfg.gwvw)), "gate data for ei=%u"%elementIdx, preventOverflow=False)
@@ -1030,17 +1035,17 @@ class StoreState:
                     addrBiasVgpr = self.sharedColBiasVgprs+elementCol
                 else:
                     addrBiasVgpr = None
-                if kernel["ProblemType"]["UseE"] and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1):
+                if kernel["ProblemType"]["UseE"] and isSingleKernel:
                     addrEVgpr = self.sharedColEVgprs+elementCol
                 else:
                     addrEVgpr = None
-                if self.useGateResidual and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1 or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+                if self.useGateResidual and isSingleKernel:
                     addrGateVgpr = self.sharedColGateVgprs+elementCol
                 else:
                     addrGateVgpr = None
                 #print ("d0=", d0, "vc0=", vc0, "elementCol=", elementCol)
 
-                if kernel["ProblemType"]["UseScaleAlphaVec"] and ((kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1) or (kernel["StreamK"] > 0 and not isWorkspace)):
+                if kernel["ProblemType"]["UseScaleAlphaVec"] and isSingleKernel:
                     if self.referenceVgprDim[self.factorDim] and self.referenceVgprDim[self.factorDim][0] == "ScaleAlpha":
                         addrScaleAlphaVecVgpr = self.sharedColScaleAlphaVecVgprs+elementCol
                     else:
@@ -1048,7 +1053,7 @@ class StoreState:
                 else:
                     addrScaleAlphaVecVgpr = None
 
-                if (kernel["ProblemType"]["UseScaleAB"] == "Vector") and ((kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1) or (kernel["StreamK"] > 0 and not isWorkspace)):
+                if (kernel["ProblemType"]["UseScaleAB"] == "Vector") and isSingleKernel:
                     if self.referenceVgprDim[0] and self.referenceVgprDim[0][0] == "ScaleA":
                         addrScaleAVecVgpr = self.sharedColScaleAVecVgprs+elementCol
                     else:
@@ -1081,13 +1086,13 @@ class StoreState:
                 else:
                     addrBiasVgpr = None
 
-                if kernel["ProblemType"]["UseE"] and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1):
+                if kernel["ProblemType"]["UseE"] and isSingleKernel:
                     addrEVgpr = kw.vgprPool.checkOutAligned(self.cfg.numVgprsPerAddr, \
                         int(ceil(self.cfg.numVgprsPerAddr)), "loadEBatch-addr for ei=%u"%(elementIdx), preventOverflow=not isOptNLL)
                 else:
                     addrEVgpr = None
 
-                if self.useGateResidual and (kernel["GlobalSplitU"] == 1 or kernel["GlobalSplitU"] == -1 or kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+                if self.useGateResidual and isSingleKernel:
                     # No-opt path: Gate reuses D's per-element addr VGPR.
                     addrGateVgpr = addrDVgpr
                 else:

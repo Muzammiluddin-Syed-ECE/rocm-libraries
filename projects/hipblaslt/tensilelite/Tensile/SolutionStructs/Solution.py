@@ -1716,6 +1716,12 @@ class Solution(collections.abc.Mapping):
       mxBlockScaled = bool(state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"])
       mxBlockScaleSgprFits = not (mxBlockScaled and bool(miwt) and len(miwt) == 2 and
                                   min(miwt[0], miwt[1]) <= 2 and max(miwt[0], miwt[1]) >= 16)
+      # The fused-store runtime guard computes SizesSum % DepthU with a bit mask,
+      # which is valid only for a positive power-of-two DepthU.  Other kernels
+      # (including FP4 DepthU=768) remain valid; they simply use the normal
+      # post-loop store path.
+      depthU = state["DepthU"]
+      powerOfTwoDepthU = depthU > 1 and (depthU & (depthU - 1)) == 0
       # Hard structural: the fused store literally cannot be emitted. ALWAYS enforced.
       structuralFail = ((not isFloat4)
                         or (not state["UseSubtileImpl"])
@@ -1725,7 +1731,8 @@ class Solution(collections.abc.Mapping):
                         or (not state["BufferStore"])
                         or (not pairedStoreAvailable)
                         or (not streamKAtomicFree)
-                        or (not barrierFreeStore))
+                        or (not barrierFreeStore)
+                        or (not powerOfTwoDepthU))
       # Register / spill budget: the fused store would overflow the arch-VGPR / 102-SGPR
       # ceiling for this tile. ALWAYS enforced, so the force only ever turns on non-spill
       # macrotiles (never pushes a tile past the ceiling / emits out-of-range v>=256).

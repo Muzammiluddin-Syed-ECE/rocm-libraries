@@ -40,7 +40,7 @@ from rocisa.instruction import BufferAtomicAddF32, BufferAtomicCmpswapB32, \
   VMulLOU32, VMulPKF16, VMulPKF32, VPackF16toB32, VReadfirstlaneB32, VRndneF32, VCvtBF16toFP32
 from rocisa.functions import vectorStaticMultiply
 
-from ..Common import DataDirection, SemanticVersion, isSubtileMultiDU
+from ..Common import DataDirection, SemanticVersion, isSubtileMultiDU, plsinDebugEnv
 from ..Common.DataType import DataType
 from ..Component import GlobalWriteComponents
 from ..Component import Component
@@ -59,19 +59,16 @@ import os as _os
 
 
 def _plsinStoreGate(name: str, default: bool = False) -> bool:
-    """Read a PLSIN store optimization gate from the environment.
+    """Read a PLSIN store optimization gate at emission time.
 
     The proven AITER-style store optimizations (B: address hoist, C: permlane16)
     are enabled by default on the PLSIN1 fused-full-tile path.  Each can still be
-    turned OFF independently via its env var (set to 0/false/off) for A/B
-    benchmarking and bisection; setting both off reproduces the pre-optimization
-    codegen byte-for-byte.
+    turned OFF independently through ``TENSILE_PLSIN_DEBUG`` for A/B benchmarking
+    and bisection; setting both off reproduces the pre-optimization codegen.
 
     Truthy = any value other than {"", "0", "false", "False", "off", "OFF"}.
     """
-    v = _os.environ.get(name)
-    if v is None:
-        return default
+    v = plsinDebugEnv(name, "1" if default else "0")
     return v not in ("", "0", "false", "False", "off", "OFF")
 
 
@@ -80,14 +77,9 @@ def _plsinStoreGate(name: str, default: bool = False) -> bool:
 #   lane-adjusted dwordx4 base is computed once per (addr,N-group) and reused via the
 #   MUBUF immediate offsets 0/64/128/192.  Pure reorder of address arithmetic; the
 #   store data path is unchanged.
-PLSIN_STORE_HOIST_ADDR = _plsinStoreGate("PLSIN_STORE_HOIST_ADDR", default=True)
 # Component C: replace `ds_bpermute x4 + s_waitcnt + v_permlane32_swap x2` with the
 #   AITER two-`v_permlane16_swap` shuffle.  Changes the cross-lane assembly AND the
 #   per-lane store row address; correctness must be proven on hardware (norm==0).
-PLSIN_STORE_PERMLANE16 = _plsinStoreGate("PLSIN_STORE_PERMLANE16", default=True)
-# Component A: when Bias/ScaleAlphaVec are proven identity at runtime (null pointers),
-#   take a direct ACC->bf16 path that skips the bias/SAV LDS reads and packed FMAs.
-PLSIN_STORE_DIRECT_EPILOGUE = _plsinStoreGate("PLSIN_STORE_DIRECT_EPILOGUE")
 
 
 def _scmpGtU32(writer, src, imm, comment=""):
@@ -182,6 +174,11 @@ class GlobalWriteBatchWriter:
     # it only when that key changes.  -1 = invalid / not yet computed.
     self._subtileHoistedAddrDVgpr = -1
     self._subtileHoistedAddrBlockN = -1
+    # In an epilogue-rewriting weave batch, all per-element epilogues are emitted
+    # before that batch's paired-store loop.  Track readiness separately from the
+    # store-loop counter so each element pair gets its own terminal MFMA group before
+    # its accvgpr_read without advancing the later store schedule.
+    self._weaveEpiloguePairCounter = None
     self.numBatches = numBatches
 
     # CompactLoopStore: stash the "next batch's first elt rowInc" passed in via
@@ -1054,8 +1051,11 @@ class GlobalWriteBatchWriter:
       if self.storeBiasD == 1:
         module.add(addrCalc.emitLdChange(self.kernel, self.ss, 'Bias', self.edge, self.beta, mask, bufferOOB, (elementIdx == len(self.batchElements) - 1), self.tmpVgpr, tmpInrSgpr, addrBiasVgpr, self.addrBias, self.factorDim))
 
-      if self.parentWriter.states.useGateResidual and \
-         (self.kernel["GlobalSplitU"] == 1 or self.kernel["GlobalSplitU"] == -1 or self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+      if self.ss.useGateResidual and (
+          self.kernel["GlobalSplitU"] in (1, -1)
+          or self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"
+          or self.kernel["StreamK"] > 0
+      ):
         _gateList = self.kernel["ProblemType"].get("GateResidualDataTypeList", [])
         _destDtype = self.kernel["ProblemType"]["DestDataType"]
         if not _gateList:
@@ -1247,7 +1247,9 @@ class GlobalWriteBatchWriter:
       self.applyAlpha or
       self.kernel["ProblemType"].get("UseScaleAlphaVec", 0) or
       self.kernel["ProblemType"].get("UseScaleAB", "") == "Vector" or
-      self.kernel["ProblemType"].get("UseScaleCD", False)
+      self.kernel["ProblemType"].get("UseScaleCD", False) or
+      self.kernel["ProblemType"].get("UseE", False) or
+      self.parentWriter.states.useGateResidual
     )
     if _weaveMode:
       pass  # accvgpr reads emitted per-pair in _emit16bitSubtilePairedStore path below
@@ -1515,7 +1517,9 @@ class GlobalWriteBatchWriter:
   def _emitHoistedGateLoadPhase(self, module: Module, bufferOOB):
     """opt path: emit the gate prolog load wrapped in ONE null-gate skip branch."""
     if not (self.parentWriter.states.useGateResidual and
-            (self.kernel["GlobalSplitU"] == 1 or self.kernel["GlobalSplitU"] == -1 or self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel")):
+            (self.kernel["GlobalSplitU"] in (1, -1)
+             or self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"
+             or self.kernel["StreamK"] > 0)):
       return
     if not self.ss.optSingleColVgpr:
       return  # no-opt path keeps the per-element load in the prolog loop
@@ -1569,7 +1573,9 @@ class GlobalWriteBatchWriter:
     """Multi-dtype Gate: convert ALL loaded gate values to f32 in one GateType
     dispatch."""
     if not (self.parentWriter.states.useGateResidual and
-            (self.kernel["GlobalSplitU"] == 1 or self.kernel["GlobalSplitU"] == -1 or self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel")):
+            (self.kernel["GlobalSplitU"] in (1, -1)
+             or self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"
+             or self.kernel["StreamK"] > 0)):
       return
     gateList = list(self.kernel["ProblemType"].get("GateResidualDataTypeList", []))
     if len(gateList) <= 1:
@@ -1686,7 +1692,7 @@ class GlobalWriteBatchWriter:
       # align8 machinery, whose mask is derived for that lane layout.  This setup
       # block runs per globalWriteElements emission, so _fusedFullTileNoGuards()
       # here matches the store sites emitted from the same call.
-      if PLSIN_STORE_PERMLANE16 and self._fusedFullTileNoGuards():
+      if _plsinStoreGate("PLSIN_STORE_PERMLANE16", default=True) and self._fusedFullTileNoGuards():
         # Component C: the AITER two-`v_permlane16_swap` shuffle needs no ds_bpermute,
         # so the partner-lane address is dead.  Repurpose the vPermAddr slot to hold
         # the per-lane-group row-byte delta that compensates the permlane16 lane
@@ -1970,8 +1976,7 @@ class GlobalWriteBatchWriter:
       # Gate Residual: acc = gate*acc + gate. Built here but DEFERRED — added after
       # activation+scaleD (see module.add(gateModule) below), on the f32 ValuC.
       gateModule = Module("Empty GateResidual")
-      if self.parentWriter.states.useGateResidual and \
-         (self.kernel["GlobalSplitU"] == 1 or self.kernel["GlobalSplitU"] == -1 or self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel"):
+      if self.parentWriter.states.useGateResidual and isSingleKernel:
         # TODO: I8 input (int32 compute) — needs int32 acc -> cvt f32 -> FMA ->
         # saturate-cast. Not supported yet; reject below.
         if not self.kernel["ProblemType"]["ComputeDataType"].isSingle():
@@ -2931,14 +2936,23 @@ class GlobalWriteBatchWriter:
     fall back to flushing all pending MFMA groups."""
     element = self.batchElements[elementIdx]
     tt0 = element[1]
+    if self._weaveEpiloguePairCounter is None:
+      self._weaveEpiloguePairCounter = self.parentWriter.states.subtileWeavePairCounter
     if tt0 % 2 == 0:
       partnerElementIdx = elementIdx + 1
       partnerExists = (partnerElementIdx < len(self.batchElements) and
                        self.batchElements[partnerElementIdx][1] == tt0 + 1)
       if partnerExists:
         # sba=0, first of pair: ensure this pair's terminal MFMAs are issued before
-        # its reads (idempotent; a previous pair's lookahead usually issued them).
-        self._weaveEmitReady(module, self.parentWriter.states.subtileWeavePairCounter)
+        # its reads, then pre-issue the lookahead pair in this parent stream.  The
+        # latter preserves the required MFMA->accvgpr_read latency while keeping the
+        # instruction physically ahead of future epilogue reads (storeCode is emitted
+        # only after all per-element epilogues in the batch).
+        self._weaveEmitReady(module, self._weaveEpiloguePairCounter)
+        self._weaveEmitGroup(
+          module,
+          self._weaveEpiloguePairCounter + self._weaveLookahead(),
+        )
       else:
         self._weaveEmitAll(module)  # orphan sba=0
     else:
@@ -2949,6 +2963,8 @@ class GlobalWriteBatchWriter:
         self._weaveEmitAll(module)  # orphan sba=1 (batch split)
       # paired sba=1: readiness already emitted at the sba=0 partner above.
     module.add(self._popSubtileAccVgprReads(elementIdx))
+    if tt0 % 2 == 1 and partnerExists:
+      self._weaveEpiloguePairCounter += 1
 
   def _weaveLookahead(self):
     """How many store-pairs ahead a pair's terminal MFMAs are pre-issued (the
@@ -3154,7 +3170,13 @@ class GlobalWriteBatchWriter:
     module = Module("16bitSubtilePairedStoreWoven")
     module.add(self._emit16bitSubtilePairedStorePhase1(
       addrCalc, sumIdx0, sumIdx1, prefixOffset, tt0=tt0, blockIdxM=blockIdxM, blockIdxN=blockIdxN))
-    self._weaveEmitGroup(module, pairIdx + self._weaveLookahead())
+    # Epilogue-rewriting batches collect their stores in a trailing storeCode module
+    # while the per-element reads/epilogues stay in the parent module.  Pre-issuing a
+    # future MFMA here would mark it emitted at codegen time but place it physically
+    # after that future pair's accvgpr_read.  Let _weaveReadForEpilogue issue each
+    # pair's readiness MFMA in the parent stream instead.
+    if not self._weaveReadBeforeEpilogue:
+      self._weaveEmitGroup(module, pairIdx + self._weaveLookahead())
     module.add(self._emit16bitSubtilePairedStorePhase2(addrCalc, tt0=tt0))
     return module
 
@@ -3244,7 +3266,8 @@ class GlobalWriteBatchWriter:
     # four ds_bpermute and their s_waitcnt are dropped.  vPermAddr becomes dead.
     # Restricted to the full-tile fused store (see setup note): the guarded/edge
     # path keeps ds_bpermute + its align8 mask.
-    self._permlane16Active = PLSIN_STORE_PERMLANE16 and self._fusedFullTileNoGuards()
+    self._permlane16Active = _plsinStoreGate(
+      "PLSIN_STORE_PERMLANE16", default=True) and self._fusedFullTileNoGuards()
     if not self._permlane16Active:
       module.addComment1("ds_bpermute in-place: gather packed dwords from partner lane-group")
       for k in range(4):
@@ -3271,7 +3294,8 @@ class GlobalWriteBatchWriter:
     # standard lane_group*8 in vLGDelta.
     vRowDelta = vPermAddr if self._permlane16Active else vLGDelta
     deltaStr = "(lane_group&1)*12rows" if self._permlane16Active else "lane_group*8"
-    hoistAddr = PLSIN_STORE_HOIST_ADDR and self._fusedFullTileNoGuards()
+    hoistAddr = _plsinStoreGate(
+      "PLSIN_STORE_HOIST_ADDR", default=True) and self._fusedFullTileNoGuards()
     addrAlreadyLive = (hoistAddr
                        and self._subtileHoistedAddrDVgpr == addrDVgpr
                        and self._subtileHoistedAddrBlockN == blockIdxN)
