@@ -225,8 +225,13 @@ class InstructionEmitter:
         group_span = len(instructions)
         return [(first_consumer, group_span)] * group_span
 
-    def emit_mfma(self, placement, unroll_iter=0):
-        """Emit MFMA instructions from MFMAPlacement."""
+    def emit_mfma(self, placement, unroll_iter=0, scale_phase=None):
+        """Emit MFMAs, optionally selecting a scale phase independently.
+
+        ``unroll_iter`` continues to select the operand VGPR tile map.  The
+        separate scale-phase override is used by the flat tail loop, whose one
+        physical operand layout must serve either dual-period scale byte.
+        """
         module = Module()
         subIterK = placement.subIterK
         # Dual-period MXFP8: the data body is unrolled scaleReuse times per
@@ -235,7 +240,11 @@ class InstructionEmitter:
         # K-phase that selects the scale byte within the shared 4B dword is the
         # data-iteration parity, i.e. unroll_iter, NOT subIterK (always 0).
         dualPeriodScale = self.hasScale and getattr(self.config, 'dualPeriodScale', False)
-        scalePhase = (unroll_iter % self.config.scaleReuse) if dualPeriodScale else subIterK
+        if dualPeriodScale:
+            phase = unroll_iter if scale_phase is None else scale_phase
+            scalePhase = phase % self.config.scaleReuse
+        else:
+            scalePhase = subIterK
         tile_maps = {t: placement.vgpr_tile_maps[t][unroll_iter]
                      for t in placement.vgpr_tile_maps}
 
@@ -840,11 +849,20 @@ class InstructionEmitter:
             self._tail_boundaryMask = None
         return []
 
-    def populate(self, emitted, unroll_iter=0):
-        """Walk emitted partitions and fill em.instructions."""
+    def populate(self, emitted, unroll_iter=0, mfma_scale_phase=None):
+        """Walk emitted partitions and fill ``em.instructions``.
+
+        ``mfma_scale_phase`` changes only the scale-byte selector.  GR/LR
+        cadence and operand tile-map selection remain tied to ``unroll_iter``.
+        """
         for partition_emitted in emitted:
             for emitted_group in partition_emitted:
                 for em in emitted_group:
+                    if em.opType == 'mfma' and mfma_scale_phase is not None:
+                        em.instructions = self.emit_mfma(
+                            em.source, unroll_iter,
+                            scale_phase=mfma_scale_phase)
+                        continue
                     handler = self._dispatch.get(em.opType)
                     if handler:
                         em.instructions = handler(em, unroll_iter)

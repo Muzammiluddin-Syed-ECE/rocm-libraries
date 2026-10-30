@@ -4489,10 +4489,57 @@ class LogicalScheduler:
         # the mask vgprs (kReg, vDiff, …) that init allocates.
         for inst in self._emitter.emit_mask_k_init():
             module.add(inst)
-        self._emitter.populate(self._tailloop_emitted, unroll_iter=0)
-        module.add(self._emitLoop(writer, kernel, "TAILLOOP",
-                                  self._tailloop_emitted,
-                                  schedule=False))
+
+        if not self.config.dualPeriodScale:
+            self._emitter.populate(self._tailloop_emitted, unroll_iter=0)
+            module.add(self._emitLoop(writer, kernel, "TAILLOOP",
+                                      self._tailloop_emitted,
+                                      schedule=False))
+        else:
+            # The scale dword spans two DepthU=128 data phases.  A residual
+            # tail after an odd number of complete data iterations must select
+            # phase 1; always emitting unroll_iter=0 silently reuses phase 0
+            # for K in [129,255], [385,511], ... .  The tail belongs to the
+            # final global K interval under both GSU and StreamK, so derive the
+            # phase from global K rather than from a workgroup-local loop count.
+            assert self.config.scaleReuse == 2, \
+                "dual-period tail dispatch currently supports scaleReuse=2"
+            assert kernel["DepthU"] > 0 and \
+                kernel["DepthU"] & (kernel["DepthU"] - 1) == 0, \
+                "dual-period tail dispatch requires a power-of-two DepthU"
+
+            from rocisa.code import Label
+            from rocisa.container import sgpr
+            from rocisa.instruction import SCBranchSCC1, SBranch
+
+            phase1 = Label("SubtileTailPhase1", "")
+            phaseDone = Label("SubtileTailPhaseDone", "")
+            phaseBit = kernel["DepthU"].bit_length() - 1
+            unrollIdx = writer.states.unrollIdx
+
+            bodies = []
+            for phase in range(2):
+                emitted = copy.deepcopy(self._tailloop_emitted)
+                self._emitter.populate(
+                    emitted, unroll_iter=0, mfma_scale_phase=phase)
+                bodies.append(self._emitLoop(
+                    writer, kernel, f"TAILLOOP_PHASE{phase}", emitted,
+                    schedule=False))
+
+            module.add(SBitcmp1B32(
+                src0=sgpr(f"SizesSum+{unrollIdx}"), src1=phaseBit,
+                comment="dual-period tail: select completed-DepthU parity"))
+            module.add(SCBranchSCC1(
+                labelName=phase1.getLabelName(),
+                comment="odd completed DepthU count -> scale phase 1"))
+            module.add(bodies[0])
+            module.add(SBranch(
+                labelName=phaseDone.getLabelName(),
+                comment="skip scale phase 1 tail body"))
+            module.add(phase1)
+            module.add(bodies[1])
+            module.add(phaseDone)
+
         for inst in self._emitter.emit_mask_k_done():
             module.add(inst)
         return module
