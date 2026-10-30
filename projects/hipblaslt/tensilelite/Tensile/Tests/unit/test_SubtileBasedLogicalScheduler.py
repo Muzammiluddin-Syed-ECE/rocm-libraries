@@ -432,13 +432,9 @@ def make_writer_and_tileinfos(kernel, fp4=False):
     return writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo
 
 
-def _emit_du128_mxfp8_mainloops(cfg=None):
-    """Emit both concrete production-style main-loop copies for tests."""
-    kernel = create_kernel_mxfp8()
-    writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = \
-        make_writer_and_tileinfos(kernel, fp4=True)
-    if cfg is None:
-        cfg = replace(make_cfg_du128_4wave(), uniformPgrEpoch=True)
+def _emit_mainloops(kernel, fixture, cfg):
+    """Emit both concrete main-loop copies from a scheduler fixture."""
+    writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = fixture
     sched = LogicalScheduler(cfg)
     sched.build()
     sched.allocVgprTiles(
@@ -456,6 +452,15 @@ def _emit_du128_mxfp8_mainloops(cfg=None):
         return str(sched.emitMainAndExitLoops(writer, kernel))
     finally:
         sched.deallocVgprTiles(writer)
+
+
+def _emit_du128_mxfp8_mainloops(cfg=None):
+    """Emit the MT256x256 production-style main-loop copies for tests."""
+    kernel = create_kernel_mxfp8()
+    fixture = make_writer_and_tileinfos(kernel, fp4=True)
+    if cfg is None:
+        cfg = replace(make_cfg_du128_4wave(), uniformPgrEpoch=True)
+    return _emit_mainloops(kernel, fixture, cfg)
 
 
 # ── Assertion helpers ─────────────────────────────────────────
@@ -2472,6 +2477,53 @@ class TestUniformPgrEpoch:
         finally:
             scheduler.deallocVgprTiles(writer)
 
+    @pytest.mark.parametrize(
+        "mt_m,mt_n,expected_counts",
+        [
+            (256, 256, [5, 5, 5, 1]),
+            (256, 320, [5, 5, 5, 3]),
+            (320, 256, [5, 5, 5, 3]),
+        ])
+    def test_production_geometries_publish_one_complete_uniform_epoch(
+            self, mt_m, mt_n, expected_counts):
+        _kernel, _fixture, cfg = self._production_fixture(mt_m, mt_n)
+        scheduler = LogicalScheduler(cfg)
+        scheduler.build()
+
+        ab_atoms = []
+        partition_counts = []
+        for partition in scheduler._partitions:
+            count = 0
+            for slot in partition:
+                for gr in slot.grs:
+                    if gr.tensor not in ("A", "B"):
+                        continue
+                    granularity = getattr(cfg, f"gr{gr.tensor}")
+                    atoms = list(range(
+                        gr.tiles.tileId_start,
+                        gr.tiles.tileId_end,
+                        granularity.mn))
+                    ab_atoms.extend(
+                        (gr.tensor, tile, gr.mtIteration)
+                        for tile in atoms)
+                    count += len(atoms)
+            partition_counts.append(count)
+
+        expected_atoms = [
+            ("A", tile, 2) for tile in range(cfg.numMFMATilesM)
+        ] + [
+            ("B", tile, 2) for tile in range(cfg.numMFMATilesN)
+        ]
+        assert ab_atoms == expected_atoms
+        assert partition_counts == expected_counts
+        assert sum(
+            isinstance(op, WaitGROp)
+            for partition in scheduler._partitions
+            for slot in partition
+            for lr in slot.lrs
+            for op in lr.preOps
+        ) == 1
+
     def test_complete_n2_epoch_precedes_first_n1_consumer(self):
         cfg = self._cfg()
         sched = LogicalScheduler(cfg)
@@ -3601,6 +3653,89 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
             normalized.append(" ".join(line.split()))
         return "\n".join(normalized) + "\n"
 
+    @staticmethod
+    def _partition_instructions(assembly, copy_index):
+        """Return comment-free instructions grouped by physical partition."""
+        import re
+
+        begin = f"/* MAINLOOP_C{copy_index} start */"
+        end = f"/* MAINLOOP_C{copy_index} end */"
+        region = assembly[
+            assembly.index(begin) + len(begin):assembly.index(end)
+        ]
+        partitions = []
+        for raw in region.splitlines():
+            line = raw.strip()
+            marker = re.fullmatch(
+                r"/\* partition=(\d+) subIterK=(\d+) \*/", line)
+            if marker:
+                partition = int(marker.group(1))
+                assert partition == len(partitions)
+                partitions.append([])
+                continue
+            line = line.split("//", 1)[0].strip()
+            if not line or line.startswith("/*"):
+                continue
+            assert partitions, f"instruction precedes first partition: {line}"
+            partitions[-1].append(" ".join(line.split()))
+        return partitions
+
+    @staticmethod
+    def _dtl_tensor(line):
+        for tensor in ("MXSA", "MXSB", "A", "B"):
+            if (f"LocalWriteBaseAddr{tensor}" in line
+                    or f"sgprSrd{tensor}:" in line):
+                return tensor
+        raise AssertionError(f"unrecognized DTL instruction: {line}")
+
+    @classmethod
+    def _assert_dtl_pairs_and_mfma_shadows(cls, partitions):
+        """Check DTL pairing and interleaving, allowing P3's remainder."""
+        for partition_index, instructions in enumerate(partitions):
+            pending_setup = None
+            seen_mfma = False
+            loads_since_mfma = 0
+            for line in instructions:
+                is_setup = line.startswith(
+                    ("s_add_u32 m0,", "s_mov_b32 m0,"))
+                is_load = line.startswith("buffer_load")
+                is_mfma = line.startswith("v_mfma")
+
+                if is_setup:
+                    assert pending_setup is None, (
+                        f"P{partition_index}: m0 setup overwritten before "
+                        f"its load: {pending_setup} -> {line}")
+                    pending_setup = (cls._dtl_tensor(line), line)
+                elif is_load:
+                    assert pending_setup is not None, (
+                        f"P{partition_index}: buffer load has no m0 setup: "
+                        f"{line}")
+                    assert cls._dtl_tensor(line) == pending_setup[0], (
+                        f"P{partition_index}: setup/load tensor mismatch: "
+                        f"{pending_setup[1]} -> {line}")
+                    pending_setup = None
+
+                if is_mfma:
+                    if not seen_mfma:
+                        assert loads_since_mfma == 0
+                    elif partition_index < 3:
+                        assert loads_since_mfma <= 1, (
+                            f"P{partition_index}: {loads_since_mfma} buffer "
+                            "loads share one MFMA interval")
+                    seen_mfma = True
+                    loads_since_mfma = 0
+                elif is_load:
+                    assert seen_mfma, (
+                        f"P{partition_index}: buffer load precedes first MFMA")
+                    loads_since_mfma += 1
+
+            assert pending_setup is None, (
+                f"P{partition_index}: m0 setup has no buffer load: "
+                f"{pending_setup}")
+            assert seen_mfma
+            assert loads_since_mfma == 0, (
+                f"P{partition_index}: buffer load follows final MFMA")
+
     def test_mt256x256_c0_c1_match_clean_baseline(self):
         import hashlib
 
@@ -3624,9 +3759,57 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                 if line.startswith(("s_add_u32 m0,", "s_mov_b32 m0,")):
                     assert not pending_m0_setup
                     pending_m0_setup = True
-                elif line.startswith("buffer_load") and pending_m0_setup:
+                elif line.startswith("buffer_load"):
+                    assert pending_m0_setup
                     pending_m0_setup = False
             assert not pending_m0_setup
+
+    @pytest.mark.parametrize(
+        "mt_m,mt_n,expected_ab_counts",
+        [
+            (256, 256, [5, 5, 5, 1]),
+            (256, 320, [5, 5, 5, 3]),
+            (320, 256, [5, 5, 5, 3]),
+        ])
+    def test_supported_geometries_keep_productized_schedule_invariants(
+            self, mt_m, mt_n, expected_ab_counts):
+        kernel, fixture, cfg = \
+            TestUniformPgrEpoch._production_fixture(mt_m, mt_n)
+        assembly = _emit_mainloops(kernel, fixture, cfg)
+
+        for copy_index in range(2):
+            partitions = self._partition_instructions(
+                assembly, copy_index)
+            assert len(partitions) == 4
+            self._assert_dtl_pairs_and_mfma_shadows(partitions)
+
+            ab_counts = [
+                sum(
+                    line.startswith("buffer_load")
+                    and self._dtl_tensor(line) in ("A", "B")
+                    for line in instructions)
+                for instructions in partitions
+            ]
+            assert ab_counts == expected_ab_counts
+
+            vmcnt_partitions = [
+                partition
+                for partition, instructions in enumerate(partitions)
+                for line in instructions
+                if line.startswith("s_waitcnt vmcnt")
+            ]
+            assert vmcnt_partitions == [3]
+
+            barrier_partitions = [
+                partition
+                for partition, instructions in enumerate(partitions)
+                for line in instructions
+                if line.startswith("s_barrier")
+            ]
+            assert barrier_partitions == [0, 1, 3]
+            assert not any(
+                line.startswith("s_waitcnt lgkmcnt")
+                for line in partitions[2])
 
 
 class TestInstructionSchedulerWrapPrefetch:
