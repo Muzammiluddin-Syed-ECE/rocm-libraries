@@ -4725,11 +4725,21 @@ class LogicalScheduler:
           LR          — first partition, subIterK=0
           skip(LE 1, NLL)
 
-        PGR=2 sequence:
+        Legacy PGR=2 sequence:
           GR(MT 0)    — all tensors, all tiles (× numUnroll if unrolled)
           initC       — accumulator zeroing, overlapped with in-flight GR
-          guard(LE 1) — skip speculative MT 1 loads on the NLL path
+          WaitGR      — wait for global reads to land in LDS
+          Sync        — barrier
+          LR          — first partition, subIterK=0
+          skip(LE 1, NLL)
           GR(MT 1)    — first partition tiles (× numUnroll if unrolled)
+          skip(LE 2, NGLL)
+
+        Uniform-epoch PGR=2 sequence (dual-period MXFP8 only):
+          GR(MT 0)    — all tensors, all tiles
+          initC       — accumulator zeroing, overlapped with in-flight GR
+          guard(LE 1) — skip speculative MT 1 loads on the NLL path
+          GR(MT 1)    — complete A/B epoch plus due scales
           WaitGR      — partial wait; leave MT 1 loads in flight
           cold WaitGR — full drain when the guard skipped MT 1
           Sync        — barrier
@@ -4838,7 +4848,7 @@ class LogicalScheduler:
                         *gl2_preloop_ops,
                         SkipOp(compare='LE', value=2, target='NGLL'),
                     ])
-                else:
+                elif cfg.uniformPgrEpoch:
                     mt1_counts = self._wait_gr_counts_for_ops(mt1_ops)
                     no_mt1_label = "SubtilePreloopNoMT1"
                     wait_done_label = "SubtilePreloopWaitDone"
@@ -4857,6 +4867,18 @@ class LogicalScheduler:
                         SyncOp(),
                         *self._make_lr_all_tensors(lr_tiles),
                         SkipOp(compare='LE', value=1, target='NLL'),
+                        *gl2_preloop_ops,
+                        SkipOp(compare='LE', value=2, target='NGLL'),
+                    ])
+                else:
+                    emitted = self._to_emitted([
+                        *preloop_ops,
+                        initC_op,
+                        WaitGROp(wait_gr_counts=WaitGRCounts()),
+                        SyncOp(),
+                        *self._make_lr_all_tensors(lr_tiles),
+                        SkipOp(compare='LE', value=1, target='NLL'),
+                        *mt1_ops,
                         *gl2_preloop_ops,
                         SkipOp(compare='LE', value=2, target='NGLL'),
                     ])
@@ -4881,8 +4903,8 @@ class LogicalScheduler:
                         *gl2_preloop_ops,
                         SkipOp(compare='LE', value=2, target='NGLL'),
                     ])
-                else:
-                    mt1_ops = self._make_preloop_mt1_grs()
+                elif cfg.uniformPgrEpoch:
+                    mt1_ops = mt1_grs
                     mt1_counts = self._wait_gr_counts_for_ops(mt1_ops)
                     no_mt1_label = "SubtilePreloopNoMT1"
                     wait_done_label = "SubtilePreloopWaitDone"
@@ -4902,6 +4924,22 @@ class LogicalScheduler:
                         SyncOp(),
                         *self._make_lr_all_tensors(lr_tiles),
                         SkipOp(compare='LE', value=1, target='NLL'),
+                        *gl2_preloop_ops,
+                        SkipOp(compare='LE', value=2, target='NGLL'),
+                    ])
+                else:
+                    # Reorder off: MT1 after the NLL skip, full vmcnt(0) drain at the
+                    # barrier. PGRCS MT0 clustering still applies — the region up to
+                    # initC is unchanged, so _interleave_preloop_filler still rewrites it.
+                    emitted = self._to_emitted([
+                        *self._make_gr_all_tensors(0, all_tiles),
+                        *self._make_depops_all_tensors(GRIncOp, holdOnLastIter=True),
+                        initC_op,
+                        WaitGROp(wait_gr_counts=WaitGRCounts()),
+                        SyncOp(),
+                        *self._make_lr_all_tensors(lr_tiles),
+                        SkipOp(compare='LE', value=1, target='NLL'),
+                        *mt1_grs,
                         *gl2_preloop_ops,
                         SkipOp(compare='LE', value=2, target='NGLL'),
                     ])
