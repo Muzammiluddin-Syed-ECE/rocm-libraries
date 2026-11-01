@@ -15,11 +15,13 @@ Organized by pass:
   12. Integration    — Full pipeline with real instructions
 """
 from dataclasses import replace
+import re
 
 import pytest
 from tensilelite.Components.Subtile.Kernel import (
     TileInfo, AB_B8, AB_B16, AB_B16_W32, AB_B4, MXSA_B4, MXSB_B4,
     MXSA_B8, MXSB_B8, CD_F32, CD_F32_W32,
+    _supportsUniformPgrEpoch,
 )
 from tensilelite.Components.Subtile.LogicalScheduler import (
     GRPlacementStrategy,
@@ -437,11 +439,12 @@ def make_writer_and_tileinfos(kernel, fp4=False):
     return writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo
 
 
-def _emit_mainloops(kernel, fixture, cfg):
+def _emit_mainloops(kernel, fixture, cfg, scale_tail_staging=False):
     """Emit both concrete main-loop copies from a scheduler fixture."""
     writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = fixture
     sched = LogicalScheduler(cfg)
     sched.build()
+    sched.scaleTailStagingEnabled = scale_tail_staging
     sched.allocVgprTiles(
         writer, tiA, tiB,
         scaleTileInfoA=scaleTiA,
@@ -459,13 +462,15 @@ def _emit_mainloops(kernel, fixture, cfg):
         sched.deallocVgprTiles(writer)
 
 
-def _emit_du128_mxfp8_mainloops(cfg=None):
+def _emit_du128_mxfp8_mainloops(cfg=None, scale_tail_staging=False):
     """Emit the MT256x256 production-style main-loop copies for tests."""
     kernel = create_kernel_mxfp8()
     fixture = make_writer_and_tileinfos(kernel, fp4=True)
     if cfg is None:
         cfg = replace(make_cfg_du128_4wave(), uniformPgrEpoch=True)
-    return _emit_mainloops(kernel, fixture, cfg)
+    return _emit_mainloops(
+        kernel, fixture, cfg,
+        scale_tail_staging=scale_tail_staging)
 
 
 # ── Assertion helpers ─────────────────────────────────────────
@@ -2440,6 +2445,124 @@ class TestUniformPgrEpoch:
         assert selected.uniformPgrEpoch
         assert selected.uniformEpochVmemCohortSize == 5
 
+    def test_scale_tail_staging_adds_exactly_three_vgprs(self):
+        _kernel, fixture, cfg = self._production_fixture()
+        _writer, ti_a, ti_b, ti_sa, ti_sb, _dest = fixture
+        scheduler = LogicalScheduler(cfg)
+        scheduler.build()
+
+        baseline = scheduler.getNumVgpr(
+            ti_a, ti_b, ti_sa, ti_sb)
+        scheduler.scaleTailStagingEnabled = True
+        staged = scheduler.getNumVgpr(
+            ti_a, ti_b, ti_sa, ti_sb)
+
+        assert staged == baseline + 3
+
+    def test_three_vgpr_scale_tail_staging_contract(self):
+        assembly = _emit_du128_mxfp8_mainloops(
+            scale_tail_staging=True)
+
+        def section(label):
+            start = assembly.index(f"/* {label} start */")
+            end = assembly.index(f"/* {label} end */", start)
+            return assembly[start:end].splitlines()
+
+        preloop = assembly[:assembly.index("label_LoopBeginL:")]
+        c0 = section("MAINLOOP_C0")
+        c1 = section("MAINLOOP_C1")
+
+        seeds = [
+            line for line in preloop.splitlines()
+            if "preloop seed for staged C0 scale" in line
+        ]
+        publishes = [
+            line for line in c0
+            if "publish staged future scale" in line
+        ]
+        stages = [
+            line for line in c1
+            if "stage next C0 scale in temporary VGPR" in line
+        ]
+        assert len(seeds) == len(publishes) == len(stages) == 3
+
+        seed_temps = {
+            int(re.search(r"ds_read_b32 v(\d+),", line).group(1))
+            for line in seeds
+        }
+        stage_temps = {
+            int(re.search(r"ds_read_b32 v(\d+),", line).group(1))
+            for line in stages
+        }
+        publish_temps = {
+            int(re.search(r"v_mov_b32 v\d+, v(\d+)", line).group(1))
+            for line in publishes
+        }
+        assert seed_temps == stage_temps == publish_temps
+
+        staged_canonicals = {
+            int(re.search(r"canonical=v(\d+)", line).group(1))
+            for line in stages
+        }
+        published_canonicals = {
+            int(re.search(r"v_mov_b32 v(\d+),", line).group(1))
+            for line in publishes
+        }
+        assert staged_canonicals == published_canonicals
+
+        # The conservative source-WAR pad is gone, as are every physical-path
+        # reference that writes one of the three staged canonical values.
+        assert not any("scale-source reads before refresh" in line
+                       for line in c0)
+        direct_scale_reads = [
+            line for line in c0
+            if re.search(r"^\s*ds_read_b32\b.*// S[AB] MT=", line)
+        ]
+        assert direct_scale_reads
+        assert not any(
+            int(re.search(r"ds_read_b32 v(\d+),", line).group(1))
+            in staged_canonicals
+            for line in direct_scale_reads
+        )
+
+        first_drain = next(
+            index for index, line in enumerate(c0)
+            if "s_waitcnt lgkmcnt(0)" in line)
+        first_publish = next(
+            index for index, line in enumerate(c0)
+            if "publish staged future scale" in line)
+        first_mfma = next(
+            index for index, line in enumerate(c0)
+            if "v_mfma_scale" in line)
+        assert first_drain < first_mfma < first_publish
+
+        # P3's vmcnt/barrier/A+B address swaps move into the final three P2
+        # shadows.  The shifted A/B LDS stream starts immediately in P3.
+        p2_start = next(
+            index for index, line in enumerate(c1)
+            if "partition=2 subIterK=0" in line)
+        p3_start = next(
+            index for index, line in enumerate(c1)
+            if "partition=3 subIterK=0" in line)
+        p2 = c1[p2_start:p3_start]
+        assert any("s_waitcnt vmcnt(15)" in line for line in p2)
+        assert any(line.lstrip().startswith("s_barrier") for line in p2)
+        assert sum(line.lstrip().startswith("v_xor_b32") for line in p2) == 4
+
+        stage_after_mfma = []
+        mfma_rank = -1
+        for line in c1:
+            if "v_mfma_scale" in line:
+                mfma_rank += 1
+            elif "stage next C0 scale in temporary VGPR" in line:
+                stage_after_mfma.append(mfma_rank)
+        assert stage_after_mfma == [57, 58, 59]
+
+    def test_one_dimensional_partition_cycles_keep_local_frontiers(self):
+        assert not _supportsUniformPgrEpoch(True, 2, (4, 2), 8, 2)
+        assert not _supportsUniformPgrEpoch(True, 2, (2, 4), 2, 8)
+        assert _supportsUniformPgrEpoch(True, 2, (4, 2), 8, 4)
+
     @pytest.mark.parametrize(
         "mt_m,mt_n", [(256, 256), (256, 320), (320, 256)])
     def test_production_geometries_use_three_phase_p0_for_c0_c1(
@@ -2527,13 +2650,18 @@ class TestUniformPgrEpoch:
         ]
         assert ab_atoms == expected_atoms
         assert partition_counts == expected_counts
-        assert sum(
-            isinstance(op, WaitGROp)
+        waits = [
+            op
             for partition in scheduler._partitions
             for slot in partition
             for lr in slot.lrs
             for op in lr.preOps
-        ) == 1
+            if isinstance(op, WaitGROp)
+        ]
+        assert len(waits) == 2
+        assert sum(op.first_unroll_only for op in waits) == 1
+        assert sum(op.wait_gr_counts_by_unroll is not None
+                   for op in waits) == 1
 
     def test_complete_n2_epoch_precedes_first_n1_consumer(self):
         cfg = self._cfg()
@@ -3662,8 +3790,8 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
     """
 
     _EXPECTED = {
-        0: (180, "ca4f07114f874f89cc6fd8802f837240fc8be0278f377ba574cab1e35e07ab56"),
-        1: (150, "93518cec9c744055c8c49aae5f23e8a9cf5f71216d5c0ea1b5f514f52e99da91"),
+        0: (180, "88d0b6d626520d4afb49e68d1ee9c6ddf8bd2c9738d6670813a866cc489975b0"),
+        1: (150, "e1735141b3e9308fcc6c3ea7db8f6fee9996077ab4e47eb2835d2954ed3ee1dc"),
     }
 
     @staticmethod
@@ -3836,7 +3964,8 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                 for line in instructions
                 if line.startswith("s_waitcnt vmcnt")
             ]
-            assert vmcnt_partitions == [3]
+            assert vmcnt_partitions == (
+                [0, 3] if copy_index == 0 else [3])
 
             barrier_partitions = [
                 partition
@@ -3844,7 +3973,8 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                 for line in instructions
                 if line.startswith("s_barrier")
             ]
-            assert barrier_partitions == [0, 1, 3]
+            assert barrier_partitions == (
+                [0, 0, 1, 3] if copy_index == 0 else [0, 1, 3])
             assert not any(
                 line.startswith("s_waitcnt lgkmcnt")
                 for line in partitions[2])
@@ -3944,6 +4074,140 @@ class TestInstructionSchedulerWrapPrefetch:
         return modules, list(instructionSchedule(
             modules, partitionPrefetch=True).flatitems())
 
+    @staticmethod
+    def _typed_capacity_tail_schedule(
+            read_count=20, dtl_count=5, overloaded=True):
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, DSLoadB128, MFMAInstruction, SAddU32,
+            SBarrier, SWaitCnt, VXorB32)
+
+        def mfma(index):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=f"mfma-{index}")
+
+        schedule = Module()
+        schedule.add(SWaitCnt(dscnt=0, comment="entry-wait"))
+        reads = [
+            DSLoadB128(
+                dst=vgpr(80 + 4 * index, 4),
+                src=vgpr(65 + index % 4),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"read-{index}")
+            for index in range(read_count)
+        ]
+        bundles = [
+            (
+                SAddU32(
+                    dst=mgpr(0), src0=sgpr(20), src1=index * 128,
+                    comment=f"setup-{index}"),
+                BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"dtl-{index}"),
+            )
+            for index in range(dtl_count)
+        ]
+        xors = [
+            VXorB32(
+                dst=vgpr(65 + 2 * index),
+                src0=vgpr(65 + 2 * index),
+                src1=vgpr(66 + 2 * index),
+                comment=f"xor-{index}")
+            for index in range(4)
+        ]
+
+        for index in range(16):
+            schedule.add(mfma(index))
+            if index == 0:
+                schedule.add(SWaitCnt(vlcnt=15, comment="vmem-wait"))
+            elif index == 1:
+                schedule.add(SBarrier(comment="barrier"))
+                schedule.addComment0("A address swaps")
+                schedule.add(xors[0])
+            elif 2 <= index <= 4:
+                if index == 3:
+                    schedule.addComment0("B address swaps")
+                schedule.add(xors[index - 1])
+            if index == 14:
+                schedule.addItems(reads)
+                if overloaded:
+                    for setup, load in bundles:
+                        schedule.add(setup)
+                        schedule.add(load)
+            if not overloaded and 10 <= index < 10 + len(bundles):
+                setup, load = bundles[index - 10]
+                schedule.add(setup)
+                schedule.add(load)
+        return schedule
+
+    @staticmethod
+    def _typed_capacity_p0_schedule(late_wait=False):
+        from rocisa.code import Module
+        from rocisa.container import DSModifiers, mgpr, sgpr, vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import (
+            BufferLoadB128, DSLoadB128, MFMAInstruction, SAddCU32,
+            SAddU32, SBarrier, SWaitCnt, SXorB32)
+
+        def mfma(index):
+            return MFMAInstruction(
+                InstType.INST_F32, InstType.INST_F32, [16, 16, 4],
+                False, vgpr(0, 4), vgpr(4), vgpr(5), 0,
+                comment=f"mfma-{index}")
+
+        def bundle(index):
+            return (
+                SAddU32(
+                    dst=mgpr(0), src0=sgpr("LocalWriteBaseAddrA"),
+                    src1=index * 128, comment=f"setup-{index}"),
+                BufferLoadB128(
+                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    soffset=0, comment=f"dtl-{index}"),
+            )
+
+        reads = [
+            DSLoadB128(
+                dst=vgpr(80 + 4 * index, 4), src=vgpr(65),
+                ds=DSModifiers(offset=index * 16),
+                comment=f"read-{index}")
+            for index in range(4)
+        ]
+        bundles = [bundle(index) for index in range(3)]
+        schedule = Module()
+        schedule.add(SWaitCnt(dscnt=0, comment="entry-wait"))
+        for index in range(8):
+            schedule.add(mfma(index))
+            if index == 1:
+                schedule.add(SBarrier(comment="overwrite-barrier"))
+                schedule.add(SAddU32(
+                    dst=sgpr("SrdA"), src0=sgpr("SrdA"), src1=128,
+                    comment="advance-a"))
+                schedule.add(SAddCU32(
+                    dst=sgpr("SrdA", 1), src0=sgpr("SrdA", 1), src1=0,
+                    comment="carry-a"))
+            elif index == 2:
+                schedule.add(SXorB32(
+                    dst=sgpr("LocalWriteBaseAddrA"),
+                    src0=sgpr("LocalWriteBaseAddrA"),
+                    src1=sgpr("SwapA"), comment="swap-a"))
+                schedule.addItems(bundles[0])
+                if late_wait:
+                    schedule.add(SWaitCnt(dscnt=0, comment="late-wait"))
+            elif index == 3:
+                schedule.addItems(bundles[1])
+            elif index == 4:
+                schedule.addItems(bundles[2])
+                schedule.add(reads[0])
+            elif index == 5:
+                schedule.addItems(reads[1:3])
+            elif index == 6:
+                schedule.add(reads[3])
+        return schedule
+
     def test_wrap_payload_starts_after_second_mfma(self):
         from rocisa.instruction import (
             LocalReadInstruction, MFMAInstruction, SBarrier)
@@ -4027,6 +4291,176 @@ class TestInstructionSchedulerWrapPrefetch:
         ]
         assert physical_counts == [3] * 7
         assert not placer.leftovers
+
+    def test_final_partition_uses_per_pipeline_shadow_capacities(self):
+        from rocisa.code import TextBlock
+        from rocisa.instruction import (
+            GlobalReadInstruction, LocalReadInstruction, MFMAInstruction,
+            VXorB32)
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            packFinalPartitionByInstructionType)
+
+        self._schedule()
+        schedule = self._typed_capacity_tail_schedule()
+
+        assert packFinalPartitionByInstructionType(schedule)
+
+        followers = []
+        for inst in schedule.flatitems():
+            if isinstance(inst, MFMAInstruction):
+                followers.append([])
+            elif followers:
+                followers[-1].append(inst)
+
+        assert [
+            inst.comment for inst in followers[2]
+            if isinstance(inst, VXorB32)
+        ] == [f"xor-{index}" for index in range(4)]
+        assert [
+            str(inst).strip() for inst in followers[2]
+            if isinstance(inst, TextBlock)
+        ] == ["/* A address swaps */", "/* B address swaps */"]
+        assert [
+            sum(isinstance(inst, LocalReadInstruction) for inst in group)
+            for group in followers
+        ] == [0, 0, 0, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0]
+        assert [
+            sum(isinstance(inst, GlobalReadInstruction) for inst in group)
+            for group in followers
+        ] == [0] * 10 + [1] * 5 + [0]
+        assert [
+            inst.comment for group in followers for inst in group
+            if isinstance(inst, LocalReadInstruction)
+        ] == [f"read-{index}" for index in range(20)]
+        assert [
+            inst.comment for group in followers for inst in group
+            if isinstance(inst, GlobalReadInstruction)
+        ] == [f"dtl-{index}" for index in range(5)]
+
+    def test_final_partition_shadow_capacity_limits_are_independent(self):
+        from rocisa.container import DSModifiers, sgpr, vgpr
+        from rocisa.instruction import DSLoadB128, SAddU32, VXorB32
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _fitsInstructionTypeShadow)
+
+        self._schedule()
+        reads = [
+            DSLoadB128(
+                dst=vgpr(80 + 4 * index, 4), src=vgpr(65),
+                ds=DSModifiers(offset=index * 16))
+            for index in range(3)
+        ]
+        salu = [
+            SAddU32(dst=sgpr(20 + index), src0=sgpr(20 + index), src1=1)
+            for index in range(5)
+        ]
+        valu = [
+            VXorB32(
+                dst=vgpr(65 + 2 * index),
+                src0=vgpr(65 + 2 * index),
+                src1=vgpr(66 + 2 * index))
+            for index in range(4)
+        ]
+
+        assert _fitsInstructionTypeShadow(reads[:2] + salu + valu)
+        assert not _fitsInstructionTypeShadow(
+            reads + salu + valu, allowPressedDs=False)
+        assert _fitsInstructionTypeShadow(reads + salu + valu)
+        assert not _fitsInstructionTypeShadow(
+            reads + [reads[0]] + salu + valu)
+        assert not _fitsInstructionTypeShadow(
+            reads + salu + [salu[0]] + valu)
+        assert not _fitsInstructionTypeShadow(
+            reads + salu + valu + [valu[0]])
+
+    def test_final_partition_capacity_pass_is_noop_for_balanced_tail(self):
+        from rocisa.code import TextBlock
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            packFinalPartitionByInstructionType)
+
+        self._schedule()
+        schedule = self._typed_capacity_tail_schedule(overloaded=False)
+        snapshot = lambda: [
+            (type(inst), str(inst),
+             None if isinstance(inst, TextBlock) else id(inst))
+            for inst in schedule.flatitems()
+        ]
+        before = snapshot()
+
+        assert not packFinalPartitionByInstructionType(schedule)
+        assert snapshot() == before
+
+    def test_final_partition_capacity_pass_does_not_cross_barrier(self):
+        from rocisa.instruction import LocalReadInstruction, MFMAInstruction
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            packFinalPartitionByInstructionType)
+
+        self._schedule()
+        schedule = self._typed_capacity_tail_schedule()
+        items = list(schedule.flatitems())
+        early_read = next(
+            inst for inst in items if isinstance(inst, LocalReadInstruction))
+        items.remove(early_read)
+        first_mfma = next(
+            index for index, inst in enumerate(items)
+            if isinstance(inst, MFMAInstruction))
+        items.insert(first_mfma + 1, early_read)
+        schedule.setItems(items)
+        before = [id(inst) for inst in schedule.flatitems()]
+
+        assert not packFinalPartitionByInstructionType(schedule)
+        assert [id(inst) for inst in schedule.flatitems()] == before
+
+    def test_partition_zero_preserves_barrier_shadow_and_uses_capacities(self):
+        from rocisa.instruction import (
+            GlobalReadInstruction, LocalReadInstruction, MFMAInstruction,
+            SBarrier)
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            packPartitionZeroByInstructionType)
+
+        self._schedule()
+        schedule = self._typed_capacity_p0_schedule()
+
+        assert packPartitionZeroByInstructionType(schedule)
+
+        followers = []
+        for inst in schedule.flatitems():
+            if isinstance(inst, MFMAInstruction):
+                followers.append([])
+            elif followers:
+                followers[-1].append(inst)
+
+        assert [inst.comment for inst in followers[1]] == [
+            "overwrite-barrier", "advance-a", "carry-a",
+        ]
+        assert [inst.comment for inst in followers[2]] == [
+            "swap-a", "setup-0", "dtl-0",
+        ]
+        assert sum(
+            isinstance(inst, SBarrier) for inst in followers[1]) == 1
+        assert [
+            sum(isinstance(inst, GlobalReadInstruction) for inst in group)
+            for group in followers
+        ] == [0, 0, 1, 1, 1, 0, 0, 0]
+        assert [
+            sum(isinstance(inst, LocalReadInstruction) for inst in group)
+            for group in followers
+        ] == [0, 0, 0, 0, 2, 2, 0, 0]
+        assert [
+            inst.comment for group in followers for inst in group
+            if isinstance(inst, LocalReadInstruction)
+        ] == [f"read-{index}" for index in range(4)]
+
+    def test_partition_zero_capacity_pass_preserves_late_wait(self):
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            packPartitionZeroByInstructionType)
+
+        self._schedule()
+        schedule = self._typed_capacity_p0_schedule(late_wait=True)
+        before = [id(inst) for inst in schedule.flatitems()]
+
+        assert not packPartitionZeroByInstructionType(schedule)
+        assert [id(inst) for inst in schedule.flatitems()] == before
 
     def test_reads_across_wait_require_partition_prefetch_policy(self):
         from rocisa.container import DSModifiers, vgpr
@@ -4200,29 +4634,29 @@ class TestInstructionSchedulerWrapPrefetch:
             if isinstance(inst, SWaitCnt) and inst.dscnt >= 0
         )
 
-        assert [type(inst) for inst in items[:4]] == [
-            SWaitCntEx, SWaitCnt, MXMFMAInstruction, SBarrier]
+        assert [type(inst) for inst in items[:2]] == [
+            SWaitCntEx, SBarrier]
         barrier_position = next(
             index for index, inst in enumerate(items)
             if isinstance(inst, SBarrier))
-        assert mfma_positions[0] < barrier_position < mfma_positions[1]
+        assert barrier_position < mfma_positions[0]
         assert wait.dscnt == 0
-        assert wait.comment == "Wait for preloop LR before p0 MFMA"
-        assert not any(
-            isinstance(inst, DSLoadB128)
-            for inst in items[:mfma_positions[0]]
-        )
+        assert wait.comment == (
+            "Wait for C0 scale refresh and outstanding preloop LR")
+        assert [
+            inst.comment for inst in items[:mfma_positions[0]]
+            if isinstance(inst, DSLoadB128)
+        ] == [f"ds{i}" for i in range(8, 16)]
 
-        # Finish the earliest-consumer LDS cohort before writing the future
-        # LDS epoch.  Then issue exactly one m0/load bundle per MFMA interval;
-        # remaining LDS reads follow.
+        # Refresh every C0 scale operand before MFMA0. Then issue exactly one
+        # m0/load bundle per MFMA interval while spreading data LDS reads.
         assert next(
             inst.comment for inst in items[mfma_positions[0] + 1:]
             if isinstance(inst, DSLoadB128)
-        ) == "ds8"
+        ) == "ds0"
         expected_reads = [
-            "ds8", "ds14", "ds0", "ds1", "ds2", "ds3", "ds15", "ds4",
-            "ds5", "ds6", "ds7", "ds9", "ds10", "ds12", "ds13", "ds11",
+            *[f"ds{i}" for i in range(8, 16)],
+            *[f"ds{i}" for i in range(8)],
         ]
         clustered = [
             inst.comment for inst in items
@@ -4230,12 +4664,12 @@ class TestInstructionSchedulerWrapPrefetch:
                 ("m0-", "gr-", "ds"))
         ]
         assert clustered == [
-            *expected_reads[:4],
+            *expected_reads[:10],
             "m0-0", "gr-0",
             "m0-1", "gr-1",
             "m0-2", "gr-2",
             "m0-3", "gr-3",
-            *expected_reads[4:],
+            *expected_reads[10:],
         ]
         assert [
             inst.comment for inst in items
@@ -4259,7 +4693,8 @@ class TestInstructionSchedulerWrapPrefetch:
             end - begin - 1
             for begin, end in zip(mfma_positions, mfma_positions[1:])
         ]
-        assert sum(count > 0 for count in reads_per_interval) >= 8
+        assert sum(reads_per_interval) == 8
+        assert sum(count > 0 for count in reads_per_interval) >= 4
         assert max(reads_per_interval) <= 2
         assert max(global_reads_per_interval) <= 1
         assert max(instructions_per_interval) <= 3

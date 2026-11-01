@@ -246,25 +246,99 @@ def test_vgpr_within_two_wave_slot_budget(dual_src):
         "architectural VGPR %d exceeds the two-wave-slot budget (128)" % vgpr)
 
 
-def test_no_scale_local_read_in_preloop(dual_src):
-    """The pre-loop prefetches data operands but not scales.
-
-    Scale local reads are epoch-granular: the mainloop, NLL, NGLL and tail
-    paths each re-read the whole group set at their head, so a pre-loop copy
-    would be overwritten before any MFMA consumes it.  Data local reads are
-    partition-granular and must still be there, feeding partition 0's MFMAs.
-    """
+def test_scale_local_reads_are_not_duplicated_in_preloop(dual_src):
+    """C0 publishes all scale operands, so the preloop must not duplicate them."""
     preloop = []
     for ln in dual_src.splitlines():
         if ln.strip() == "label_LoopBeginL:":
             break
         preloop.append(ln)
 
-    scale_lr = [l for l in preloop if "ds_read" in l and "scaleMXS" in l]
-    assert not scale_lr, "pre-loop re-reads scales the mainloop reloads: %s" % scale_lr
+    scale_lr = [
+        l for l in preloop
+        if re.search(r"^\s*ds_read_b32\b.*// S[AB] MT=", l)
+    ]
+    assert not scale_lr, "preloop duplicated C0 scale reads: %s" % scale_lr
 
     data_lr = [
         l for l in preloop
         if re.search(r"^\s*ds_read_\w+\b.*// [AB](?: MT=)?", l)
     ]
     assert data_lr, "pre-loop lost its data operand prefetch"
+
+
+def test_scale_local_reads_complete_before_first_c0_mfma(dual_src):
+    """Every epoch must refresh scale VGPRs before its first consumer.
+
+    The loop executes C0 repeatedly.  Seeding only the first C0 in the preloop
+    lets later C0 bodies consume the previous epoch's scales, which unit scales
+    conceal.  Keep the producer wait, barrier, all six scale reads, and the
+    LGKM drain ahead of C0's first MFMA.
+    """
+    c0 = dual_src[
+        dual_src.index("/* MAINLOOP_C0 start */"):
+        dual_src.index("/* MAINLOOP_C0 end */")
+    ].splitlines()
+    scale_read_indices = [
+        i for i, line in enumerate(c0)
+        if re.search(r"^\s*ds_read_b32\b.*// S[AB] MT=", line)
+    ]
+    assert len(scale_read_indices) == 6
+
+    first_mfma = next(i for i, line in enumerate(c0)
+                      if "v_mfma_scale" in line)
+    assert max(scale_read_indices) < first_mfma, (
+        "C0 can consume stale scale VGPRs before their epoch refresh"
+    )
+
+    producer_waits = [
+        i for i, line in enumerate(c0[:scale_read_indices[0]])
+        if re.search(r"^\s*s_waitcnt\b.*\bvmcnt\(", line)
+    ]
+    barriers = [
+        i for i, line in enumerate(c0[:scale_read_indices[0]])
+        if line.lstrip().startswith("s_barrier")
+    ]
+    assert producer_waits and barriers
+    assert producer_waits[-1] < barriers[-1] < scale_read_indices[0]
+
+    lr_drains = [
+        i for i, line in enumerate(c0)
+        if re.search(r"^\s*s_waitcnt\b.*\blgkmcnt\(0\)", line)
+    ]
+    assert any(scale_read_indices[-1] < i < first_mfma for i in lr_drains)
+
+
+def test_c0_scale_refresh_retires_prior_scaled_mfma_sources(dual_src):
+    """The C1 backedge must not overwrite scale VGPRs still read by its MFMAs."""
+    c0 = dual_src[
+        dual_src.index("/* MAINLOOP_C0 start */"):
+        dual_src.index("/* MAINLOOP_C0 end */")
+    ].splitlines()
+    first_scale_read = next(
+        i for i, line in enumerate(c0)
+        if re.search(r"^\s*ds_read_b32\b.*// S[AB] MT=", line)
+    )
+    pads = [
+        i for i, line in enumerate(c0[:first_scale_read])
+        if re.search(
+            r"^\s*s_nop 8\b.*retire prior gfx950 scaled-MFMA "
+            r"scale-source reads",
+            line,
+        )
+    ]
+    assert pads == [first_scale_read - 1]
+
+
+def test_c1_omits_c0_only_scale_producer_sync(dual_src):
+    """Do not retain a VMEM wait/barrier after suppressing C1 scale producers."""
+    c1 = dual_src[
+        dual_src.index("/* MAINLOOP_C1 start */"):
+        dual_src.index("/* MAINLOOP_C1 end */")
+    ].splitlines()
+    first_mfma = next(i for i, line in enumerate(c1)
+                      if "v_mfma_scale" in line)
+    prefix = c1[:first_mfma]
+    assert not any(re.search(r"^\s*s_waitcnt\b.*\bvmcnt\(", line)
+                   for line in prefix)
+    assert not any(line.lstrip().startswith("s_barrier") for line in prefix)

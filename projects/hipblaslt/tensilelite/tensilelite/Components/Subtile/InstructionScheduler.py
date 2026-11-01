@@ -7,10 +7,12 @@ Interleaves non-MFMA instructions between MFMAs using a slot-based placer
 with pluggable scheduling rules.
 """
 
+import copy
 from typing import List, Tuple, Optional
 from rocisa.code import Module, TextBlock
-from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
-    LocalReadInstruction, GlobalReadInstruction, CommonInstruction
+from rocisa.instruction import SWaitCnt, SBarrier, SNop, MFMAInstruction, MXMFMAInstruction, \
+    LocalReadInstruction, GlobalReadInstruction, CommonInstruction, DSLoadB32, VMovB32, VXorB32
+from rocisa.container import vgpr
 
 
 # Advance the final partition's entry anchor by this many MFMA intervals.
@@ -30,6 +32,262 @@ _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
 # LGKM wait still supplies the empty seam anchor for preceding-partition DTL
 # right alignment.
 _ADVANCE_FINAL_PARTITION_FOLLOWERS = False
+# Preferred and hard per-MFMA-shadow issue capacities for typed partition
+# packing.  The hard LDS limit is used only when the preferred two-read
+# cohorts cannot fit; the other pipelines have no separate pressure mode.
+_INSTRUCTION_TYPE_SHADOW_PREFERRED_CAPACITY = {
+    "ds": 2,
+    "salu": 5,
+    "valu": 4,
+    "vmem": 1,
+}
+_INSTRUCTION_TYPE_SHADOW_HARD_CAPACITY = {
+    **_INSTRUCTION_TYPE_SHADOW_PREFERRED_CAPACITY,
+    "ds": 3,
+}
+# gfx950 has no wait instruction for retiring scaled-MFMA VGPR source reads.
+# One s_nop with this immediate provides the conservative source-read window
+# before a following ds_read overwrites a scale operand.
+_GFX950_SCALE_REFRESH_WAR_WAIT_STATE = 8
+# MT256x256 has room for three temporary scale values without changing
+# occupancy.  Keeping the count in one place makes the resource gate and the
+# physical rewrite agree.
+_SCALE_TAIL_STAGING_VGPRS = 3
+
+
+def _physicalInstructionCount(items):
+    return sum(not isinstance(inst, TextBlock) for inst in items)
+
+
+def _registerIndex(register):
+    """Return a physical VGPR index, or None for a symbolic/non-VGPR operand."""
+    if register is None or getattr(register, "regType", None) != "v":
+        return None
+    index = getattr(register, "regIdx", None)
+    return index if isinstance(index, int) else None
+
+
+def selectScaleTailStagingPlan(
+        c0Instructions, c1Instructions, stagingVgprs,
+        count=_SCALE_TAIL_STAGING_VGPRS):
+    """Select the latest-live scale values for temporary LDS staging.
+
+    Selection is derived from the emitted instruction stream rather than from
+    a macrotile-specific register list:
+
+      * C0 ``ds_read_b32`` destinations identify canonical scale VGPRs and
+        preserve each read's LDS address/offset as a cloning template.
+      * C1 scaled-MFMA operands determine each canonical VGPR's final use.
+      * The ``count`` latest final uses are staged.
+
+    Each returned dictionary contains the canonical and temporary VGPRs, the
+    read template, and the first/last MFMA-use ranks needed by the physical
+    rewrites.  An empty list means the emitted schedule does not support the
+    transform.
+    """
+    if len(stagingVgprs) != count:
+        return []
+
+    c0Reads = {}
+    for inst in c0Instructions:
+        if not isinstance(inst, DSLoadB32):
+            continue
+        destination = _registerIndex(inst.dst)
+        if destination is None:
+            continue
+        comment = getattr(inst, "comment", "")
+        if not (comment.startswith("SA ") or comment.startswith("SB ")):
+            continue
+        # The emitted dependency graph can reference the same logical read
+        # from more than one path before physical path extraction.  All such
+        # references carry the same LDS address, so one cloning template is
+        # sufficient.
+        c0Reads.setdefault(destination, inst)
+
+    c0FirstUse = {}
+    c1LastUse = {}
+    c0Rank = 0
+    for inst in c0Instructions:
+        if not isinstance(inst, MXMFMAInstruction):
+            continue
+        for register in (inst.mxsa, inst.mxsb):
+            index = _registerIndex(register)
+            if index is not None:
+                c0FirstUse.setdefault(index, c0Rank)
+        c0Rank += 1
+
+    c1Rank = 0
+    for inst in c1Instructions:
+        if not isinstance(inst, MXMFMAInstruction):
+            continue
+        for register in (inst.mxsa, inst.mxsb):
+            index = _registerIndex(register)
+            if index is not None:
+                c1LastUse[index] = c1Rank
+        c1Rank += 1
+
+    candidates = [
+        register for register in c0Reads
+        if register in c0FirstUse and register in c1LastUse
+    ]
+    if len(candidates) < count:
+        return []
+    candidates.sort(
+        key=lambda register: (c1LastUse[register], register),
+        reverse=True)
+    selected = candidates[:count]
+
+    return [
+        {
+            "canonicalVgpr": canonical,
+            "stagingVgpr": staging,
+            "readTemplate": copy.deepcopy(c0Reads[canonical]),
+            "firstC0Mfma": c0FirstUse[canonical],
+            "lastC1Mfma": c1LastUse[canonical],
+        }
+        for canonical, staging in zip(selected, stagingVgprs)
+    ]
+
+
+def rewriteC0ForScaleTailStaging(schedule, plan):
+    """Replace three unsafe C0 scale refreshes with interleaved publishes.
+
+    The corresponding LDS reads are supplied by the preloop on first entry and
+    by the preceding C1 thereafter.  C0's existing full LGKM drain publishes
+    those temporary values.  Place one temporary-to-canonical move in each of
+    three early MFMA shadows, before that canonical scale's first consumer.
+
+    Return False without mutating ``schedule`` when its physical shape does not
+    satisfy the contract.
+    """
+    if not plan:
+        return False
+
+    targetRegisters = {
+        entry["canonicalVgpr"] for entry in plan
+    }
+    removedReadRegisters = set()
+    filtered = []
+    for inst in schedule.flatitems():
+        if (
+                isinstance(inst, DSLoadB32)
+                and _registerIndex(inst.dst) in targetRegisters):
+            removedReadRegisters.add(_registerIndex(inst.dst))
+            continue
+        if (
+                isinstance(inst, SNop)
+                and "scaled-MFMA scale-source reads before refresh"
+                in getattr(inst, "comment", "")):
+            continue
+        filtered.append(inst)
+
+    if removedReadRegisters != targetRegisters:
+        return False
+
+    prefix = []
+    mfmas = []
+    followers = []
+    for inst in filtered:
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            mfmas.append(inst)
+            followers.append([])
+        elif not mfmas:
+            prefix.append(inst)
+        else:
+            followers[-1].append(inst)
+
+    placements = []
+    searchFrom = 0
+    for entry in sorted(plan, key=lambda item: item["firstC0Mfma"]):
+        limit = min(entry["firstC0Mfma"], len(followers))
+        target = next(
+            (
+                index for index in range(searchFrom, limit)
+                if _physicalInstructionCount(followers[index]) < 3
+            ),
+            None,
+        )
+        if target is None:
+            return False
+        placements.append((target, entry))
+        searchFrom = target + 1
+
+    for target, entry in placements:
+        followers[target].append(VMovB32(
+            dst=vgpr(entry["canonicalVgpr"]),
+            src=vgpr(entry["stagingVgpr"]),
+            comment=(
+                "publish staged future scale after C0 LGKM drain "
+                f"(last C1 use M{entry['lastC1Mfma']})"
+            ),
+        ))
+
+    items = list(prefix)
+    for mfma, group in zip(mfmas, followers):
+        items.append(mfma)
+        items.extend(group)
+    schedule.setItems(items)
+    return True
+
+
+def appendScaleTailStagingReads(schedule, plan):
+    """Place staged future-scale reads in the first empty P3 MFMA shadows.
+
+    ``advancePartitionInterleave`` shifts P3's synchronization and A/B read
+    stream three MFMAs earlier.  Start immediately after the last remaining
+    follower, one read per MFMA shadow, which gives the staged values maximum
+    LDS latency before the next C0 while retaining MFMA interleaving.
+    """
+    if not plan:
+        return False
+
+    prefix = []
+    mfmas = []
+    followers = []
+    for inst in schedule.flatitems():
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            mfmas.append(inst)
+            followers.append([])
+        elif not mfmas:
+            prefix.append(inst)
+        else:
+            followers[-1].append(inst)
+
+    occupied = [
+        index for index, group in enumerate(followers)
+        if _physicalInstructionCount(group)
+    ]
+    searchFrom = occupied[-1] + 1 if occupied else 0
+    targets = []
+    for index in range(searchFrom, len(followers)):
+        if _physicalInstructionCount(followers[index]) < 3:
+            targets.append(index)
+        if len(targets) == len(plan):
+            break
+    if len(targets) != len(plan):
+        return False
+
+    # Earliest final consumers first makes the physical stream deterministic;
+    # temporary destinations mean these reads may overlap later canonical uses.
+    orderedPlan = sorted(
+        plan, key=lambda entry: (
+            entry["lastC1Mfma"], entry["canonicalVgpr"]))
+    for target, entry in zip(targets, orderedPlan):
+        read = copy.deepcopy(entry["readTemplate"])
+        read.dst = vgpr(entry["stagingVgpr"])
+        read.comment = (
+            "stage next C0 scale in temporary VGPR; "
+            f"canonical=v{entry['canonicalVgpr']} "
+            f"last-use=M{entry['lastC1Mfma']}"
+        )
+        followers[target].append(read)
+
+    items = list(prefix)
+    for mfma, group in zip(mfmas, followers):
+        items.append(mfma)
+        items.extend(group)
+    schedule.setItems(items)
+    return True
 
 
 class _DtlIntervalCapacityError(RuntimeError):
@@ -438,6 +696,37 @@ _isVALU = lambda x: isinstance(x, CommonInstruction) \
     and not isinstance(x, (GlobalReadInstruction, LocalReadInstruction)) \
     and hasattr(x, 'dst') and hasattr(x.dst, 'regType') \
     and x.dst.regType == 'v'
+
+
+def _shadowPipeline(inst):
+    """Return the independently capacity-limited pipeline for ``inst``."""
+    if _isDsRead(inst):
+        return "ds"
+    if _isBufferLoad(inst):
+        return "vmem"
+    if _isVALU(inst):
+        return "valu"
+    if isinstance(inst, CommonInstruction):
+        return "salu"
+    return None
+
+
+def _fitsInstructionTypeShadow(group, allowPressedDs=True):
+    """Whether a follower group fits the per-pipeline shadow capacities."""
+    capacities = (
+        _INSTRUCTION_TYPE_SHADOW_HARD_CAPACITY
+        if allowPressedDs
+        else _INSTRUCTION_TYPE_SHADOW_PREFERRED_CAPACITY
+    )
+    counts = {pipeline: 0 for pipeline in capacities}
+    for inst in group:
+        pipeline = _shadowPipeline(inst)
+        if pipeline is None:
+            continue
+        counts[pipeline] += 1
+        if counts[pipeline] > capacities[pipeline]:
+            return False
+    return True
 # Typed op detection (see SWaitCntEx.isWaitGr / SBarrier) rather than matching
 # substrings in the instruction comment, which is brittle to comment edits.
 _isWaitGr = lambda x: _isWaitCnt(x) and getattr(x, "isWaitGr", False)
@@ -727,7 +1016,9 @@ def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
     return None
 
 
-def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
+def _splitPartitionZeroPrefetch(
+        preMfmaOrders, emittedModules,
+        scaleRefreshWarWaitState: Optional[int] = None):
     """Move p0's full LR drain before its independent younger reads.
 
     Returns the matched order, a pre-MFMA wait/sync prefix, the payload path
@@ -739,25 +1030,62 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     if order is None:
         return None
 
+    def isScaleRefresh(mid):
+        em = emittedModules[mid]
+        return (
+            em.opType in ("lr", "lr_inc")
+            and getattr(em.source, "tensor", None) in ("SA", "SB")
+        )
+
+    scalePayloadOrder = [mid for mid in order if isScaleRefresh(mid)]
+    scalePayloadInsts = _flattenPath(scalePayloadOrder, emittedModules)
+
     prefixInsts = []
     syncInsts = []
-    for opType in ("wait_gr", "sync", "wait_lr"):
+    for opType in ("wait_gr", "sync"):
         for mid in order:
             em = emittedModules[mid]
             if em.opType != opType:
                 continue
             for inst in em.instructions:
-                if opType == "wait_lr" and _isWaitCnt(inst):
-                    inst.dscnt = 0
-                    inst.comment = "Wait for preloop LR before p0 MFMA"
                 item = (mid, inst)
                 prefixInsts.append(item)
-                if opType == "sync":
+                # A barrier publishing the scale producer cannot be deferred
+                # past MFMA0: every C0 iteration refreshes the same scale
+                # VGPRs, so MFMA0 would otherwise consume the prior epoch.
+                if opType == "sync" and not scalePayloadInsts:
                     syncInsts.append(item)
+
+    if scalePayloadInsts and scaleRefreshWarWaitState is not None:
+        prefixInsts.append((
+            -1,
+            SNop(
+                waitState=scaleRefreshWarWaitState,
+                comment=(
+                    "retire prior gfx950 scaled-MFMA scale-source reads "
+                    "before refresh"
+                ),
+            ),
+        ))
+    prefixInsts.extend(scalePayloadInsts)
+    for mid in order:
+        em = emittedModules[mid]
+        if em.opType != "wait_lr":
+            continue
+        for inst in em.instructions:
+            if _isWaitCnt(inst):
+                inst.dscnt = 0
+                inst.comment = (
+                    "Wait for C0 scale refresh and outstanding preloop LR"
+                    if scalePayloadInsts
+                    else "Wait for preloop LR before p0 MFMA"
+                )
+            prefixInsts.append((mid, inst))
 
     payloadOrder = [
         mid for mid in order
         if emittedModules[mid].opType not in ("wait_gr", "sync", "wait_lr")
+        and not isScaleRefresh(mid)
     ]
     payloadInsts = _flattenPath(payloadOrder, emittedModules)
     return order, prefixInsts, payloadOrder, payloadInsts, syncInsts
@@ -1265,6 +1593,463 @@ def advancePartitionInterleave(
     return True
 
 
+def packPartitionZeroByInstructionType(schedule):
+    """Left-pack the dependency-safe P0 suffix by instruction pipeline.
+
+    Partition zero has a synchronization boundary before its future-epoch DTL
+    writes.  After that barrier, its emitted scalar address updates, atomic
+    m0/DTL bundles, and next-partition LDS reads are independent of the current
+    partition's MFMA results.  Preserve their complete instruction order while
+    allowing independent pipelines to share an MFMA shadow:
+
+      * two LDS reads per shadow (three only if the preferred layout cannot fit);
+      * five scalar instructions;
+      * four VALU instructions;
+      * one VMEM request.
+
+    The pre-MFMA scale-refresh prefix and everything through the in-partition
+    barrier remain anchored.  The barrier shadow may keep its emitted
+    followers but cannot absorb younger work from a later MFMA shadow.
+    Unsupported instructions, work after the final MFMA, unpaired DTL
+    requests, or a read/MFMA register overlap make this a byte-identical no-op.
+    """
+    isMfma = lambda inst: isinstance(
+        inst, (MFMAInstruction, MXMFMAInstruction))
+
+    prefix = []
+    mfmas = []
+    followers = []
+    for inst in schedule.flatitems():
+        if isMfma(inst):
+            mfmas.append(inst)
+            followers.append([])
+        elif not mfmas:
+            prefix.append(inst)
+        else:
+            followers[-1].append(inst)
+
+    if len(mfmas) < 2 or followers[-1]:
+        return False
+
+    barriers = [
+        (groupIndex, instIndex)
+        for groupIndex, group in enumerate(followers)
+        for instIndex, inst in enumerate(group)
+        if _isBarrier(inst)
+    ]
+    if len(barriers) != 1:
+        return False
+    barrierGroup, barrierOffset = barriers[0]
+    if barrierGroup >= len(mfmas) - 1:
+        return False
+
+    movable = []
+    for groupIndex in range(barrierGroup, len(followers)):
+        begin = barrierOffset + 1 if groupIndex == barrierGroup else 0
+        movable.extend(
+            (groupIndex, inst)
+            for inst in followers[groupIndex][begin:]
+        )
+
+    def safeScalar(inst):
+        if not isinstance(inst, CommonInstruction):
+            return False
+        dst = getattr(inst, "dst", None)
+        if dst is None or not hasattr(dst, "regType"):
+            return False
+        if dst.regType == "m":
+            return True
+        dstName = str(dst)
+        return (
+            dst.regType == "s"
+            and ("sgprSrd" in dstName
+                 or "sgprLocalWriteBaseAddr" in dstName)
+        )
+
+    for _groupIndex, inst in movable:
+        if isinstance(inst, TextBlock):
+            continue
+        if (
+                _isWaitCnt(inst)
+                or _isBarrier(inst)
+                or _isVALU(inst)):
+            return False
+        if (
+                _isDsRead(inst)
+                or _isBufferLoad(inst)
+                or safeScalar(inst)):
+            continue
+        return False
+
+    # Keep comments with the instruction they describe and every m0/load pair
+    # atomic.  A standalone buffer load or m0 update is not this P0 shape.
+    units = []
+    pendingText = []
+    dtlBundles = 0
+    index = 0
+    while index < len(movable):
+        groupIndex, inst = movable[index]
+        if isinstance(inst, TextBlock):
+            pendingText.append((groupIndex, inst))
+            index += 1
+            continue
+        if _isBufferLoad(inst):
+            return False
+        if _isM0Update(inst):
+            bundle = [*pendingText, (groupIndex, inst)]
+            pendingText = []
+            nextIndex = index + 1
+            while (
+                    nextIndex < len(movable)
+                    and isinstance(movable[nextIndex][1], TextBlock)):
+                bundle.append(movable[nextIndex])
+                nextIndex += 1
+            if (
+                    nextIndex >= len(movable)
+                    or movable[nextIndex][0] != groupIndex
+                    or not _isBufferLoad(movable[nextIndex][1])):
+                return False
+            bundle.append(movable[nextIndex])
+            units.append((groupIndex, bundle))
+            dtlBundles += 1
+            index = nextIndex + 1
+            continue
+        units.append((groupIndex, [*pendingText, (groupIndex, inst)]))
+        pendingText = []
+        index += 1
+    if pendingText:
+        if not units:
+            return False
+        units[-1][1].extend(pendingText)
+    if dtlBundles < 2:
+        return False
+
+    def vgprSpan(reg):
+        if reg is None or not hasattr(reg, "regType") or reg.regType != "v":
+            return ()
+        if getattr(reg, "regName", None) is not None:
+            return None
+        return (reg.regIdx, reg.regIdx + reg.regNum)
+
+    def spansOverlap(lhs, rhs):
+        return lhs[0] < rhs[1] and rhs[0] < lhs[1]
+
+    def canAdvanceRead(inst, targetGroup, originalGroup):
+        if targetGroup >= originalGroup:
+            return True
+        dstSpan = vgprSpan(getattr(inst, "dst", None))
+        if dstSpan is None or not dstSpan:
+            return False
+        for mfma in mfmas[targetGroup + 1:originalGroup + 1]:
+            for operandName in ("a", "b", "mxsa", "mxsb", "acc", "acc2"):
+                operandSpan = vgprSpan(getattr(mfma, operandName, None))
+                if operandSpan is None:
+                    return False
+                if operandSpan and spansOverlap(dstSpan, operandSpan):
+                    return False
+        return True
+
+    fixed = [list(group) for group in followers]
+    fixed[barrierGroup] = fixed[barrierGroup][:barrierOffset + 1]
+    for groupIndex in range(barrierGroup + 1, len(fixed)):
+        fixed[groupIndex] = []
+
+    def attempt(allowPressedDs):
+        rewritten = [list(group) for group in fixed]
+        target = barrierGroup
+        for originalGroup, unit in units:
+            unitInsts = [inst for _groupIndex, inst in unit]
+            placed = False
+            while target <= originalGroup and target < len(mfmas) - 1:
+                candidate = [*rewritten[target], *unitInsts]
+                crossesIntoBarrierShadow = (
+                    target == barrierGroup
+                    and originalGroup > barrierGroup
+                )
+                readsSafe = all(
+                    not _isDsRead(inst)
+                    or canAdvanceRead(inst, target, originalGroup)
+                    for inst in unitInsts
+                )
+                if (
+                        not crossesIntoBarrierShadow
+                        and readsSafe
+                        and _fitsInstructionTypeShadow(
+                            candidate, allowPressedDs=allowPressedDs)):
+                    rewritten[target].extend(unitInsts)
+                    placed = True
+                    break
+                target += 1
+            if not placed:
+                return None
+        return rewritten
+
+    rewritten = attempt(allowPressedDs=False)
+    if rewritten is None:
+        rewritten = attempt(allowPressedDs=True)
+    if rewritten is None:
+        return False
+
+    oldPositions = {
+        id(inst): groupIndex
+        for groupIndex, group in enumerate(followers)
+        for inst in group
+    }
+    newPositions = {
+        id(inst): groupIndex
+        for groupIndex, group in enumerate(rewritten)
+        for inst in group
+    }
+    if oldPositions.keys() != newPositions.keys():
+        return False
+    if all(
+            oldPositions[instId] == newPositions[instId]
+            for instId in oldPositions):
+        return False
+
+    items = list(prefix)
+    for mfma, group in zip(mfmas, rewritten):
+        items.append(mfma)
+        items.extend(group)
+    schedule.setItems(items)
+    return True
+
+
+def packFinalPartitionByInstructionType(schedule):
+    """Balance an overloaded wrap tail with per-pipeline shadow capacities.
+
+    This is a conservative final-partition post-pass.  It recognizes only the
+    dependency shape whose legality can be established from the emitted code:
+    independent LR-address XORs, ordered LDS reads, and atomic m0/DTL bundles.
+    Waits and barriers remain anchored.
+
+    The placement policy is:
+
+      * up to four independent VALU address swaps in one shadow;
+      * two LDS reads per shadow, increasing selected early cohorts to three
+        only when required for the complete schedule to fit;
+      * one right-aligned VMEM request per shadow, kept with its SALU setup;
+      * at most five SALU instructions in any shadow.
+
+    Returns ``True`` only after applying the complete legal rewrite.  Balanced
+    and unsupported schedules are left byte-identical.
+    """
+    isMfma = lambda inst: isinstance(
+        inst, (MFMAInstruction, MXMFMAInstruction))
+
+    prefix = []
+    mfmas = []
+    followers = []
+    for inst in schedule.flatitems():
+        if isMfma(inst):
+            mfmas.append(inst)
+            followers.append([])
+        elif not mfmas:
+            prefix.append(inst)
+        else:
+            followers[-1].append(inst)
+
+    if len(mfmas) < 4:
+        return False
+
+    # A balanced tail does not need a rewrite.  VMEM is intentionally kept at
+    # one request per MFMA shadow even though the other pipeline capacities are
+    # independent.
+    if not any(
+            sum(_isDtlLoad(inst) for inst in group)
+            > _INSTRUCTION_TYPE_SHADOW_HARD_CAPACITY["vmem"]
+            for group in followers):
+        return False
+
+    barriers = [
+        groupIndex
+        for groupIndex, group in enumerate(followers)
+        for inst in group
+        if _isBarrier(inst)
+    ]
+    if len(barriers) != 1:
+        return False
+    barrierIndex = barriers[0]
+
+    # Never move work across the synchronization boundary.  The barrier can
+    # share a follower group with later work, so validate instruction order
+    # rather than treating its whole group as one side of the boundary.
+    seenBarrier = False
+    for group in followers:
+        for inst in group:
+            if _isBarrier(inst):
+                seenBarrier = True
+            elif (
+                    not seenBarrier
+                    and (isinstance(inst, VXorB32)
+                         or _isDsRead(inst)
+                         or _isDtlLoad(inst))):
+                return False
+
+    # Only self-XOR LR address swaps with disjoint destinations are movable.
+    # This proves that coexecuting them changes no inter-XOR dependency.
+    xors = [
+        inst for groupIndex, group in enumerate(followers)
+        if groupIndex >= barrierIndex
+        for inst in group
+        if isinstance(inst, VXorB32)
+    ]
+    valuCapacity = _INSTRUCTION_TYPE_SHADOW_HARD_CAPACITY["valu"]
+    if not xors or len(xors) > valuCapacity:
+        return False
+    xorDst = {str(inst.dst) for inst in xors}
+
+    def isIndependentXor(inst):
+        srcs = list(inst.srcs)
+        return (
+            len(srcs) == 2
+            and str(srcs[0]) == str(inst.dst)
+            and str(srcs[1]) not in xorDst
+        )
+
+    if (
+            len(xorDst) != len(xors)
+            or not all(isIndependentXor(inst) for inst in xors)):
+        return False
+
+    xorGroupIds = {
+        groupIndex
+        for groupIndex, group in enumerate(followers)
+        if groupIndex >= barrierIndex
+        if any(isinstance(inst, VXorB32) for inst in group)
+    }
+    xorPayload = [
+        inst
+        for groupIndex, group in enumerate(followers)
+        if groupIndex in xorGroupIds
+        for inst in group
+        if isinstance(inst, (TextBlock, VXorB32))
+    ]
+
+    reads = [
+        inst for group in followers[barrierIndex:] for inst in group
+        if _isDsRead(inst)
+    ]
+    if not reads:
+        return False
+
+    # Preserve comments attached to each atomic m0/load request while proving
+    # that every DTL request still follows its own final m0 setup.
+    dtlBundles = []
+    bundledIds = set()
+    for group in followers[barrierIndex:]:
+        for loadIndex, inst in enumerate(group):
+            if not _isDtlLoad(inst):
+                continue
+            setupIndex = loadIndex - 1
+            while (setupIndex >= 0
+                   and isinstance(group[setupIndex], TextBlock)):
+                setupIndex -= 1
+            if setupIndex < 0 or not _isM0Update(group[setupIndex]):
+                return False
+            bundleStart = setupIndex
+            while (bundleStart > 0
+                   and isinstance(group[bundleStart - 1], TextBlock)):
+                bundleStart -= 1
+            bundle = group[bundleStart:loadIndex + 1]
+            if any(id(item) in bundledIds for item in bundle):
+                return False
+            bundledIds.update(id(item) for item in bundle)
+            dtlBundles.append(bundle)
+
+    if len(dtlBundles) < 2 or len(reads) < len(dtlBundles):
+        return False
+
+    xorTarget = barrierIndex + 1
+    readStart = xorTarget + 1
+    # Followers after the final MFMA cannot hide work, so the final request
+    # occupies the shadow before that MFMA.
+    dtlStart = len(mfmas) - 1 - len(dtlBundles)
+    dtlTargets = list(range(dtlStart, len(mfmas) - 1))
+    readOnlyTargets = list(range(readStart, dtlStart))
+    if (
+            xorTarget >= len(mfmas) - 1
+            or not readOnlyTargets
+            or len(dtlTargets) != len(dtlBundles)):
+        return False
+
+    # Keep one ordered LDS read in every right-aligned DTL shadow.  Place the
+    # rest in preferred two-read cohorts; if that is insufficient, increase
+    # only as many earliest cohorts as necessary to the hard limit of three.
+    lateReads = reads[-len(dtlBundles):]
+    earlyReads = reads[:-len(dtlBundles)]
+    preferredDs = _INSTRUCTION_TYPE_SHADOW_PREFERRED_CAPACITY["ds"]
+    hardDs = _INSTRUCTION_TYPE_SHADOW_HARD_CAPACITY["ds"]
+    pressedCohorts = max(
+        0, len(earlyReads) - preferredDs * len(readOnlyTargets))
+    if pressedCohorts > (hardDs - preferredDs) * len(readOnlyTargets):
+        return False
+
+    readPlan = []
+    remaining = list(earlyReads)
+    for targetIndex, target in enumerate(readOnlyTargets):
+        extra = min(
+            hardDs - preferredDs,
+            max(0, pressedCohorts
+                - targetIndex * (hardDs - preferredDs)))
+        capacity = preferredDs + extra
+        cohort = remaining[:capacity]
+        remaining = remaining[capacity:]
+        if cohort:
+            readPlan.append((target, cohort))
+    if remaining:
+        return False
+    readPlan.extend(zip(dtlTargets, ([read] for read in lateReads)))
+
+    movedIds = {
+        id(inst)
+        for inst in [*xorPayload, *reads]
+    }
+    movedIds.update(
+        id(inst)
+        for bundle in dtlBundles
+        for inst in bundle
+    )
+    rewritten = [
+        [inst for inst in group if id(inst) not in movedIds]
+        for group in followers
+    ]
+
+    # Do not infer dependencies for unrelated instructions.  Capacity-aware
+    # merging is used only in shadows emptied by the recognized streams.
+    targetGroups = {
+        xorTarget,
+        *(target for target, _ in readPlan),
+    }
+    if any(
+            any(not isinstance(inst, TextBlock) for inst in rewritten[target])
+            for target in targetGroups):
+        return False
+
+    rewritten[xorTarget].extend(xorPayload)
+    for target, cohort in readPlan:
+        rewritten[target].extend(cohort)
+    for target, bundle in zip(dtlTargets, dtlBundles):
+        rewritten[target].extend(bundle)
+
+    if any(
+            not _fitsInstructionTypeShadow(group)
+            for group in rewritten):
+        return False
+    if any(
+            sum(_isDtlLoad(inst) for inst in group)
+            > _INSTRUCTION_TYPE_SHADOW_HARD_CAPACITY["vmem"]
+            for group in rewritten):
+        return False
+
+    items = list(prefix)
+    for mfma, group in zip(mfmas, rewritten):
+        items.append(mfma)
+        items.extend(group)
+    schedule.setItems(items)
+    return True
+
+
 def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], List[List[int]]]:
     """Extract non-MFMA dependency paths using only EmittedModule.before links.
 
@@ -1389,7 +2174,8 @@ def instructionSchedule(
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
         partitionPrefetch: bool = False,
         limitDtlBundlesPerMfma: bool = False,
-        uniformPgrEpoch: bool = False):
+        uniformPgrEpoch: bool = False,
+        scaleRefreshWarWaitState: Optional[int] = None):
     """Interleave non-MFMA instructions between MFMAs.
 
     Rules (shared):
@@ -1430,7 +2216,8 @@ def instructionSchedule(
     # mode keeps legacy MXFP4 and other subtile schedules byte-stable.
     if isMx8Cycle and partitionPrefetch:
         p0Split = _splitPartitionZeroPrefetch(
-            preMfmaOrders, emittedModules)
+            preMfmaOrders, emittedModules,
+            scaleRefreshWarWaitState=scaleRefreshWarWaitState)
     partitionPrefetchPolicy = (
         isMx8Cycle
         and not multiDU

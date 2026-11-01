@@ -657,6 +657,10 @@ class WaitGROp(BaseOp):
     # and force_drain survives _merge_preops so the min-count merge cannot
     # silently weaken the drain back to a partial vmcnt.
     force_drain: bool = False
+    # Dual-period scale producers exist only in the first statically unrolled
+    # body.  Their wait and paired barrier must disappear with those producers
+    # in later bodies rather than leaving an unnecessary VMEM drain.
+    first_unroll_only: bool = False
 
     def __post_init__(self):
         self.kind = 'wait_gr'
@@ -686,6 +690,8 @@ class WaitLROp(BaseOp):
 @dataclass
 class SyncOp(BaseOp):
     """Standalone sync barrier."""
+    first_unroll_only: bool = False
+
     def __post_init__(self):
         self.kind = 'sync'
 
@@ -901,6 +907,12 @@ class LogicalScheduler:
                                                       'SA': set(), 'SB': set()}
         self._tail_freed_tile_ids: Dict[str, set] = {'A': set(), 'B': set(),
                                                      'SA': set(), 'SB': set()}
+        # Experimental MT256x256 scale-tail staging.  Kernel.mainLoop enables
+        # it only when the schedule topology matches and three additional
+        # VGPRs fit the hardware budget.
+        self.scaleTailStagingEnabled = False
+        self.scaleTailStagingVgprs: List[int] = []
+        self._scaleTailStagingPlan = None
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -2723,15 +2735,25 @@ class LogicalScheduler:
             raise ValueError(
                 "uniformPgrEpoch frontier has no next-epoch A/B consumer")
 
-        # Remove every partition-local producer wait.  Their LDS overwrite
-        # waits live on GR.preOps and are deliberately not modified.
+        # Replace only the partition-local A/B producer waits.  Scale reads
+        # consume a separate 256-K epoch before the A/B frontier and therefore
+        # retain their own producer wait; folding that wait into the later A/B
+        # frontier lets C0 read stale scale LDS.
         for partition_slots in self._partitions:
             for slot in partition_slots:
                 for lr in slot.lrs:
-                    lr.preOps = [
-                        op for op in lr.preOps
-                        if not isinstance(op, WaitGROp)
-                    ]
+                    if lr.tensor in ('A', 'B'):
+                        lr.preOps = [
+                            op for op in lr.preOps
+                            if not isinstance(op, WaitGROp)
+                        ]
+                    elif cfg.dualPeriodScale and lr.tensor in ('SA', 'SB'):
+                        # Scale GRs are emitted only in C0. Keep their producer
+                        # frontier for C0, but suppress both it and its paired
+                        # barrier when the static C1 body is populated.
+                        for op in lr.preOps:
+                            if isinstance(op, WaitGROp):
+                                op.first_unroll_only = True
 
         num_bodies = cfg.scaleReuse if cfg.dualPeriodScale else 1
         counts_by_unroll = []
@@ -3000,6 +3022,12 @@ class LogicalScheduler:
             # vmcnt and re-introduce the wrap-LR race).
             merged_force_drain = any(
                 getattr(op, 'force_drain', False) for op, _ in wait_gr_by_lr)
+            # A mixed merge conservatively remains active in every body.  In
+            # the dual-period scale path the A/B waits were removed before
+            # grouping, so the scale-only merged frontier remains C0-only.
+            merged_first_unroll_only = all(
+                getattr(op, 'first_unroll_only', False)
+                for op, _ in wait_gr_by_lr)
             dynamic_counts = [
                 op.wait_gr_counts_by_unroll
                 for op, _ in wait_gr_by_lr
@@ -3014,7 +3042,8 @@ class LogicalScheduler:
                                        if dynamic_counts else None),
                                    has_sync=has_wait_gr_sync,
                                    adjustVmcnt=adjust,
-                                   force_drain=merged_force_drain))
+                                   force_drain=merged_force_drain,
+                                   first_unroll_only=merged_first_unroll_only))
         result.extend(others)
         return result
 
@@ -3329,7 +3358,8 @@ class LogicalScheduler:
                             if firstPreOpId is None:
                                 firstPreOpId = depId
                             if preOp.has_sync:
-                                depId = add(SyncOp())
+                                depId = add(SyncOp(
+                                    first_unroll_only=preOp.first_unroll_only))
                                 setBefore(depId, prevId)
                                 prevId = depId
                                 lastDepId = depId
@@ -3978,13 +4008,10 @@ class LogicalScheduler:
             'B':  MFMATileRange(0, cfg.lrB.k, *part0['B']),
         }
         if cfg.hasScale and not cfg.prefetchNextPartition:
-            # Scales are left out of the partition-directed prefetch.  Data local
-            # reads are partition-granular, so the pre-loop's copies feed the
-            # first partition's MFMAs and are genuinely live.  Scale local reads
-            # are epoch-granular instead: every entry point re-reads the whole
-            # group set before consuming it -- the mainloop at its C0 head, and
-            # the NLL, NGLL and tail paths at theirs -- so a pre-loop copy would
-            # be overwritten before use on every path out of here.
+            # Partition-prefetch mainloops publish their complete scale epoch
+            # at the C0 head.  Keeping scales out of the preloop avoids loading
+            # the same LDS locations twice while preserving one entry policy
+            # for the steady-state loop and every exit path.
             lr_tiles['SA'] = MFMATileRange(0, cfg.lrSA.k, *part0['A'])
             lr_tiles['SB'] = MFMATileRange(0, cfg.lrSB.k, *part0['B'])
 
@@ -4107,6 +4134,66 @@ class LogicalScheduler:
         self._preloop_emitted = [[emitted]]
         return self._preloop_emitted
 
+    @staticmethod
+    def _flatEmittedInstructions(emitted_3d):
+        """Flatten populated EmittedModules without changing their ownership."""
+        for partition in emitted_3d:
+            for em_list in partition:
+                for emitted in em_list:
+                    for inst in emitted.instructions:
+                        if isinstance(inst, Module):
+                            yield from inst.flatitems()
+                        else:
+                            yield inst
+
+    def _prepareScaleTailStagingPlan(self):
+        """Derive the physical scale staging plan after register population."""
+        if not self.scaleTailStagingEnabled:
+            self._scaleTailStagingPlan = []
+            return self._scaleTailStagingPlan
+        if self._scaleTailStagingPlan is not None:
+            return self._scaleTailStagingPlan
+
+        from .InstructionScheduler import (
+            _SCALE_TAIL_STAGING_VGPRS,
+            selectScaleTailStagingPlan,
+        )
+
+        assert self.unroll_factor == 2, \
+            "scale-tail staging requires the dual-period C0/C1 loop"
+        assert len(self.scaleTailStagingVgprs) == _SCALE_TAIL_STAGING_VGPRS
+        plan = selectScaleTailStagingPlan(
+            list(self._flatEmittedInstructions(
+                self._emitted_per_unroll[0])),
+            list(self._flatEmittedInstructions(
+                self._emitted_per_unroll[1])),
+            self.scaleTailStagingVgprs,
+        )
+        assert len(plan) == _SCALE_TAIL_STAGING_VGPRS, \
+            "enabled scale-tail staging could not derive three scale values"
+        self._scaleTailStagingPlan = plan
+        return plan
+
+    @staticmethod
+    def _makeScaleTailStagingSeed(plan):
+        """Seed the temporary scale VGPRs for the first C0 entry."""
+        from rocisa.container import vgpr
+
+        module = Module("Preloop scale-tail staging seed")
+        module.addComment0(
+            "Seed future-scale temporaries for the first C0 entry")
+        for entry in sorted(
+                plan, key=lambda item: (
+                    item["firstC0Mfma"], item["canonicalVgpr"])):
+            read = copy.deepcopy(entry["readTemplate"])
+            read.dst = vgpr(entry["stagingVgpr"])
+            read.comment = (
+                "preloop seed for staged C0 scale; "
+                f"canonical=v{entry['canonicalVgpr']}"
+            )
+            module.add(read)
+        return module
+
     def _emitLoop(self, writer, kernel, label, emitted_3d, schedule=True):
         """Emit a loop section from a 3D emitted structure.
 
@@ -4120,10 +4207,15 @@ class LogicalScheduler:
             _ADVANCE_FINAL_PARTITION_FOLLOWERS,
             _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT,
             _FINAL_ENTRY_ANCHOR_ADVANCE_MFMAS,
+            _GFX950_SCALE_REFRESH_WAR_WAIT_STATE,
             _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX,
             advancePartitionInterleave,
+            appendScaleTailStagingReads,
             eliminateRedundantLgkmDrains,
             instructionSchedule,
+            packFinalPartitionByInstructionType,
+            packPartitionZeroByInstructionType,
+            rewriteC0ForScaleTailStaging,
             safeOutstandingLocalReadSuffix,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250,
@@ -4140,6 +4232,12 @@ class LogicalScheduler:
         minGapDsReadToWait = (_MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250
                               if isGfx1250
                               else _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT)
+        scaleRefreshWarWaitState = (
+            _GFX950_SCALE_REFRESH_WAR_WAIT_STATE
+            if (self.config.dualPeriodScale
+                and tuple(kernel.get("ISA", ())) == (9, 5, 0))
+            else None
+        )
 
         module = Module(label)
         module.addComment0(f"{label} start")
@@ -4190,7 +4288,8 @@ class LogicalScheduler:
                             minGapDsReadToWait=minGapDsReadToWait,
                             partitionPrefetch=self.config.prefetchNextPartition,
                             limitDtlBundlesPerMfma=self.config.dualPeriodScale,
-                            uniformPgrEpoch=self.config.uniformPgrEpoch)
+                            uniformPgrEpoch=self.config.uniformPgrEpoch,
+                            scaleRefreshWarWaitState=scaleRefreshWarWaitState)
                     except _DtlIntervalCapacityError:
                         # Dependency windows can make the simple request-count
                         # capacity check optimistic. Retry only this cell with
@@ -4201,15 +4300,27 @@ class LogicalScheduler:
                             minGapDsReadToWait=minGapDsReadToWait,
                             partitionPrefetch=self.config.prefetchNextPartition,
                             limitDtlBundlesPerMfma=False,
-                            uniformPgrEpoch=self.config.uniformPgrEpoch)
+                            uniformPgrEpoch=self.config.uniformPgrEpoch,
+                            scaleRefreshWarWaitState=scaleRefreshWarWaitState)
                     if (
-                            self.config.uniformPgrEpoch
+                            self.config.dualPeriodScale
+                            and self.config.uniformPgrEpoch
+                            and self.config.numSubIterK == 1
+                            and label.startswith("MAINLOOP")
+                            and pi == 0
+                            and k == 0):
+                        packPartitionZeroByInstructionType(scheduled)
+                    if (
+                            self.config.dualPeriodScale
+                            and self.config.uniformPgrEpoch
                             and self.config.numSubIterK == 1
                             and label.startswith("MAINLOOP")
                             and pi == len(emitted_3d) - 1
                             and k == 0
                             and previous_schedule is not None):
-                        advancePartitionInterleave(
+                        stageScaleTail = bool(self._scaleTailStagingPlan) \
+                            and label == "MAINLOOP_C1"
+                        advanced = advancePartitionInterleave(
                             previous_schedule[0],
                             scheduled,
                             _FINAL_ENTRY_ANCHOR_ADVANCE_MFMAS,
@@ -4220,7 +4331,16 @@ class LogicalScheduler:
                             dropRedundantFinalLgkm=(
                                 _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT),
                             advanceFinalFollowers=(
-                                _ADVANCE_FINAL_PARTITION_FOLLOWERS))
+                                True if stageScaleTail
+                                else _ADVANCE_FINAL_PARTITION_FOLLOWERS))
+                        if stageScaleTail:
+                            assert advanced, \
+                                "scale-tail staging could not advance P3 into P2"
+                        packFinalPartitionByInstructionType(scheduled)
+                        if stageScaleTail:
+                            assert appendScaleTailStagingReads(
+                                scheduled, self._scaleTailStagingPlan), \
+                                "scale-tail staging found no three empty P3 shadows"
                     module.add(scheduled)
                     if use_partial_lr_waits:
                         if first_cell is None:
@@ -4254,6 +4374,15 @@ class LogicalScheduler:
                 first_mfma_count,
             )
             _set_entry_wait_lr_count(first_em_list, safe_count)
+        if (
+                self._scaleTailStagingPlan
+                and label == "MAINLOOP_C0"):
+            # Rewrite after all four partitions are assembled: the logical
+            # graph can reference a canonical scale read from more than one
+            # physical path, and every duplicate write must disappear.
+            assert rewriteC0ForScaleTailStaging(
+                module, self._scaleTailStagingPlan), \
+                "scale-tail staging could not rewrite the C0 prefix"
         if use_partial_lr_waits:
             # Dependency lowering creates correctness waits independently.
             # Once every partition has its final physical placement, remove a
@@ -4341,6 +4470,7 @@ class LogicalScheduler:
 
         module = Module("MainAndExitLoops")
         uf = self.unroll_factor
+        scaleTailStagingPlan = self._prepareScaleTailStagingPlan()
 
         # gfx1250 requires a loop-back/exit s_cbranch to be alone/first after an
         # MFMA, so hoist the per-copy dec+compare above the body's last MFMA.
@@ -4443,6 +4573,12 @@ class LogicalScheduler:
                     instructions=[skipGRLabel]))
         module.add(self._emitLoop(writer, kernel, "PRELOOP",
                                   preloop_emitted, schedule=False))
+        if scaleTailStagingPlan:
+            # The normal preloop path falls through to these reads.  Its NLL
+            # and NGLL branches jump over them, where the unchanged exit
+            # schedules retain their own canonical scale refreshes.
+            module.add(self._makeScaleTailStagingSeed(
+                scaleTailStagingPlan))
 
         # ── Mainloop ──
         module.addComment0("MAINLOOP")
@@ -4650,7 +4786,13 @@ class LogicalScheduler:
         mainloop_total = _total_for(self.tile_peaks)
         _, flat_peaks = self._compute_flat_tail_tile_state()
         tail_total = _total_for(flat_peaks)
-        return max(mainloop_total, tail_total)
+        from .InstructionScheduler import _SCALE_TAIL_STAGING_VGPRS
+        stagingCount = (
+            _SCALE_TAIL_STAGING_VGPRS
+            if self.scaleTailStagingEnabled
+            else 0
+        )
+        return max(mainloop_total, tail_total) + stagingCount
 
     def allocVgprTiles(self, writer, tileInfoA, tileInfoB,
                        scaleTileInfoA=None, scaleTileInfoB=None):
@@ -4690,6 +4832,20 @@ class LogicalScheduler:
             self.vgprTilesSA = []
             self.vgprTilesSB = []
 
+        if self.scaleTailStagingEnabled:
+            from .InstructionScheduler import _SCALE_TAIL_STAGING_VGPRS
+            stagingBase = writer.vgprPool.checkOutAligned(
+                _SCALE_TAIL_STAGING_VGPRS,
+                1,
+                tag="scaleTailStagingVgprs",
+            )
+            self.scaleTailStagingVgprs = list(range(
+                stagingBase,
+                stagingBase + _SCALE_TAIL_STAGING_VGPRS,
+            ))
+        else:
+            self.scaleTailStagingVgprs = []
+
         # Stash tile-info so _realloc_tail_tiles_flat can reallocate the
         # tail's flat tile set without the caller plumbing them in again.
         self._alloc_tile_info = {
@@ -4712,6 +4868,9 @@ class LogicalScheduler:
         _dealloc_tiles(self.vgprTilesB,  self._tail_freed_tile_ids['B'])
         _dealloc_tiles(self.vgprTilesSA, self._tail_freed_tile_ids['SA'])
         _dealloc_tiles(self.vgprTilesSB, self._tail_freed_tile_ids['SB'])
+        if self.scaleTailStagingVgprs:
+            writer.vgprPool.checkIn(self.scaleTailStagingVgprs[0])
+            self.scaleTailStagingVgprs = []
         self.vgprTilesA = []
         self.vgprTilesB = []
         self.vgprTilesSA = []

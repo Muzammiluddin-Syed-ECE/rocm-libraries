@@ -858,6 +858,10 @@ class InstructionEmitter:
         for partition_emitted in emitted:
             for emitted_group in partition_emitted:
                 for em in emitted_group:
+                    if (getattr(em.source, "first_unroll_only", False)
+                            and unroll_iter > 0):
+                        em.instructions = []
+                        continue
                     if em.opType == 'mfma' and mfma_scale_phase is not None:
                         em.instructions = self.emit_mfma(
                             em.source, unroll_iter,

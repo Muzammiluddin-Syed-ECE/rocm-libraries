@@ -1391,6 +1391,16 @@ def _emitDualPeriodTailScaleSrdAlignment(kernel, unrollIdx, scaleTiA, scaleTiB):
   return module
 
 
+def _supportsUniformPgrEpoch(partitionPrefetch, pgr, partition, m, n):
+  """Whether a complete-epoch frontier is valid for this partition grid."""
+  return (
+      partitionPrefetch
+      and pgr == 2
+      and partition is not None
+      and partition[0] < m
+      and partition[1] < n)
+
+
 def mainLoop(writer, kernel):
   module = Module()
   tensorParametersA = writer.tPA
@@ -1475,6 +1485,11 @@ def mainLoop(writer, kernel):
       mnN = max(1, int(lrSBGran.mn) if lrSBGran else 1)
       forcedPartition = (MFMASchedulerConfig._even_split_size(M, mnM),
                          MFMASchedulerConfig._even_split_size(N, mnN))
+  # The consolidated n+2 producer frontier requires a genuine 2-D (2x2)
+  # partition cycle.  On a 2x1/1x2 grid one operand is shared by both
+  # partitions, so keep its dependency-derived per-partition VMEM frontiers.
+  schedulerUniformPgrEpoch = _supportsUniformPgrEpoch(
+      schedulerPartitionPrefetch, schedulerPgr, forcedPartition, M, N)
 
   vgprBudget = writer.states.regCaps["MaxVgpr"]
   vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
@@ -1506,7 +1521,7 @@ def mainLoop(writer, kernel):
           plr=schedulerPlr,
           doubleBufferTensors=schedulerDoubleBuffer,
           prefetchNextPartition=schedulerPartitionPrefetch,
-          uniformPgrEpoch=(schedulerPartitionPrefetch and schedulerPgr == 2),
+          uniformPgrEpoch=schedulerUniformPgrEpoch,
           uniformEpochVmemCohortSize=5,
           partitionOrder=schedulerPartitionOrder,
           grPlacement=grPlacement,
@@ -1518,7 +1533,31 @@ def mainLoop(writer, kernel):
       scheduler = LogicalScheduler(cfg)
       scheduler.build()
 
-      numVgpr = scheduler.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)
+      baseNumVgpr = scheduler.getNumVgpr(
+          tiA, tiB, scaleTiA, scaleTiB)
+      # Experimental MT256x256 topology: use three temporary VGPRs to stage
+      # the latest-live future scale values in C1 P3, then publish them in the
+      # next C0.  Gate on the logical 8x8 MFMA grid rather than physical
+      # register numbers, and retain the baseline schedule if the extra
+      # resources would exceed the hardware VGPR budget.
+      from .InstructionScheduler import _SCALE_TAIL_STAGING_VGPRS
+      scaleTailStagingCandidate = (
+          tuple(kernel.get("ISA", ())) == (9, 5, 0)
+          and cfg.dualPeriodScale
+          and cfg.uniformPgrEpoch
+          and cfg.numSubIterK == 1
+          and cfg.numPartitionsM > 1
+          and cfg.numPartitionsN > 1
+          and M == 8
+          and N == 8
+      )
+      scheduler.scaleTailStagingEnabled = (
+          scaleTailStagingCandidate
+          and vgprUsed + baseNumVgpr + _SCALE_TAIL_STAGING_VGPRS
+          <= vgprBudget
+      )
+      numVgpr = scheduler.getNumVgpr(
+          tiA, tiB, scaleTiA, scaleTiB)
       if vgprUsed + numVgpr <= vgprBudget:
           break
   scheduler.allocVgprTiles(writer, tiA, tiB,
