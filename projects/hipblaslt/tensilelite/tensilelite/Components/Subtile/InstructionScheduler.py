@@ -149,13 +149,78 @@ def selectScaleTailStagingPlan(
     ]
 
 
-def rewriteC0ForScaleTailStaging(schedule, plan):
+def selectScaleTailDirectReadPlan(
+        c0Instructions, c1Instructions, stagedPlan):
+    """Select remaining M/SA scales for direct refresh in the prior C1 tail.
+
+    The latest-live SA value is already represented in ``stagedPlan`` and must
+    retain its temporary VGPR.  Every other SA value is dead early enough to
+    reload its canonical VGPR in an empty final-partition MFMA shadow.  Derive
+    this set from emitted comments and scaled-MFMA operands, without relying on
+    physical register numbers.
+    """
+    stagedRegisters = {
+        entry["canonicalVgpr"] for entry in stagedPlan
+    }
+    c0Reads = {}
+    for inst in c0Instructions:
+        if not isinstance(inst, DSLoadB32):
+            continue
+        destination = _registerIndex(inst.dst)
+        if destination is None or destination in stagedRegisters:
+            continue
+        if not getattr(inst, "comment", "").startswith("SA "):
+            continue
+        c0Reads.setdefault(destination, inst)
+
+    c0FirstUse = {}
+    c1LastUse = {}
+    c0Rank = 0
+    for inst in c0Instructions:
+        if not isinstance(inst, MXMFMAInstruction):
+            continue
+        for register in (inst.mxsa, inst.mxsb):
+            index = _registerIndex(register)
+            if index is not None:
+                c0FirstUse.setdefault(index, c0Rank)
+        c0Rank += 1
+    c1Rank = 0
+    for inst in c1Instructions:
+        if not isinstance(inst, MXMFMAInstruction):
+            continue
+        for register in (inst.mxsa, inst.mxsb):
+            index = _registerIndex(register)
+            if index is not None:
+                c1LastUse[index] = c1Rank
+        c1Rank += 1
+
+    if any(
+            register not in c0FirstUse or register not in c1LastUse
+            for register in c0Reads):
+        return []
+    return [
+        {
+            "canonicalVgpr": canonical,
+            "readTemplate": copy.deepcopy(c0Reads[canonical]),
+            "firstC0Mfma": c0FirstUse[canonical],
+            "lastC1Mfma": c1LastUse[canonical],
+        }
+        for canonical in sorted(
+            c0Reads,
+            key=lambda register: (
+                c1LastUse[register], register))
+    ]
+
+
+def rewriteC0ForScaleTailStaging(schedule, plan, directReadPlan=()):
     """Replace three unsafe C0 scale refreshes with interleaved publishes.
 
     The corresponding LDS reads are supplied by the preloop on first entry and
     by the preceding C1 thereafter.  C0's existing full LGKM drain publishes
     those temporary values.  Place one temporary-to-canonical move in each of
     three early MFMA shadows, before that canonical scale's first consumer.
+    Early-dead M/SA values in ``directReadPlan`` are refreshed directly in the
+    preceding C1 tail and therefore have no C0 read or publish.
 
     Return False without mutating ``schedule`` when its physical shape does not
     satisfy the contract.
@@ -163,8 +228,11 @@ def rewriteC0ForScaleTailStaging(schedule, plan):
     if not plan:
         return False
 
-    targetRegisters = {
+    stagedRegisters = {
         entry["canonicalVgpr"] for entry in plan
+    }
+    targetRegisters = stagedRegisters | {
+        entry["canonicalVgpr"] for entry in directReadPlan
     }
     removedReadRegisters = set()
     filtered = []
@@ -230,13 +298,15 @@ def rewriteC0ForScaleTailStaging(schedule, plan):
     return True
 
 
-def appendScaleTailStagingReads(schedule, plan):
-    """Place staged future-scale reads in the first empty P3 MFMA shadows.
+def appendScaleTailStagingReads(
+        schedule, plan, directReadPlan=(), partitionMfmaBase=0):
+    """Place future-scale reads in empty P3 MFMA shadows.
 
     ``advancePartitionInterleave`` shifts P3's synchronization and A/B read
     stream three MFMAs earlier.  Start immediately after the last remaining
-    follower, one read per MFMA shadow, which gives the staged values maximum
-    LDS latency before the next C0 while retaining MFMA interleaving.
+    follower, one read per MFMA shadow.  Temporary reads for latest-live scales
+    come first.  Remaining M/SA scales then reload their dead canonical VGPRs
+    directly in the final shadows, eliminating their next-C0 prefix reads.
     """
     if not plan:
         return False
@@ -277,6 +347,34 @@ def appendScaleTailStagingReads(schedule, plan):
         read.dst = vgpr(entry["stagingVgpr"])
         read.comment = (
             "stage next C0 scale in temporary VGPR; "
+            f"canonical=v{entry['canonicalVgpr']} "
+            f"last-use=M{entry['lastC1Mfma']}"
+        )
+        followers[target].append(read)
+
+    searchFrom = targets[-1] + 1 if targets else searchFrom
+    directTargets = []
+    for entry in sorted(
+            directReadPlan, key=lambda item: (
+                item["lastC1Mfma"], item["canonicalVgpr"])):
+        target = next(
+            (
+                index for index in range(searchFrom, len(followers))
+                if _physicalInstructionCount(followers[index]) < 3
+                and partitionMfmaBase + index > entry["lastC1Mfma"]
+            ),
+            None,
+        )
+        if target is None:
+            return False
+        directTargets.append((target, entry))
+        searchFrom = target + 1
+
+    for target, entry in directTargets:
+        read = copy.deepcopy(entry["readTemplate"])
+        read.dst = vgpr(entry["canonicalVgpr"])
+        read.comment = (
+            "reload next C0 M-scale directly after prior value is dead; "
             f"canonical=v{entry['canonicalVgpr']} "
             f"last-use=M{entry['lastC1Mfma']}"
         )

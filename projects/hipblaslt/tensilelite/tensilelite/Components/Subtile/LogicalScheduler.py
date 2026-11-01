@@ -913,6 +913,7 @@ class LogicalScheduler:
         self.scaleTailStagingEnabled = False
         self.scaleTailStagingVgprs: List[int] = []
         self._scaleTailStagingPlan = None
+        self._scaleTailDirectReadPlan = None
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -4150,38 +4151,48 @@ class LogicalScheduler:
         """Derive the physical scale staging plan after register population."""
         if not self.scaleTailStagingEnabled:
             self._scaleTailStagingPlan = []
+            self._scaleTailDirectReadPlan = []
             return self._scaleTailStagingPlan
         if self._scaleTailStagingPlan is not None:
             return self._scaleTailStagingPlan
 
         from .InstructionScheduler import (
             _SCALE_TAIL_STAGING_VGPRS,
+            selectScaleTailDirectReadPlan,
             selectScaleTailStagingPlan,
         )
 
         assert self.unroll_factor == 2, \
             "scale-tail staging requires the dual-period C0/C1 loop"
         assert len(self.scaleTailStagingVgprs) == _SCALE_TAIL_STAGING_VGPRS
+        c0Instructions = list(self._flatEmittedInstructions(
+            self._emitted_per_unroll[0]))
+        c1Instructions = list(self._flatEmittedInstructions(
+            self._emitted_per_unroll[1]))
         plan = selectScaleTailStagingPlan(
-            list(self._flatEmittedInstructions(
-                self._emitted_per_unroll[0])),
-            list(self._flatEmittedInstructions(
-                self._emitted_per_unroll[1])),
+            c0Instructions,
+            c1Instructions,
             self.scaleTailStagingVgprs,
         )
         assert len(plan) == _SCALE_TAIL_STAGING_VGPRS, \
             "enabled scale-tail staging could not derive three scale values"
+        directReadPlan = selectScaleTailDirectReadPlan(
+            c0Instructions, c1Instructions, plan)
+        assert directReadPlan, \
+            "enabled scale-tail staging could not derive direct M-scale reads"
         self._scaleTailStagingPlan = plan
+        self._scaleTailDirectReadPlan = directReadPlan
         return plan
 
     @staticmethod
-    def _makeScaleTailStagingSeed(plan):
-        """Seed the temporary scale VGPRs for the first C0 entry."""
+    def _makeScaleTailStagingSeed(plan, directReadPlan=()):
+        """Seed relocated scale reads for the first C0 entry."""
         from rocisa.container import vgpr
 
         module = Module("Preloop scale-tail staging seed")
         module.addComment0(
-            "Seed future-scale temporaries for the first C0 entry")
+            "Seed relocated future scales for the first C0 entry")
+        seeds = []
         for entry in sorted(
                 plan, key=lambda item: (
                     item["firstC0Mfma"], item["canonicalVgpr"])):
@@ -4191,6 +4202,19 @@ class LogicalScheduler:
                 "preloop seed for staged C0 scale; "
                 f"canonical=v{entry['canonicalVgpr']}"
             )
+            seeds.append((
+                entry["firstC0Mfma"], entry["canonicalVgpr"], read))
+        for entry in directReadPlan:
+            read = copy.deepcopy(entry["readTemplate"])
+            read.dst = vgpr(entry["canonicalVgpr"])
+            read.comment = (
+                "preloop seed for directly relocated C0 M-scale; "
+                f"canonical=v{entry['canonicalVgpr']}"
+            )
+            seeds.append((
+                entry["firstC0Mfma"], entry["canonicalVgpr"], read))
+        for _firstUse, _canonical, read in sorted(
+                seeds, key=lambda item: (item[0], item[1])):
             module.add(read)
         return module
 
@@ -4258,6 +4282,7 @@ class LogicalScheduler:
         )
         previous_schedule = None
         first_cell = None
+        emittedMfmaCount = 0
 
         def mfma_count(em_list):
             return sum(
@@ -4339,9 +4364,13 @@ class LogicalScheduler:
                         packFinalPartitionByInstructionType(scheduled)
                         if stageScaleTail:
                             assert appendScaleTailStagingReads(
-                                scheduled, self._scaleTailStagingPlan), \
-                                "scale-tail staging found no three empty P3 shadows"
+                                scheduled,
+                                self._scaleTailStagingPlan,
+                                self._scaleTailDirectReadPlan,
+                                emittedMfmaCount), \
+                                "scale-tail staging could not place P3 scale reads"
                     module.add(scheduled)
+                    emittedMfmaCount += current_mfma_count
                     if use_partial_lr_waits:
                         if first_cell is None:
                             first_cell = (em_list, current_mfma_count)
@@ -4381,7 +4410,9 @@ class LogicalScheduler:
             # graph can reference a canonical scale read from more than one
             # physical path, and every duplicate write must disappear.
             assert rewriteC0ForScaleTailStaging(
-                module, self._scaleTailStagingPlan), \
+                module,
+                self._scaleTailStagingPlan,
+                self._scaleTailDirectReadPlan), \
                 "scale-tail staging could not rewrite the C0 prefix"
         if use_partial_lr_waits:
             # Dependency lowering creates correctness waits independently.
@@ -4578,7 +4609,8 @@ class LogicalScheduler:
             # and NGLL branches jump over them, where the unchanged exit
             # schedules retain their own canonical scale refreshes.
             module.add(self._makeScaleTailStagingSeed(
-                scaleTailStagingPlan))
+                scaleTailStagingPlan,
+                self._scaleTailDirectReadPlan))
 
         # ── Mainloop ──
         module.addComment0("MAINLOOP")

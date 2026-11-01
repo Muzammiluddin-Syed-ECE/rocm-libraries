@@ -2484,7 +2484,16 @@ class TestUniformPgrEpoch:
             line for line in c1
             if "stage next C0 scale in temporary VGPR" in line
         ]
+        direct_seeds = [
+            line for line in preloop.splitlines()
+            if "preloop seed for directly relocated C0 M-scale" in line
+        ]
+        direct_reloads = [
+            line for line in c1
+            if "reload next C0 M-scale directly" in line
+        ]
         assert len(seeds) == len(publishes) == len(stages) == 3
+        assert len(direct_seeds) == len(direct_reloads) == 3
 
         seed_temps = {
             int(re.search(r"ds_read_b32 v(\d+),", line).group(1))
@@ -2509,9 +2518,19 @@ class TestUniformPgrEpoch:
             for line in publishes
         }
         assert staged_canonicals == published_canonicals
+        direct_seed_canonicals = {
+            int(re.search(r"canonical=v(\d+)", line).group(1))
+            for line in direct_seeds
+        }
+        direct_reload_canonicals = {
+            int(re.search(r"canonical=v(\d+)", line).group(1))
+            for line in direct_reloads
+        }
+        assert direct_seed_canonicals == direct_reload_canonicals
+        assert not direct_reload_canonicals & staged_canonicals
 
         # The conservative source-WAR pad is gone, as are every physical-path
-        # reference that writes one of the three staged canonical values.
+        # reference that writes a relocated canonical value.
         assert not any("scale-source reads before refresh" in line
                        for line in c0)
         direct_scale_reads = [
@@ -2521,9 +2540,10 @@ class TestUniformPgrEpoch:
         assert direct_scale_reads
         assert not any(
             int(re.search(r"ds_read_b32 v(\d+),", line).group(1))
-            in staged_canonicals
+            in staged_canonicals | direct_reload_canonicals
             for line in direct_scale_reads
         )
+        assert all("// SB MT=" in line for line in direct_scale_reads)
 
         first_drain = next(
             index for index, line in enumerate(c0)
@@ -2550,13 +2570,17 @@ class TestUniformPgrEpoch:
         assert sum(line.lstrip().startswith("v_xor_b32") for line in p2) == 4
 
         stage_after_mfma = []
+        direct_reload_after_mfma = []
         mfma_rank = -1
         for line in c1:
             if "v_mfma_scale" in line:
                 mfma_rank += 1
             elif "stage next C0 scale in temporary VGPR" in line:
                 stage_after_mfma.append(mfma_rank)
+            elif "reload next C0 M-scale directly" in line:
+                direct_reload_after_mfma.append(mfma_rank)
         assert stage_after_mfma == [57, 58, 59]
+        assert direct_reload_after_mfma == [60, 61, 62]
 
     def test_one_dimensional_partition_cycles_keep_local_frontiers(self):
         assert not _supportsUniformPgrEpoch(True, 2, (4, 2), 8, 2)
