@@ -2445,8 +2445,11 @@ class TestUniformPgrEpoch:
         assert selected.uniformPgrEpoch
         assert selected.uniformEpochVmemCohortSize == 5
 
-    def test_scale_tail_staging_adds_exactly_three_vgprs(self):
-        _kernel, fixture, cfg = self._production_fixture()
+    @pytest.mark.parametrize(
+        "mt_m,mt_n", [(256, 256), (256, 320), (320, 256)])
+    def test_scale_tail_staging_adds_exactly_three_vgprs(
+            self, mt_m, mt_n):
+        _kernel, fixture, cfg = self._production_fixture(mt_m, mt_n)
         _writer, ti_a, ti_b, ti_sa, ti_sb, _dest = fixture
         scheduler = LogicalScheduler(cfg)
         scheduler.build()
@@ -2581,6 +2584,83 @@ class TestUniformPgrEpoch:
                 direct_reload_after_mfma.append(mfma_rank)
         assert stage_after_mfma == [57, 58, 59]
         assert direct_reload_after_mfma == [60, 61, 62]
+
+    @pytest.mark.parametrize(
+        "mt_m,mt_n,expected_direct,expected_remaining_sb",
+        [
+            (256, 320, [70, 71, 72], 3),
+            (320, 256, [70, 71, 72, 73], 2),
+        ],
+    )
+    def test_rectangular_scale_tail_staging_uses_third_ds_position(
+            self, mt_m, mt_n, expected_direct, expected_remaining_sb):
+        kernel, fixture, cfg = self._production_fixture(mt_m, mt_n)
+        assembly = _emit_mainloops(
+            kernel, fixture, cfg, scale_tail_staging=True)
+
+        def section(label):
+            start = assembly.index(f"/* {label} start */")
+            end = assembly.index(f"/* {label} end */", start)
+            return assembly[start:end].splitlines()
+
+        c0 = section("MAINLOOP_C0")
+        c1 = section("MAINLOOP_C1")
+        stage_after_mfma = []
+        direct_reload_after_mfma = []
+        ds_reads_per_shadow = []
+        shadows = []
+        mfma_rank = -1
+        for line in c1:
+            if "v_mfma_scale" in line:
+                mfma_rank += 1
+                ds_reads_per_shadow.append(0)
+                shadows.append([])
+            elif line.lstrip().startswith("ds_read_"):
+                ds_reads_per_shadow[mfma_rank] += 1
+                if "stage next C0 scale in temporary VGPR" in line:
+                    stage_after_mfma.append(mfma_rank)
+                elif "reload next C0 M-scale directly" in line:
+                    direct_reload_after_mfma.append(mfma_rank)
+                shadows[mfma_rank].append(line.lstrip())
+            elif mfma_rank >= 0:
+                shadows[mfma_rank].append(line.lstrip())
+
+        assert stage_after_mfma == [67, 68, 69]
+        assert direct_reload_after_mfma == expected_direct
+        assert all(
+            ds_reads_per_shadow[index] == 3
+            for index in stage_after_mfma + direct_reload_after_mfma
+        )
+        assert max(ds_reads_per_shadow) == 3
+
+        mixed_shadows = [
+            shadow for shadow in shadows
+            if any(line.startswith("buffer_load") for line in shadow)
+            and any(line.startswith("ds_read_") for line in shadow)
+        ]
+        assert mixed_shadows
+        for shadow in mixed_shadows:
+            setup = next(
+                index for index, line in enumerate(shadow)
+                if line.startswith(("s_add_u32 m0,", "s_mov_b32 m0,")))
+            vmem = next(
+                index for index, line in enumerate(shadow)
+                if line.startswith("buffer_load"))
+            lds = next(
+                index for index, line in enumerate(shadow)
+                if line.startswith("ds_read_"))
+            assert setup < vmem < lds
+
+        # Every directly relocated SA read and two staged SB/SA reads disappear
+        # from C0.  The only canonical scale reads left there are SB values.
+        remaining_scale_reads = [
+            line for line in c0
+            if re.search(r"^\s*ds_read_b32\b.*// S[AB] MT=", line)
+        ]
+        assert len(remaining_scale_reads) == expected_remaining_sb
+        assert all("// SB MT=" in line for line in remaining_scale_reads)
+        assert not any("scale-source reads before refresh" in line
+                       for line in c0)
 
     def test_one_dimensional_partition_cycles_keep_local_frontiers(self):
         assert not _supportsUniformPgrEpoch(True, 2, (4, 2), 8, 2)
@@ -3885,10 +3965,12 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
             pending_setup = None
             seen_mfma = False
             loads_since_mfma = 0
+            ds_reads_since_mfma = 0
             for line in instructions:
                 is_setup = line.startswith(
                     ("s_add_u32 m0,", "s_mov_b32 m0,"))
                 is_load = line.startswith("buffer_load")
+                is_ds_read = line.startswith("ds_read_")
                 is_mfma = line.startswith("v_mfma")
 
                 if is_setup:
@@ -3912,12 +3994,19 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                         assert loads_since_mfma <= 1, (
                             f"P{partition_index}: {loads_since_mfma} buffer "
                             "loads share one MFMA interval")
+                    if loads_since_mfma:
+                        assert ds_reads_since_mfma <= 1, (
+                            f"P{partition_index}: VMEM shares one MFMA "
+                            f"interval with {ds_reads_since_mfma} LDS reads")
                     seen_mfma = True
                     loads_since_mfma = 0
+                    ds_reads_since_mfma = 0
                 elif is_load:
                     assert seen_mfma, (
                         f"P{partition_index}: buffer load precedes first MFMA")
                     loads_since_mfma += 1
+                elif is_ds_read:
+                    ds_reads_since_mfma += 1
 
             assert pending_setup is None, (
                 f"P{partition_index}: m0 setup has no buffer load: "
@@ -4322,7 +4411,7 @@ class TestInstructionSchedulerWrapPrefetch:
             GlobalReadInstruction, LocalReadInstruction, MFMAInstruction,
             VXorB32)
         from tensilelite.Components.Subtile.InstructionScheduler import (
-            packFinalPartitionByInstructionType)
+            _isM0Update, packFinalPartitionByInstructionType)
 
         self._schedule()
         schedule = self._typed_capacity_tail_schedule()
@@ -4360,6 +4449,23 @@ class TestInstructionSchedulerWrapPrefetch:
             inst.comment for group in followers for inst in group
             if isinstance(inst, GlobalReadInstruction)
         ] == [f"dtl-{index}" for index in range(5)]
+        shared_shadows = [
+            group for group in followers
+            if any(isinstance(inst, GlobalReadInstruction) for inst in group)
+            and any(isinstance(inst, LocalReadInstruction) for inst in group)
+        ]
+        assert len(shared_shadows) == 5
+        for group in shared_shadows:
+            relevant = [
+                inst for inst in group
+                if (_isM0Update(inst)
+                    or isinstance(
+                        inst, (GlobalReadInstruction, LocalReadInstruction)))
+            ]
+            assert len(relevant) == 3
+            assert _isM0Update(relevant[0])
+            assert isinstance(relevant[1], GlobalReadInstruction)
+            assert isinstance(relevant[2], LocalReadInstruction)
 
     def test_final_partition_shadow_capacity_limits_are_independent(self):
         from rocisa.container import DSModifiers, sgpr, vgpr
@@ -4435,7 +4541,7 @@ class TestInstructionSchedulerWrapPrefetch:
         assert not packFinalPartitionByInstructionType(schedule)
         assert [id(inst) for inst in schedule.flatitems()] == before
 
-    def test_partition_zero_preserves_barrier_shadow_and_uses_capacities(self):
+    def test_partition_zero_keeps_balanced_mixed_memory_shadows(self):
         from rocisa.instruction import (
             GlobalReadInstruction, LocalReadInstruction, MFMAInstruction,
             SBarrier)
@@ -4445,7 +4551,7 @@ class TestInstructionSchedulerWrapPrefetch:
         self._schedule()
         schedule = self._typed_capacity_p0_schedule()
 
-        assert packPartitionZeroByInstructionType(schedule)
+        assert not packPartitionZeroByInstructionType(schedule)
 
         followers = []
         for inst in schedule.flatitems():
@@ -4469,7 +4575,14 @@ class TestInstructionSchedulerWrapPrefetch:
         assert [
             sum(isinstance(inst, LocalReadInstruction) for inst in group)
             for group in followers
-        ] == [0, 0, 0, 0, 2, 2, 0, 0]
+        ] == [0, 0, 0, 0, 1, 2, 1, 0]
+        assert all(
+            sum(isinstance(inst, LocalReadInstruction) for inst in group) <= 1
+            for group in followers
+            if any(
+                isinstance(inst, GlobalReadInstruction)
+                for inst in group)
+        )
         assert [
             inst.comment for group in followers for inst in group
             if isinstance(inst, LocalReadInstruction)

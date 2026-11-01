@@ -907,9 +907,9 @@ class LogicalScheduler:
                                                       'SA': set(), 'SB': set()}
         self._tail_freed_tile_ids: Dict[str, set] = {'A': set(), 'B': set(),
                                                      'SA': set(), 'SB': set()}
-        # Experimental MT256x256 scale-tail staging.  Kernel.mainLoop enables
-        # it only when the schedule topology matches and three additional
-        # VGPRs fit the hardware budget.
+        # Experimental scale-tail staging for the supported square/rectangular
+        # macrotiles.  Kernel.mainLoop enables it only when the schedule
+        # topology matches and three additional VGPRs fit the hardware budget.
         self.scaleTailStagingEnabled = False
         self.scaleTailStagingVgprs: List[int] = []
         self._scaleTailStagingPlan = None
@@ -4345,7 +4345,7 @@ class LogicalScheduler:
                             and previous_schedule is not None):
                         stageScaleTail = bool(self._scaleTailStagingPlan) \
                             and label == "MAINLOOP_C1"
-                        advanced = advancePartitionInterleave(
+                        advancePartitionInterleave(
                             previous_schedule[0],
                             scheduled,
                             _FINAL_ENTRY_ANCHOR_ADVANCE_MFMAS,
@@ -4358,9 +4358,11 @@ class LogicalScheduler:
                             advanceFinalFollowers=(
                                 True if stageScaleTail
                                 else _ADVANCE_FINAL_PARTITION_FOLLOWERS))
-                        if stageScaleTail:
-                            assert advanced, \
-                                "scale-tail staging could not advance P3 into P2"
+                        # The square topology advances the complete P3 stream
+                        # and gains an empty suffix.  Rectangular P3 tails are
+                        # too dense for that strict whole-stream transform;
+                        # their typed pack below instead exposes the third DS
+                        # position used by scale staging.
                         packFinalPartitionByInstructionType(scheduled)
                         if stageScaleTail:
                             assert appendScaleTailStagingReads(

@@ -1535,11 +1535,11 @@ def mainLoop(writer, kernel):
 
       baseNumVgpr = scheduler.getNumVgpr(
           tiA, tiB, scaleTiA, scaleTiB)
-      # Experimental MT256x256 topology: use three temporary VGPRs to stage
-      # the latest-live future scale values in C1 P3, then publish them in the
-      # next C0.  Gate on the logical 8x8 MFMA grid rather than physical
-      # register numbers, and retain the baseline schedule if the extra
-      # resources would exceed the hardware VGPR budget.
+      # Experimental 256x256/256x320/320x256 topology: use three temporary
+      # VGPRs to stage the latest-live future scale values in C1 P3, then
+      # publish them in the next C0.  Gate on the supported logical MFMA grids
+      # rather than physical register numbers, and retain the baseline schedule
+      # if the extra resources would exceed the hardware VGPR budget.
       from .InstructionScheduler import _SCALE_TAIL_STAGING_VGPRS
       scaleTailStagingCandidate = (
           tuple(kernel.get("ISA", ())) == (9, 5, 0)
@@ -1548,8 +1548,7 @@ def mainLoop(writer, kernel):
           and cfg.numSubIterK == 1
           and cfg.numPartitionsM > 1
           and cfg.numPartitionsN > 1
-          and M == 8
-          and N == 8
+          and (M, N) in ((8, 8), (8, 10), (10, 8))
       )
       scheduler.scaleTailStagingEnabled = (
           scaleTailStagingCandidate

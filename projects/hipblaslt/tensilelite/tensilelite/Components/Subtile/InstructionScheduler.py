@@ -49,9 +49,9 @@ _INSTRUCTION_TYPE_SHADOW_HARD_CAPACITY = {
 # One s_nop with this immediate provides the conservative source-read window
 # before a following ds_read overwrites a scale operand.
 _GFX950_SCALE_REFRESH_WAR_WAIT_STATE = 8
-# MT256x256 has room for three temporary scale values without changing
-# occupancy.  Keeping the count in one place makes the resource gate and the
-# physical rewrite agree.
+# The supported 256x256/256x320/320x256 macrotiles have room for three
+# temporary scale values without changing occupancy.  Keeping the count in one
+# place makes the resource gate and the physical rewrite agree.
 _SCALE_TAIL_STAGING_VGPRS = 3
 
 
@@ -300,13 +300,16 @@ def rewriteC0ForScaleTailStaging(schedule, plan, directReadPlan=()):
 
 def appendScaleTailStagingReads(
         schedule, plan, directReadPlan=(), partitionMfmaBase=0):
-    """Place future-scale reads in empty P3 MFMA shadows.
+    """Place future-scale reads in available P3 MFMA shadows.
 
     ``advancePartitionInterleave`` shifts P3's synchronization and A/B read
     stream three MFMAs earlier.  Start immediately after the last remaining
-    follower, one read per MFMA shadow.  Temporary reads for latest-live scales
-    come first.  Remaining M/SA scales then reload their dead canonical VGPRs
-    directly in the final shadows, eliminating their next-C0 prefix reads.
+    follower when that leaves enough empty shadows.  Rectangular macrotiles
+    fill the tail with A/B reads, so fall back to their otherwise-unused third
+    DS issue position, starting with the first A/B-read shadow.  Temporary
+    reads for latest-live scales come first.  Remaining M/SA scales then reload
+    their dead canonical VGPRs directly after their final C1 use, eliminating
+    their next-C0 prefix reads.
     """
     if not plan:
         return False
@@ -327,21 +330,76 @@ def appendScaleTailStagingReads(
         index for index, group in enumerate(followers)
         if _physicalInstructionCount(group)
     ]
-    searchFrom = occupied[-1] + 1 if occupied else 0
-    targets = []
-    for index in range(searchFrom, len(followers)):
-        if _physicalInstructionCount(followers[index]) < 3:
-            targets.append(index)
-        if len(targets) == len(plan):
-            break
-    if len(targets) != len(plan):
-        return False
-
     # Earliest final consumers first makes the physical stream deterministic;
     # temporary destinations mean these reads may overlap later canonical uses.
     orderedPlan = sorted(
         plan, key=lambda entry: (
             entry["lastC1Mfma"], entry["canonicalVgpr"]))
+    orderedDirectPlan = sorted(
+        directReadPlan, key=lambda item: (
+            item["lastC1Mfma"], item["canonicalVgpr"]))
+
+    def canAppendScaleRead(group):
+        candidate = [
+            *group,
+            # Every scale template is a DSLoadB32.  Use the first one only as a
+            # type/capacity probe; the physical destination is irrelevant.
+            orderedPlan[0]["readTemplate"],
+        ]
+        return _fitsInstructionTypeShadow(candidate)
+
+    def makePlacement(start):
+        stageTargets = []
+        searchFrom = start
+        for _entry in orderedPlan:
+            target = next(
+                (
+                    index for index in range(searchFrom, len(followers))
+                    if canAppendScaleRead(followers[index])
+                ),
+                None,
+            )
+            if target is None:
+                return None
+            stageTargets.append(target)
+            searchFrom = target + 1
+
+        directTargets = []
+        for entry in orderedDirectPlan:
+            target = next(
+                (
+                    index for index in range(searchFrom, len(followers))
+                    if canAppendScaleRead(followers[index])
+                    and partitionMfmaBase + index > entry["lastC1Mfma"]
+                ),
+                None,
+            )
+            if target is None:
+                return None
+            directTargets.append((target, entry))
+            searchFrom = target + 1
+        return stageTargets, directTargets
+
+    # Preserve the square schedule's low-pressure empty-tail placement.  A
+    # rectangular final partition has no sufficiently long empty suffix; use
+    # the third DS position alongside its packed A/B read stream instead.
+    emptyTailStart = occupied[-1] + 1 if occupied else 0
+    placement = makePlacement(emptyTailStart)
+    if placement is None:
+        firstReadShadow = next(
+            (
+                index for index, group in enumerate(followers)
+                if any(isinstance(inst, LocalReadInstruction) for inst in group)
+            ),
+            None,
+        )
+        if firstReadShadow is None:
+            return False
+        placement = makePlacement(firstReadShadow)
+    if placement is None:
+        return False
+    targets, directTargets = placement
+
     for target, entry in zip(targets, orderedPlan):
         read = copy.deepcopy(entry["readTemplate"])
         read.dst = vgpr(entry["stagingVgpr"])
@@ -351,24 +409,6 @@ def appendScaleTailStagingReads(
             f"last-use=M{entry['lastC1Mfma']}"
         )
         followers[target].append(read)
-
-    searchFrom = targets[-1] + 1 if targets else searchFrom
-    directTargets = []
-    for entry in sorted(
-            directReadPlan, key=lambda item: (
-                item["lastC1Mfma"], item["canonicalVgpr"])):
-        target = next(
-            (
-                index for index in range(searchFrom, len(followers))
-                if _physicalInstructionCount(followers[index]) < 3
-                and partitionMfmaBase + index > entry["lastC1Mfma"]
-            ),
-            None,
-        )
-        if target is None:
-            return False
-        directTargets.append((target, entry))
-        searchFrom = target + 1
 
     for target, entry in directTargets:
         read = copy.deepcopy(entry["readTemplate"])
@@ -1705,6 +1745,10 @@ def packPartitionZeroByInstructionType(schedule):
       * four VALU instructions;
       * one VMEM request.
 
+    A VMEM shadow may contain at most one LDS read.  This keeps an atomic
+    SALU/VMEM bundle plus LDS read within three physical follower instructions
+    when later MFMA shadows are available.
+
     The pre-MFMA scale-refresh prefix and everything through the in-partition
     barrier remain anchored.  The barrier shadow may keep its emitted
     followers but cannot absorb younger work from a later MFMA shadow.
@@ -1852,7 +1896,7 @@ def packPartitionZeroByInstructionType(schedule):
     for groupIndex in range(barrierGroup + 1, len(fixed)):
         fixed[groupIndex] = []
 
-    def attempt(allowPressedDs):
+    def attempt(allowPressedDs, limitMixedMemory):
         rewritten = [list(group) for group in fixed]
         target = barrierGroup
         for originalGroup, unit in units:
@@ -1869,9 +1913,15 @@ def packPartitionZeroByInstructionType(schedule):
                     or canAdvanceRead(inst, target, originalGroup)
                     for inst in unitInsts
                 )
+                mixedMemoryFits = (
+                    not limitMixedMemory
+                    or not any(_isBufferLoad(inst) for inst in candidate)
+                    or sum(_isDsRead(inst) for inst in candidate) <= 1
+                )
                 if (
                         not crossesIntoBarrierShadow
                         and readsSafe
+                        and mixedMemoryFits
                         and _fitsInstructionTypeShadow(
                             candidate, allowPressedDs=allowPressedDs)):
                     rewritten[target].extend(unitInsts)
@@ -1882,9 +1932,20 @@ def packPartitionZeroByInstructionType(schedule):
                 return None
         return rewritten
 
-    rewritten = attempt(allowPressedDs=False)
+    rewritten = attempt(
+        allowPressedDs=False, limitMixedMemory=True)
     if rewritten is None:
-        rewritten = attempt(allowPressedDs=True)
+        rewritten = attempt(
+            allowPressedDs=True, limitMixedMemory=True)
+    # Preserve the prior capacity behavior for an unsupported dependency
+    # shape whose original deadlines cannot satisfy the preferred mixed-memory
+    # limit.  Productized MXFP8 geometries fit before this fallback.
+    if rewritten is None:
+        rewritten = attempt(
+            allowPressedDs=False, limitMixedMemory=False)
+    if rewritten is None:
+        rewritten = attempt(
+            allowPressedDs=True, limitMixedMemory=False)
     if rewritten is None:
         return False
 
@@ -1926,7 +1987,8 @@ def packFinalPartitionByInstructionType(schedule):
       * up to four independent VALU address swaps in one shadow;
       * two LDS reads per shadow, increasing selected early cohorts to three
         only when required for the complete schedule to fit;
-      * one right-aligned VMEM request per shadow, kept with its SALU setup;
+      * one right-aligned VMEM request per shadow, kept with its SALU setup
+        and emitted before any co-resident LDS read;
       * at most five SALU instructions in any shadow.
 
     Returns ``True`` only after applying the complete legal rewrite.  Balanced
@@ -2125,10 +2187,13 @@ def packFinalPartitionByInstructionType(schedule):
         return False
 
     rewritten[xorTarget].extend(xorPayload)
-    for target, cohort in readPlan:
-        rewritten[target].extend(cohort)
+    # SALU may issue in the leading MFMA slot while LDS cannot.  Emit each
+    # atomic m0/VMEM bundle first in a shared shadow, then its independent LDS
+    # read, so the physical order is SALU -> VMEM -> LDS.
     for target, bundle in zip(dtlTargets, dtlBundles):
         rewritten[target].extend(bundle)
+    for target, cohort in readPlan:
+        rewritten[target].extend(cohort)
 
     if any(
             not _fitsInstructionTypeShadow(group)
