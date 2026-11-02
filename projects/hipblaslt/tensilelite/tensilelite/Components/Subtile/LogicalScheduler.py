@@ -269,6 +269,19 @@ class SchedulerConfig:
     # epoch cohort.  The same policy controls the partition-zero overwrite
     # cohort and the retained DTL cohort at the final-partition seam.
     uniformEpochVmemCohortSize: int = 5
+    # Treat the complete uniform epoch as one ordered VMEM stream before
+    # assigning fixed-size placement cohorts.  Geometric partitions still own
+    # MFMA/VGPR identity; this flag only decouples request placement from that
+    # ownership.  Supported geometries use three A/B cohorts whose size is
+    # derived from the complete data-request count (bounded to 4, 5, or 6).
+    # C0 appends SA/SB to a short final cohort when both fit; otherwise it
+    # retains them as a separate late pair.
+    uniformEpochGlobalVmemCohorts: bool = False
+    # Number of physical VMEM instructions emitted by one logical A/B GR atom.
+    # Most geometries use one.  Asymmetric wave layouts can emit multiple
+    # requests from one atom, so cohort balancing must use these weights.
+    uniformEpochVmemInstructionsA: int = 1
+    uniformEpochVmemInstructionsB: int = 1
     # Physical traversal of the 2-D partition grid.  "m-major" preserves the
     # legacy order (M varies fastest).  "n-major" matches FlyDSL's
     # c00,c01,c10,c11 order (N varies fastest).
@@ -364,6 +377,15 @@ class SchedulerConfig:
                 "uniformPgrEpoch requires partition-directed prefetch"
         assert self.uniformEpochVmemCohortSize >= 1, \
             "uniformEpochVmemCohortSize must be >= 1"
+        if self.uniformEpochGlobalVmemCohorts:
+            assert self.uniformPgrEpoch, \
+                "uniformEpochGlobalVmemCohorts requires uniformPgrEpoch"
+            assert 4 <= self.uniformEpochVmemCohortSize <= 6, \
+                "global VMEM scheduling requires cohort sizes from 4 to 6"
+            assert self.uniformEpochVmemInstructionsA >= 1, \
+                "A VMEM instructions per atom must be positive"
+            assert self.uniformEpochVmemInstructionsB >= 1, \
+                "B VMEM instructions per atom must be positive"
 
         assert self.scaleReuse >= 1, f"scaleReuse must be >= 1, got {self.scaleReuse}"
         # Dual-period MXFP8: the scale epoch (256 K) spans scaleReuse data
@@ -378,6 +400,12 @@ class SchedulerConfig:
         # derived from the DATA tensors only; a scale gr.k > 1 must NOT expand
         # the data K axis.  Scales carry their own epoch cadence (scaleReuse).
         self.dualPeriodScale = self.hasScale and self.scaleReuse > 1
+
+        if self.uniformEpochGlobalVmemCohorts:
+            assert self.dualPeriodScale, \
+                "global VMEM cohorts require dual-period scale requests"
+            assert self.numSubIterK == 1, \
+                "global VMEM cohorts currently require one data K slot"
 
         grans = {'A': self.grA, 'B': self.grB}
         if self.hasScale:
@@ -993,8 +1021,10 @@ class LogicalScheduler:
     def _move_uniform_epoch_p0_overwrite_reads(self, partitions):
         """Make the first future-write cohort legal in partition zero.
 
-        Uniform epochs are ordered canonically as A then B.  The first
-        cohort is therefore the first configured number of atomic A/B requests.
+        Uniform epochs normally use canonical A-then-B order.  Global VMEM
+        cohort mode instead consumes the same generated atom order used by GR
+        distribution.  In either case, select the first configured request
+        cohort here.
         Pull any current-epoch local-read placement overlapping that cohort
         into partition zero.  The instruction scheduler can then issue those
         reads, drain LDS, and place the overwrite barrier before the global
@@ -1010,17 +1040,44 @@ class LogicalScheduler:
         if len(partitions) < 2:
             return
 
-        first_atoms = []
         cohortSize = cfg.uniformEpochVmemCohortSize
-        for tensor, gran, num_tiles in (
-                ('A', cfg.grA, cfg.numMFMATilesM),
-                ('B', cfg.grB, cfg.numMFMATilesN)):
-            for tile in range(0, num_tiles, gran.mn):
-                first_atoms.append((tensor, tile, tile + gran.mn))
+        if cfg.uniformEpochGlobalVmemCohorts:
+            all_atoms = []
+            for tensor, gran, num_tiles in (
+                    ('A', cfg.grA, cfg.numMFMATilesM),
+                    ('B', cfg.grB, cfg.numMFMATilesN),
+                    ('SA', cfg.grSA, cfg.numMFMATilesM),
+                    ('SB', cfg.grSB, cfg.numMFMATilesN)):
+                for tile in range(0, num_tiles, gran.mn):
+                    all_atoms.append((tensor, tile, tile + gran.mn))
+            first_atoms = []
+            first_request_count = 0
+            for atom in self._order_uniform_epoch_global_vmem_atoms(
+                    all_atoms):
+                if atom[0] not in ('A', 'B'):
+                    break
+                first_atoms.append(atom)
+                first_request_count += (
+                    cfg.uniformEpochVmemInstructionsA
+                    if atom[0] == 'A'
+                    else cfg.uniformEpochVmemInstructionsB)
+                if first_request_count >= cohortSize:
+                    break
+            if first_request_count != cohortSize:
+                raise ValueError(
+                    "global VMEM first cohort does not contain the "
+                    "configured number of physical requests")
+        else:
+            first_atoms = []
+            for tensor, gran, num_tiles in (
+                    ('A', cfg.grA, cfg.numMFMATilesM),
+                    ('B', cfg.grB, cfg.numMFMATilesN)):
+                for tile in range(0, num_tiles, gran.mn):
+                    first_atoms.append((tensor, tile, tile + gran.mn))
+                    if len(first_atoms) == cohortSize:
+                        break
                 if len(first_atoms) == cohortSize:
                     break
-            if len(first_atoms) == cohortSize:
-                break
 
         selected = {}
         for tensor, tile_start, tile_end in first_atoms:
@@ -1072,6 +1129,100 @@ class LogicalScheduler:
                         else:
                             remaining.append(segment)
                     slot.lrs[index:index + 1] = remaining
+
+    def _order_uniform_epoch_global_vmem_atoms(self, atoms):
+        """Order one complete epoch into three geometry-derived cohorts.
+
+        Preserve each tensor's tile order and reserve at least B0 in the first
+        cohort.  This avoids pulling the next A overwrite prerequisite into an
+        already-dense P0 while keeping the first cohort full.  Within each
+        cohort, A requests precede B requests.  Weighted logical atoms must
+        terminate at a cohort boundary rather than straddling a barrier.
+
+        SA/SB are appended only when both fit in the short final data cohort.
+        Otherwise they remain a separate late pair.  Reject any atom topology
+        that does not satisfy this bounded three-region policy.
+        """
+        if not self.config.uniformEpochGlobalVmemCohorts:
+            return atoms
+
+        by_tensor = {
+            tensor: [atom for atom in atoms if atom[0] == tensor]
+            for tensor in ('A', 'B', 'SA', 'SB')
+        }
+        cohort_size = self.config.uniformEpochVmemCohortSize
+        weight_a = self.config.uniformEpochVmemInstructionsA
+        weight_b = self.config.uniformEpochVmemInstructionsB
+        data_request_count = (
+            len(by_tensor['A']) * weight_a
+            + len(by_tensor['B']) * weight_b)
+        if (
+                not (4 <= cohort_size <= 6)
+                or not (
+                    2 * cohort_size
+                    < data_request_count
+                    <= 3 * cohort_size)
+                or not by_tensor['A']
+                or not by_tensor['B']
+                or len(by_tensor['SA']) != 1
+                or len(by_tensor['SB']) != 1
+                or sum(map(len, by_tensor.values())) != len(atoms)):
+            raise ValueError(
+                "global VMEM cohorts require three 4-6 request data "
+                "cohorts plus one SA and one SB request")
+
+        target_request_counts = [
+            cohort_size,
+            cohort_size,
+            data_request_count - 2 * cohort_size,
+        ]
+
+        def choose_cohort_shapes(
+                cohort_index, remaining_a, remaining_b):
+            if cohort_index == len(target_request_counts):
+                return [] if remaining_a == 0 and remaining_b == 0 else None
+            target = target_request_counts[cohort_index]
+            minimum_b = 1 if cohort_index == 0 else 0
+            candidates = [
+                (a_count, b_count)
+                for a_count in range(remaining_a + 1)
+                for b_count in range(minimum_b, remaining_b + 1)
+                if (
+                    a_count * weight_a + b_count * weight_b
+                    == target)
+            ]
+            for a_count, b_count in sorted(
+                    candidates,
+                    key=lambda counts: (counts[0], -counts[1]),
+                    reverse=True):
+                suffix = choose_cohort_shapes(
+                    cohort_index + 1,
+                    remaining_a - a_count,
+                    remaining_b - b_count)
+                if suffix is not None:
+                    return [(a_count, b_count), *suffix]
+            return None
+
+        cohort_shapes = choose_cohort_shapes(
+            0, len(by_tensor['A']), len(by_tensor['B']))
+        if cohort_shapes is None:
+            raise ValueError(
+                "global VMEM logical atoms cannot form three unsplit cohorts")
+
+        ordered_data = []
+        a_offset = 0
+        b_offset = 0
+        for a_count, b_count in cohort_shapes:
+            ordered_data.extend(
+                by_tensor['A'][a_offset:a_offset + a_count])
+            ordered_data.extend(
+                by_tensor['B'][b_offset:b_offset + b_count])
+            a_offset += a_count
+            b_offset += b_count
+        return (
+            ordered_data
+            + by_tensor['SA']
+            + by_tensor['SB'])
 
     def _place_scale_LRs_epoch(self, partitions):
         """Place the per-epoch scale LRs for the dual-period MXFP8 path.
@@ -1788,6 +1939,7 @@ class LogicalScheduler:
                                           dist_slots[-1]))
             for pos in range(t_start, t_end, mn):
                 atoms.append((tensor, mt_val, pos, pos + mn, k_start, k_end, last))
+        atoms = self._order_uniform_epoch_global_vmem_atoms(atoms)
 
         # 2b. Place atoms across dist_slots weighted by partition MFMA
         #     count.  Each partition's slots get a share proportional to its
@@ -1807,10 +1959,42 @@ class LogicalScheduler:
         total_weight = weight_prefix[-1]
         slot_boundaries = [p * nAtoms for p in weight_prefix[1:]]
 
+        global_request_offset = 0
+        global_data_requests = sum(
+            (
+                cfg.uniformEpochVmemInstructionsA
+                if atom[0] == 'A'
+                else cfg.uniformEpochVmemInstructionsB
+            )
+            for atom in atoms
+            if atom[0] in ('A', 'B')
+        )
+        global_scales_fit_final_cohort = (
+            global_data_requests - 2 * cfg.uniformEpochVmemCohortSize + 2
+            <= cfg.uniformEpochVmemCohortSize
+        )
         for i, (tensor, mt_val, ts, te, ks, ke, last) in enumerate(atoms):
             if cfg.grPlacement == GRPlacementStrategy.BUNCHED:
                 # TDM: pin every GR atom to partition 0, subIterK 0.
                 rel = 0
+            elif cfg.uniformEpochGlobalVmemCohorts:
+                request_weight = (
+                    cfg.uniformEpochVmemInstructionsA
+                    if tensor == 'A'
+                    else cfg.uniformEpochVmemInstructionsB
+                    if tensor == 'B'
+                    else 1
+                )
+                if (
+                        tensor in ('SA', 'SB')
+                        and not global_scales_fit_final_cohort):
+                    rel = min(3, len(dist_slots) - 1)
+                else:
+                    rel = min(
+                        global_request_offset
+                        // cfg.uniformEpochVmemCohortSize,
+                        len(dist_slots) - 1)
+                global_request_offset += request_weight
             elif cfg.uniformPgrEpoch:
                 # Keep non-frontier cohorts bounded like the CMS schedule; the
                 # frontier receives the remainder immediately before its epoch
@@ -4177,9 +4361,13 @@ class LogicalScheduler:
         assert len(plan) == _SCALE_TAIL_STAGING_VGPRS, \
             "enabled scale-tail staging could not derive three scale values"
         directReadPlan = selectScaleTailDirectReadPlan(
-            c0Instructions, c1Instructions, plan)
+            c0Instructions,
+            c1Instructions,
+            plan,
+            includeSB=self.config.uniformEpochGlobalVmemCohorts,
+        )
         assert directReadPlan, \
-            "enabled scale-tail staging could not derive direct M-scale reads"
+            "enabled scale-tail staging could not derive direct scale reads"
         self._scaleTailStagingPlan = plan
         self._scaleTailDirectReadPlan = directReadPlan
         return plan
@@ -4207,10 +4395,16 @@ class LogicalScheduler:
         for entry in directReadPlan:
             read = copy.deepcopy(entry["readTemplate"])
             read.dst = vgpr(entry["canonicalVgpr"])
-            read.comment = (
-                "preloop seed for directly relocated C0 M-scale; "
-                f"canonical=v{entry['canonicalVgpr']}"
-            )
+            if getattr(read, "comment", "").startswith("SB "):
+                read.comment = (
+                    "preloop seed for directly relocated C0 SB scale; "
+                    f"canonical=v{entry['canonicalVgpr']}"
+                )
+            else:
+                read.comment = (
+                    "preloop seed for directly relocated C0 M-scale; "
+                    f"canonical=v{entry['canonicalVgpr']}"
+                )
             seeds.append((
                 entry["firstC0Mfma"], entry["canonicalVgpr"], read))
         for _firstUse, _canonical, read in sorted(
@@ -4241,6 +4435,7 @@ class LogicalScheduler:
             packPartitionZeroByInstructionType,
             rewriteC0ForScaleTailStaging,
             safeOutstandingLocalReadSuffix,
+            scheduleGlobalVmemCohorts,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250,
         )
@@ -4249,7 +4444,8 @@ class LogicalScheduler:
         from rocisa.code import Module, Label
         from rocisa.container import sgpr
         from rocisa.instruction import (
-            SCmpEQU32, SCBranchSCC0, SCBranchSCC1, SMovB32, SWaitCnt)
+            GlobalReadInstruction, SCmpEQU32, SCBranchSCC0, SCBranchSCC1,
+            SMovB32, SWaitCnt)
 
         # gfx1250 needs a larger ds_read->waitcnt gap.
         isGfx1250 = writer.states.archCaps.get("HasWmmaArbStallBit", False)
@@ -4283,6 +4479,20 @@ class LogicalScheduler:
         previous_schedule = None
         first_cell = None
         emittedMfmaCount = 0
+        globalVmemLoads = None
+        if (
+                schedule
+                and self.config.uniformEpochGlobalVmemCohorts
+                and label.startswith("MAINLOOP_C")):
+            globalVmemLoads = [
+                inst
+                for partition in emitted_3d
+                for em_list in partition
+                for emitted in em_list
+                if emitted.opType == "gr"
+                for inst in emitted.instructions
+                if isinstance(inst, GlobalReadInstruction)
+            ]
 
         def mfma_count(em_list):
             return sum(
@@ -4422,6 +4632,15 @@ class LogicalScheduler:
             # later full LGKM-only drain when an earlier full drain dominates
             # it and no LDS/SMEM producer intervenes.
             eliminateRedundantLgkmDrains(module)
+        if globalVmemLoads is not None:
+            globalSchedule = scheduleGlobalVmemCohorts(
+                module,
+                globalVmemLoads,
+                cohortSize=self.config.uniformEpochVmemCohortSize,
+            )
+            assert globalSchedule is not None, \
+                "global VMEM cohorts did not match a supported loop shape"
+            module = globalSchedule
         if use_pap_preloop_skip and skipping_first_gr_group and not first_gr_group_done:
             module.add(pap_merge_label)
             module.add(SMovB32(dst=sgpr("PersistentPrefetchState"), src=0,

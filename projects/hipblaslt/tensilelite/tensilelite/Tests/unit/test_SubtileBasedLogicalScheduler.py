@@ -2400,12 +2400,14 @@ class TestUniformPgrEpoch:
         ]
 
     @staticmethod
-    def _production_fixture(mt_m=256, mt_n=256):
+    def _production_fixture(
+            mt_m=256, mt_n=256, mi_wave_group=None):
         import importlib
 
         kernel_module = importlib.import_module(
             "tensilelite.Components.Subtile.Kernel")
-        kernel = create_kernel_mxfp8(mt_m, mt_n)
+        kernel = create_kernel_mxfp8(
+            mt_m, mt_n, miWaveGroup=mi_wave_group)
         kernel["PrefetchGlobalRead"] = 2
         kernel["PrefetchLocalRead"] = 0
         fixture = make_writer_and_tileinfos(kernel, fp4=True)
@@ -2443,6 +2445,45 @@ class TestUniformPgrEpoch:
         assert selected.pgr == 2
         assert selected.prefetchNextPartition
         assert selected.uniformPgrEpoch
+        assert selected.uniformEpochVmemCohortSize == 6
+        assert selected.uniformEpochGlobalVmemCohorts
+
+    @pytest.mark.parametrize("mt_m,mt_n", [(256, 320), (320, 256)])
+    def test_rectangular_production_geometries_select_global_six_cohorts(
+            self, mt_m, mt_n):
+        _kernel, _fixture, selected = self._production_fixture(mt_m, mt_n)
+
+        assert selected.uniformPgrEpoch
+        assert selected.uniformEpochVmemCohortSize == 6
+        assert selected.uniformEpochGlobalVmemCohorts
+
+    @pytest.mark.parametrize(
+        "mt_m,mt_n,mi_wave_group,expected_size,expected_weights",
+        [
+            (128, 256, [2, 2], 4, (1, 1)),
+            (192, 256, [2, 2], 5, (1, 1)),
+            (224, 256, [1, 4], 5, (1, 2)),
+        ],
+    )
+    def test_smaller_production_geometries_derive_global_cohort_size(
+            self, mt_m, mt_n, mi_wave_group, expected_size,
+            expected_weights):
+        _kernel, _fixture, selected = self._production_fixture(
+            mt_m, mt_n, mi_wave_group)
+
+        assert selected.uniformPgrEpoch
+        assert selected.uniformEpochGlobalVmemCohorts
+        assert selected.uniformEpochVmemCohortSize == expected_size
+        assert (
+            selected.uniformEpochVmemInstructionsA,
+            selected.uniformEpochVmemInstructionsB,
+        ) == expected_weights
+
+    def test_unsplittable_smaller_geometry_keeps_fallback_schedule(self):
+        _kernel, _fixture, selected = self._production_fixture(224, 256)
+
+        assert not selected.uniformPgrEpoch
+        assert not selected.uniformEpochGlobalVmemCohorts
         assert selected.uniformEpochVmemCohortSize == 5
 
     @pytest.mark.parametrize(
@@ -2586,14 +2627,14 @@ class TestUniformPgrEpoch:
         assert direct_reload_after_mfma == [60, 61, 62]
 
     @pytest.mark.parametrize(
-        "mt_m,mt_n,expected_direct,expected_remaining_sb",
+        "mt_m,mt_n,expected_direct,expected_sb_direct",
         [
-            (256, 320, [70, 71, 72], 3),
-            (320, 256, [70, 71, 72, 73], 2),
+            (256, 320, [67, 68, 72], [74, 75, 76]),
+            (320, 256, [67, 68, 69, 72], [74, 75]),
         ],
     )
     def test_rectangular_scale_tail_staging_uses_third_ds_position(
-            self, mt_m, mt_n, expected_direct, expected_remaining_sb):
+            self, mt_m, mt_n, expected_direct, expected_sb_direct):
         kernel, fixture, cfg = self._production_fixture(mt_m, mt_n)
         assembly = _emit_mainloops(
             kernel, fixture, cfg, scale_tail_staging=True)
@@ -2607,6 +2648,7 @@ class TestUniformPgrEpoch:
         c1 = section("MAINLOOP_C1")
         stage_after_mfma = []
         direct_reload_after_mfma = []
+        sb_reload_after_mfma = []
         ds_reads_per_shadow = []
         shadows = []
         mfma_rank = -1
@@ -2621,24 +2663,27 @@ class TestUniformPgrEpoch:
                     stage_after_mfma.append(mfma_rank)
                 elif "reload next C0 M-scale directly" in line:
                     direct_reload_after_mfma.append(mfma_rank)
+                elif "reload next C0 SB scale directly" in line:
+                    sb_reload_after_mfma.append(mfma_rank)
                 shadows[mfma_rank].append(line.lstrip())
             elif mfma_rank >= 0:
                 shadows[mfma_rank].append(line.lstrip())
 
-        assert stage_after_mfma == [67, 68, 69]
+        assert stage_after_mfma == [64, 65, 66]
         assert direct_reload_after_mfma == expected_direct
+        assert sb_reload_after_mfma == expected_sb_direct
         assert all(
             ds_reads_per_shadow[index] == 3
             for index in stage_after_mfma + direct_reload_after_mfma
         )
         assert max(ds_reads_per_shadow) == 3
+        assert ds_reads_per_shadow[-1] == 0
 
         mixed_shadows = [
             shadow for shadow in shadows
             if any(line.startswith("buffer_load") for line in shadow)
             and any(line.startswith("ds_read_") for line in shadow)
         ]
-        assert mixed_shadows
         for shadow in mixed_shadows:
             setup = next(
                 index for index, line in enumerate(shadow)
@@ -2651,14 +2696,16 @@ class TestUniformPgrEpoch:
                 if line.startswith("ds_read_"))
             assert setup < vmem < lds
 
-        # Every directly relocated SA read and two staged SB/SA reads disappear
-        # from C0.  The only canonical scale reads left there are SB values.
+        # Every canonical scale read now comes from the preloop seed or prior
+        # C1 tail; C0 retains only its drain and staged publishes.
         remaining_scale_reads = [
             line for line in c0
             if re.search(r"^\s*ds_read_b32\b.*// S[AB] MT=", line)
         ]
-        assert len(remaining_scale_reads) == expected_remaining_sb
-        assert all("// SB MT=" in line for line in remaining_scale_reads)
+        assert not remaining_scale_reads
+        assert assembly[:assembly.index("label_LoopBeginL:")].count(
+            "preloop seed for directly relocated C0 SB scale"
+        ) == len(expected_sb_direct)
         assert not any("scale-source reads before refresh" in line
                        for line in c0)
 
@@ -2718,9 +2765,9 @@ class TestUniformPgrEpoch:
     @pytest.mark.parametrize(
         "mt_m,mt_n,expected_counts",
         [
-            (256, 256, [5, 5, 5, 1]),
-            (256, 320, [5, 5, 5, 3]),
-            (320, 256, [5, 5, 5, 3]),
+            (256, 256, [6, 6, 4, 0]),
+            (256, 320, [6, 6, 6, 0]),
+            (320, 256, [6, 6, 6, 0]),
         ])
     def test_production_geometries_publish_one_complete_uniform_epoch(
             self, mt_m, mt_n, expected_counts):
@@ -2747,11 +2794,25 @@ class TestUniformPgrEpoch:
                     count += len(atoms)
             partition_counts.append(count)
 
-        expected_atoms = [
-            ("A", tile, 2) for tile in range(cfg.numMFMATilesM)
-        ] + [
-            ("B", tile, 2) for tile in range(cfg.numMFMATilesN)
-        ]
+        if cfg.uniformEpochGlobalVmemCohorts:
+            expected_atoms = [
+                *[("A", tile, 2) for tile in range(5)],
+                ("B", 0, 2),
+                *[
+                    ("A", tile, 2)
+                    for tile in range(5, cfg.numMFMATilesM)
+                ],
+                *[
+                    ("B", tile, 2)
+                    for tile in range(1, cfg.numMFMATilesN)
+                ],
+            ]
+        else:
+            expected_atoms = [
+                ("A", tile, 2) for tile in range(cfg.numMFMATilesM)
+            ] + [
+                ("B", tile, 2) for tile in range(cfg.numMFMATilesN)
+            ]
         assert ab_atoms == expected_atoms
         assert partition_counts == expected_counts
         waits = [
@@ -2839,8 +2900,10 @@ class TestUniformPgrEpoch:
         _emit_du128_mxfp8_mainloops(physical_cfg)
         assert observed_caps == [3, 3]
 
-    def test_partition_zero_gets_five_writes_and_only_required_hoisted_read(self):
-        cfg = self._cfg()
+    def test_global_six_request_cohorts_keep_only_required_p0_hoisted_read(self):
+        cfg = self._cfg(
+            uniformEpochVmemCohortSize=6,
+            uniformEpochGlobalVmemCohorts=True)
         sched = LogicalScheduler(cfg)
         sched.build(stop_after=Pass.LR)
 
@@ -2874,15 +2937,22 @@ class TestUniformPgrEpoch:
 
         sched = LogicalScheduler(cfg)
         sched.build(stop_after=Pass.GR)
-        counts = []
+        data_counts = []
+        total_counts = []
         for partition in sched._partitions:
-            counts.append(sum(
+            data_counts.append(sum(
                 sched._count_gr_atoms(gr)
                 for slot in partition
                 for gr in slot.grs
                 if gr.tensor in ("A", "B")
             ))
-        assert counts == [5, 5, 5, 1]
+            total_counts.append(sum(
+                sched._count_gr_atoms(gr)
+                for slot in partition
+                for gr in slot.grs
+            ))
+        assert data_counts == [6, 6, 4, 0]
+        assert total_counts == [6, 6, 6, 0]
 
         p0_atoms = [
             (gr.tensor, tile)
@@ -2894,7 +2964,385 @@ class TestUniformPgrEpoch:
                 gr.tiles.tileId_end,
                 getattr(cfg, f"gr{gr.tensor}").mn)
         ]
-        assert p0_atoms == [("A", tile) for tile in range(5)]
+        assert p0_atoms == [
+            *[("A", tile) for tile in range(5)],
+            ("B", 0),
+        ]
+
+        cohort_atoms = []
+        for partition in sched._partitions:
+            atoms = []
+            for slot in partition:
+                for gr in slot.grs:
+                    granularity = getattr(cfg, f"gr{gr.tensor}")
+                    atoms.extend(
+                        (gr.tensor, tile)
+                        for tile in range(
+                            gr.tiles.tileId_start,
+                            gr.tiles.tileId_end,
+                            granularity.mn))
+            cohort_atoms.append(atoms)
+        assert cohort_atoms == [
+            [
+                *[("A", tile) for tile in range(5)],
+                ("B", 0),
+            ],
+            [
+                *[("A", tile) for tile in range(5, 8)],
+                *[("B", tile) for tile in range(1, 4)],
+            ],
+            [
+                *[("B", tile) for tile in range(4, 8)],
+                ("SA", 0),
+                ("SB", 0),
+            ],
+            [],
+        ]
+
+    def test_global_six_request_cohorts_preserve_overwrite_dependencies(self):
+        cfg = self._cfg(
+            uniformEpochVmemCohortSize=6,
+            uniformEpochGlobalVmemCohorts=True)
+        sched = LogicalScheduler(cfg)
+        sched.build(stop_after=Pass.DEPS)
+
+        for gr in self._grs(sched):
+            overlapping_reads = [
+                dep for dep in gr.deps
+                if isinstance(dep.ref, LRPlacement)
+                and dep.ref.tensor == gr.tensor
+                and dep.ref.tiles.tileId_start < gr.tiles.tileId_end
+                and gr.tiles.tileId_start < dep.ref.tiles.tileId_end
+            ]
+            assert overlapping_reads, (
+                f"{gr} lost its old-epoch LDS overwrite dependency")
+            assert all(
+                dep.ref.mtIteration + dep.mt_offset
+                == gr.mtIteration - 2
+                for dep in overlapping_reads)
+
+    def test_global_six_request_cohorts_reach_physical_c0_c1_streams(self):
+        kernel, fixture, cfg = self._production_fixture(256, 256)
+        assembly = _emit_mainloops(
+            kernel, fixture, cfg, scale_tail_staging=True)
+
+        def section(label):
+            start = assembly.index(f"/* {label} start */")
+            end = assembly.index(f"/* {label} end */", start)
+            return assembly[start:end].splitlines()
+
+        def partition_vmem_counts(lines):
+            markers = [
+                index for index, line in enumerate(lines)
+                if "partition=" in line
+            ]
+            return [
+                sum(
+                    "buffer_load" in line and "lds" in line
+                    for line in lines[
+                        marker:
+                        markers[index + 1]
+                        if index + 1 < len(markers)
+                        else len(lines)])
+                for index, marker in enumerate(markers)
+            ]
+
+        def vmem_schedule(lines):
+            mfma_rank = -1
+            schedule = []
+            for line in lines:
+                stripped = line.lstrip()
+                if stripped.startswith("v_mfma"):
+                    mfma_rank += 1
+                elif (
+                        stripped.startswith("buffer_load")
+                        and " lds " in stripped):
+                    schedule.append((mfma_rank, stripped.split("//")[-1]))
+            return schedule
+
+        c0 = section("MAINLOOP_C0")
+        c1 = section("MAINLOOP_C1")
+        assert partition_vmem_counts(c0) == [6, 6, 6, 0]
+        assert partition_vmem_counts(c1) == [6, 6, 4, 0]
+        c0_vmem = vmem_schedule(c0)
+        c1_vmem = vmem_schedule(c1)
+        assert [rank for rank, _ in c0_vmem] == [
+            *range(7, 13),
+            *range(23, 29),
+            *range(42, 48),
+        ]
+        assert [rank for rank, _ in c1_vmem] == [
+            *range(7, 13),
+            *range(23, 29),
+            *range(42, 46),
+        ]
+        placement_regions = ((0, 21), (21, 42), (42, 64))
+        assert [
+            sum(start <= rank < end for rank, _ in c0_vmem)
+            for start, end in placement_regions
+        ] == [6, 6, 6]
+        assert [
+            sum(start <= rank < end for rank, _ in c1_vmem)
+            for start, end in placement_regions
+        ] == [6, 6, 4]
+        assert [
+            comment.split()[0:3]
+            for _, comment in c0_vmem[-6:]
+        ] == [
+            ["B", "MT=n+2", f"tile={tile}"] for tile in range(4, 8)
+        ] + [
+            ["SA", "MT=n+2", "tile=0"],
+            ["SB", "MT=n+2", "tile=0"],
+        ]
+        assert any("s_waitcnt vmcnt(18)" in line for line in c0)
+        assert any("s_waitcnt vmcnt(16)" in line for line in c1)
+
+    @pytest.mark.parametrize(
+        "mt_m,mt_n,expected_c0,expected_c1",
+        [
+            (
+                256,
+                320,
+                [
+                    *range(7, 13),
+                    *range(31, 37),
+                    *range(54, 60),
+                    77, 78,
+                ],
+                [
+                    *range(7, 13),
+                    *range(31, 37),
+                    *range(54, 60),
+                ],
+            ),
+            (
+                320,
+                256,
+                [
+                    *range(2, 8),
+                    *range(32, 38),
+                    *range(53, 59),
+                    77, 78,
+                ],
+                [
+                    *range(2, 8),
+                    *range(32, 38),
+                    *range(54, 60),
+                ],
+            ),
+        ],
+    )
+    def test_rectangular_global_six_request_cohorts_reach_physical_streams(
+            self, mt_m, mt_n, expected_c0, expected_c1):
+        kernel, fixture, cfg = self._production_fixture(mt_m, mt_n)
+        assembly = _emit_mainloops(
+            kernel, fixture, cfg, scale_tail_staging=True)
+
+        def section(label):
+            start = assembly.index(f"/* {label} start */")
+            end = assembly.index(f"/* {label} end */", start)
+            return assembly[start:end].splitlines()
+
+        def vmem_schedule(lines):
+            mfma_rank = -1
+            schedule = []
+            for line in lines:
+                stripped = line.lstrip()
+                if stripped.startswith("v_mfma"):
+                    mfma_rank += 1
+                elif (
+                        stripped.startswith("buffer_load")
+                        and " lds " in stripped):
+                    schedule.append((
+                        mfma_rank,
+                        stripped.split("//")[-1].split()[0:3],
+                    ))
+            return schedule
+
+        c0_vmem = vmem_schedule(section("MAINLOOP_C0"))
+        c1_vmem = vmem_schedule(section("MAINLOOP_C1"))
+        assert [rank for rank, _ in c0_vmem] == expected_c0
+        assert [rank for rank, _ in c1_vmem] == expected_c1
+
+        expected_data = [
+            *[
+                ["A", "MT=n+2", f"tile={tile}"]
+                for tile in range(5)
+            ],
+            ["B", "MT=n+2", "tile=0"],
+            *[
+                ["A", "MT=n+2", f"tile={tile}"]
+                for tile in range(5, cfg.numMFMATilesM)
+            ],
+            *[
+                ["B", "MT=n+2", f"tile={tile}"]
+                for tile in range(1, cfg.numMFMATilesN)
+            ],
+        ]
+        assert [comment for _, comment in c1_vmem] == expected_data
+        assert [comment for _, comment in c0_vmem[:-2]] == expected_data
+        assert [comment for _, comment in c0_vmem[-2:]] == [
+            ["SA", "MT=n+2", "tile=0"],
+            ["SB", "MT=n+2", "tile=0"],
+        ]
+
+        placement_regions = ((0, 26), (26, 53), (53, 80))
+        for schedule in (c0_vmem[:-2], c1_vmem):
+            assert [
+                sum(start <= rank < end for rank, _ in schedule)
+                for start, end in placement_regions
+            ] == [6, 6, 6]
+
+    @pytest.mark.parametrize(
+        "mt_m,mt_n,mi_wave_group,expected_mfmas,expected_size,"
+        "expected_data_requests",
+        [
+            (128, 256, [2, 2], 32, 4, 12),
+            (192, 256, [2, 2], 48, 5, 14),
+            (224, 256, [1, 4], 56, 5, 15),
+        ],
+    )
+    def test_smaller_global_cohorts_balance_physical_vmem_requests(
+            self, mt_m, mt_n, mi_wave_group, expected_mfmas,
+            expected_size, expected_data_requests):
+        kernel, fixture, cfg = self._production_fixture(
+            mt_m, mt_n, mi_wave_group)
+        assembly = _emit_mainloops(
+            kernel, fixture, cfg, scale_tail_staging=False)
+
+        placement_regions = [
+            (
+                expected_mfmas * index // 3,
+                expected_mfmas * (index + 1) // 3,
+            )
+            for index in range(3)
+        ]
+        expected_counts = [
+            expected_size,
+            expected_size,
+            expected_data_requests - 2 * expected_size,
+        ]
+
+        for copy_index in (0, 1):
+            start = assembly.index(
+                f"/* MAINLOOP_C{copy_index} start */")
+            end = assembly.index(
+                f"/* MAINLOOP_C{copy_index} end */", start)
+            lines = assembly[start:end].splitlines()
+            mfma_rank = -1
+            data_ranks = []
+            data_comments = []
+            scale_ranks = []
+            for line in lines:
+                stripped = line.lstrip()
+                if stripped.startswith("v_mfma"):
+                    mfma_rank += 1
+                elif (
+                        stripped.startswith("buffer_load")
+                        and " lds " in stripped):
+                    comment = stripped.split("//")[-1].strip()
+                    if comment.startswith(("A ", "B ")):
+                        data_ranks.append(mfma_rank)
+                        data_comments.append(comment)
+                    elif comment.startswith(("SA ", "SB ")):
+                        scale_ranks.append(mfma_rank)
+
+            assert mfma_rank + 1 == expected_mfmas
+            assert len(data_ranks) == expected_data_requests
+            assert [
+                sum(begin <= rank < finish for rank in data_ranks)
+                for begin, finish in placement_regions
+            ] == expected_counts
+            if cfg.uniformEpochVmemInstructionsB > 1:
+                regions_by_b_tile = {}
+                for rank, comment in zip(data_ranks, data_comments):
+                    if not comment.startswith("B "):
+                        continue
+                    tile = int(
+                        re.search(r"\btile=(\d+)", comment).group(1))
+                    region = next(
+                        index
+                        for index, (begin, finish)
+                        in enumerate(placement_regions)
+                        if begin <= rank < finish)
+                    regions_by_b_tile.setdefault(tile, set()).add(region)
+                assert all(
+                    len(regions) == 1
+                    for regions in regions_by_b_tile.values())
+            if copy_index == 0:
+                assert len(scale_ranks) == 2
+                assert all(
+                    placement_regions[-1][0] <= rank
+                    < placement_regions[-1][1]
+                    for rank in scale_ranks)
+            else:
+                assert not scale_ranks
+
+    def test_global_six_request_cohorts_relocate_c0_sb_scale_reads(self):
+        kernel, fixture, cfg = self._production_fixture(256, 256)
+        assembly = _emit_mainloops(
+            kernel, fixture, cfg, scale_tail_staging=True)
+
+        def section(label):
+            start = assembly.index(f"/* {label} start */")
+            end = assembly.index(f"/* {label} end */", start)
+            return assembly[start:end].splitlines()
+
+        preloop = assembly[:assembly.index("label_LoopBeginL:")]
+        c0 = section("MAINLOOP_C0")
+        c1 = section("MAINLOOP_C1")
+        sb_seeds = [
+            line for line in preloop.splitlines()
+            if "preloop seed for directly relocated C0 SB scale" in line
+        ]
+        sb_reloads = [
+            line for line in c1
+            if "reload next C0 SB scale directly" in line
+        ]
+        assert len(sb_seeds) == len(sb_reloads) == 2
+        assert {
+            int(re.search(r"canonical=v(\d+)", line).group(1))
+            for line in sb_seeds
+        } == {
+            int(re.search(r"canonical=v(\d+)", line).group(1))
+            for line in sb_reloads
+        }
+
+        # All eight scale values now arrive from either the preloop seed or
+        # the preceding C1 tail; C0 retains only their publishing drain/moves.
+        assert not any(
+            re.search(r"^\s*ds_read_b32\b.*// S[AB] MT=", line)
+            for line in c0
+        )
+
+        placements = {
+            "stage": [],
+            "direct_sa": [],
+            "direct_sb": [],
+        }
+        ds_reads_per_shadow = []
+        mfma_rank = -1
+        for line in c1:
+            stripped = line.lstrip()
+            if stripped.startswith("v_mfma"):
+                mfma_rank += 1
+                ds_reads_per_shadow.append(0)
+            elif stripped.startswith("ds_read_"):
+                ds_reads_per_shadow[mfma_rank] += 1
+                if "stage next C0 scale in temporary VGPR" in line:
+                    placements["stage"].append(mfma_rank)
+                elif "reload next C0 M-scale directly" in line:
+                    placements["direct_sa"].append(mfma_rank)
+                elif "reload next C0 SB scale directly" in line:
+                    placements["direct_sb"].append(mfma_rank)
+
+        assert placements == {
+            "stage": [56, 57, 58],
+            "direct_sa": [59, 60, 61],
+            "direct_sb": [56, 57],
+        }
+        assert ds_reads_per_shadow[56:62] == [2, 2, 1, 1, 1, 1]
+        assert ds_reads_per_shadow[62:64] == [0, 0]
 
     def test_preloop_seeds_complete_n1_epoch(self):
         cfg = self._cfg()
@@ -3959,7 +4407,8 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
         raise AssertionError(f"unrecognized DTL instruction: {line}")
 
     @classmethod
-    def _assert_dtl_pairs_and_mfma_shadows(cls, partitions):
+    def _assert_dtl_pairs_and_mfma_shadows(
+            cls, partitions, allow_global_p2_seam_load=False):
         """Check DTL pairing and interleaving, allowing P3's remainder."""
         for partition_index, instructions in enumerate(partitions):
             pending_setup = None
@@ -4012,7 +4461,14 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                 f"P{partition_index}: m0 setup has no buffer load: "
                 f"{pending_setup}")
             assert seen_mfma
-            assert loads_since_mfma == 0, (
+            assert (
+                loads_since_mfma == 0
+                or (
+                    allow_global_p2_seam_load
+                    and partition_index == 2
+                    and loads_since_mfma == 1
+                )
+            ), (
                 f"P{partition_index}: buffer load follows final MFMA")
 
     def test_mt256x256_c0_c1_match_clean_baseline(self):
@@ -4046,9 +4502,9 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
     @pytest.mark.parametrize(
         "mt_m,mt_n,expected_ab_counts",
         [
-            (256, 256, [5, 5, 5, 1]),
-            (256, 320, [5, 5, 5, 3]),
-            (320, 256, [5, 5, 5, 3]),
+            (256, 256, [6, 6, 4, 0]),
+            (256, 320, [6, 6, 6, 0]),
+            (320, 256, [6, 6, 6, 0]),
         ])
     def test_supported_geometries_keep_productized_schedule_invariants(
             self, mt_m, mt_n, expected_ab_counts):
@@ -4060,7 +4516,11 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
             partitions = self._partition_instructions(
                 assembly, copy_index)
             assert len(partitions) == 4
-            self._assert_dtl_pairs_and_mfma_shadows(partitions)
+            self._assert_dtl_pairs_and_mfma_shadows(
+                partitions,
+                allow_global_p2_seam_load=(
+                    cfg.uniformEpochGlobalVmemCohorts),
+            )
 
             ab_counts = [
                 sum(

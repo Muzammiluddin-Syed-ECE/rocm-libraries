@@ -1391,14 +1391,70 @@ def _emitDualPeriodTailScaleSrdAlignment(kernel, unrollIdx, scaleTiA, scaleTiB):
   return module
 
 
-def _supportsUniformPgrEpoch(partitionPrefetch, pgr, partition, m, n):
+def _supportsUniformPgrEpoch(
+    partitionPrefetch, pgr, partition, m, n, mnM=1, mnN=1):
   """Whether a complete-epoch frontier is valid for this partition grid."""
   return (
       partitionPrefetch
       and pgr == 2
       and partition is not None
       and partition[0] < m
-      and partition[1] < n)
+      and partition[1] < n
+      and m % mnM == 0
+      and n % mnN == 0)
+
+
+def _deriveGlobalVmemCohortSize(
+    m, n, grA, grB, vmemInstructionsA=1, vmemInstructionsB=1):
+  """Choose three balanced data-request cohorts for a supported geometry.
+
+  The physical scheduler currently exposes three global placement regions.
+  Select the smallest cohort in [4, 6] that can hold one third of the complete
+  A/B epoch, and reject geometries that would not form exactly three non-empty
+  cohorts.  Rejection is deliberate: the caller retains the established
+  partition-local schedule for geometries outside this bounded policy.
+  """
+  if (
+      grA is None or grB is None
+      or grA.mn <= 0 or grB.mn <= 0
+      or vmemInstructionsA <= 0 or vmemInstructionsB <= 0):
+      return None
+
+  atomsA = (m + grA.mn - 1) // grA.mn
+  atomsB = (n + grB.mn - 1) // grB.mn
+  dataRequests = (
+      atomsA * vmemInstructionsA
+      + atomsB * vmemInstructionsB)
+  cohortSize = max(4, min(6, (dataRequests + 2) // 3))
+  if not (2 * cohortSize < dataRequests <= 3 * cohortSize):
+      return None
+
+  targets = (
+      cohortSize,
+      cohortSize,
+      dataRequests - 2 * cohortSize,
+  )
+
+  def canPartition(targetIndex, remainingA, remainingB):
+      if targetIndex == len(targets):
+          return remainingA == 0 and remainingB == 0
+      minimumB = 1 if targetIndex == 0 else 0
+      return any(
+          canPartition(
+              targetIndex + 1,
+              remainingA - countA,
+              remainingB - countB)
+          for countA in range(remainingA + 1)
+          for countB in range(minimumB, remainingB + 1)
+          if (
+              countA * vmemInstructionsA
+              + countB * vmemInstructionsB
+              == targets[targetIndex])
+      )
+
+  if not canPartition(0, atomsA, atomsB):
+      return None
+  return cohortSize
 
 
 def mainLoop(writer, kernel):
@@ -1489,7 +1545,21 @@ def mainLoop(writer, kernel):
   # partition cycle.  On a 2x1/1x2 grid one operand is shared by both
   # partitions, so keep its dependency-derived per-partition VMEM frontiers.
   schedulerUniformPgrEpoch = _supportsUniformPgrEpoch(
-      schedulerPartitionPrefetch, schedulerPgr, forcedPartition, M, N)
+      schedulerPartitionPrefetch, schedulerPgr, forcedPartition, M, N,
+      mnM, mnN)
+  # Decouple complete-epoch VMEM placement from geometric MFMA/VGPR ownership
+  # when the A/B request count can be balanced over exactly three regions.
+  # Geometry derives a cohort size of 4, 5, or 6; unsupported request counts
+  # retain the established partition-local five-request policy.
+  schedulerVmemCohortSize = (
+      _deriveGlobalVmemCohortSize(
+          M, N, grAGran, grBGran,
+          tiA.numGRPerSubtile, tiB.numGRPerSubtile)
+      if schedulerUniformPgrEpoch else None
+  )
+  schedulerGlobalVmemCohorts = schedulerVmemCohortSize is not None
+  if schedulerVmemCohortSize is None:
+      schedulerVmemCohortSize = 5
 
   vgprBudget = writer.states.regCaps["MaxVgpr"]
   vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
@@ -1522,7 +1592,10 @@ def mainLoop(writer, kernel):
           doubleBufferTensors=schedulerDoubleBuffer,
           prefetchNextPartition=schedulerPartitionPrefetch,
           uniformPgrEpoch=schedulerUniformPgrEpoch,
-          uniformEpochVmemCohortSize=5,
+          uniformEpochVmemCohortSize=schedulerVmemCohortSize,
+          uniformEpochGlobalVmemCohorts=schedulerGlobalVmemCohorts,
+          uniformEpochVmemInstructionsA=tiA.numGRPerSubtile,
+          uniformEpochVmemInstructionsB=tiB.numGRPerSubtile,
           partitionOrder=schedulerPartitionOrder,
           grPlacement=grPlacement,
           pgl=kernel.get("PrefetchGL2", 0),
@@ -1535,11 +1608,12 @@ def mainLoop(writer, kernel):
 
       baseNumVgpr = scheduler.getNumVgpr(
           tiA, tiB, scaleTiA, scaleTiB)
-      # Experimental 256x256/256x320/320x256 topology: use three temporary
-      # VGPRs to stage the latest-live future scale values in C1 P3, then
-      # publish them in the next C0.  Gate on the supported logical MFMA grids
-      # rather than physical register numbers, and retain the baseline schedule
-      # if the extra resources would exceed the hardware VGPR budget.
+      # Use three temporary VGPRs to stage the latest-live future scale values
+      # in C1 P3, then publish them in the next C0.  The global-cohort selector
+      # supplies the bounded logical/physical topology contract.  Bodies below
+      # 64 MFMAs do not expose three legal P3 staging shadows after their
+      # required A/B reads, so they retain their canonical C0 scale reads.
+      # Also retain the baseline schedule if resources exceed the VGPR budget.
       from .InstructionScheduler import _SCALE_TAIL_STAGING_VGPRS
       scaleTailStagingCandidate = (
           tuple(kernel.get("ISA", ())) == (9, 5, 0)
@@ -1548,7 +1622,8 @@ def mainLoop(writer, kernel):
           and cfg.numSubIterK == 1
           and cfg.numPartitionsM > 1
           and cfg.numPartitionsN > 1
-          and (M, N) in ((8, 8), (8, 10), (10, 8))
+          and cfg.uniformEpochGlobalVmemCohorts
+          and M * N >= 64
       )
       scheduler.scaleTailStagingEnabled = (
           scaleTailStagingCandidate

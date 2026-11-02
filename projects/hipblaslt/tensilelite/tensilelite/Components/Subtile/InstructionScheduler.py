@@ -49,7 +49,7 @@ _INSTRUCTION_TYPE_SHADOW_HARD_CAPACITY = {
 # One s_nop with this immediate provides the conservative source-read window
 # before a following ds_read overwrites a scale operand.
 _GFX950_SCALE_REFRESH_WAR_WAIT_STATE = 8
-# The supported 256x256/256x320/320x256 macrotiles have room for three
+# Supported global-cohort bodies with at least 64 MFMAs have room for three
 # temporary scale values without changing occupancy.  Keeping the count in one
 # place makes the resource gate and the physical rewrite agree.
 _SCALE_TAIL_STAGING_VGPRS = 3
@@ -150,14 +150,16 @@ def selectScaleTailStagingPlan(
 
 
 def selectScaleTailDirectReadPlan(
-        c0Instructions, c1Instructions, stagedPlan):
-    """Select remaining M/SA scales for direct refresh in the prior C1 tail.
+        c0Instructions, c1Instructions, stagedPlan, includeSB=False):
+    """Select early-dead scales for direct refresh in the prior C1 tail.
 
     The latest-live SA value is already represented in ``stagedPlan`` and must
     retain its temporary VGPR.  Every other SA value is dead early enough to
     reload its canonical VGPR in an empty final-partition MFMA shadow.  Derive
     this set from emitted comments and scaled-MFMA operands, without relying on
-    physical register numbers.
+    physical register numbers.  The square global-VMEM experiment can also
+    include the two remaining SB values: its C1 tail has preferred second LDS
+    slots after both canonical destinations are dead.
     """
     stagedRegisters = {
         entry["canonicalVgpr"] for entry in stagedPlan
@@ -169,7 +171,10 @@ def selectScaleTailDirectReadPlan(
         destination = _registerIndex(inst.dst)
         if destination is None or destination in stagedRegisters:
             continue
-        if not getattr(inst, "comment", "").startswith("SA "):
+        comment = getattr(inst, "comment", "")
+        if not (
+                comment.startswith("SA ")
+                or (includeSB and comment.startswith("SB "))):
             continue
         c0Reads.setdefault(destination, inst)
 
@@ -308,8 +313,10 @@ def appendScaleTailStagingReads(
     fill the tail with A/B reads, so fall back to their otherwise-unused third
     DS issue position, starting with the first A/B-read shadow.  Temporary
     reads for latest-live scales come first.  Remaining M/SA scales then reload
-    their dead canonical VGPRs directly after their final C1 use, eliminating
-    their next-C0 prefix reads.
+    their dead canonical VGPRs directly after their final C1 use.  When the
+    direct plan also contains SB scales, place those in preferred second LDS
+    positions alongside the staged reads.  This eliminates the final C0 prefix
+    reads without consuming the last MFMA shadow.
     """
     if not plan:
         return False
@@ -339,37 +346,69 @@ def appendScaleTailStagingReads(
         directReadPlan, key=lambda item: (
             item["lastC1Mfma"], item["canonicalVgpr"]))
 
-    def canAppendScaleRead(group):
+    def canAppendScaleRead(
+            group, reservations=(), allowPressedDs=True):
         candidate = [
             *group,
+            *reservations,
             # Every scale template is a DSLoadB32.  Use the first one only as a
             # type/capacity probe; the physical destination is irrelevant.
             orderedPlan[0]["readTemplate"],
         ]
-        return _fitsInstructionTypeShadow(candidate)
+        return _fitsInstructionTypeShadow(
+            candidate, allowPressedDs=allowPressedDs)
 
     def makePlacement(start):
+        reservations = {}
+        # A follower after the body's final MFMA delays the loop-back branch
+        # rather than hiding under a subsequent MFMA.  Keep that shadow free.
+        lastUsable = len(followers) - 1
+
+        def canReserve(index, allowPressedDs=True):
+            return canAppendScaleRead(
+                followers[index],
+                reservations.get(index, ()),
+                allowPressedDs=allowPressedDs,
+            )
+
+        def reserve(index, entry):
+            reservations.setdefault(index, []).append(entry["readTemplate"])
+
         stageTargets = []
         searchFrom = start
-        for _entry in orderedPlan:
+        for entry in orderedPlan:
             target = next(
                 (
-                    index for index in range(searchFrom, len(followers))
-                    if canAppendScaleRead(followers[index])
+                    index for index in range(searchFrom, lastUsable)
+                    if canReserve(index)
                 ),
                 None,
             )
             if target is None:
                 return None
             stageTargets.append(target)
+            reserve(target, entry)
             searchFrom = target + 1
 
+        # Preserve the existing SA placement byte-for-byte.  Additional SB
+        # reloads can share the preferred second LDS slot in the staged-read
+        # shadows instead of occupying the final MFMA shadow.
+        primaryDirectPlan = [
+            entry for entry in orderedDirectPlan
+            if not getattr(
+                entry["readTemplate"], "comment", "").startswith("SB ")
+        ]
+        colocatedDirectPlan = [
+            entry for entry in orderedDirectPlan
+            if getattr(
+                entry["readTemplate"], "comment", "").startswith("SB ")
+        ]
         directTargets = []
-        for entry in orderedDirectPlan:
+        for entry in primaryDirectPlan:
             target = next(
                 (
-                    index for index in range(searchFrom, len(followers))
-                    if canAppendScaleRead(followers[index])
+                    index for index in range(searchFrom, lastUsable)
+                    if canReserve(index)
                     and partitionMfmaBase + index > entry["lastC1Mfma"]
                 ),
                 None,
@@ -377,7 +416,25 @@ def appendScaleTailStagingReads(
             if target is None:
                 return None
             directTargets.append((target, entry))
+            reserve(target, entry)
             searchFrom = target + 1
+
+        colocatedSearchFrom = start
+        for entry in colocatedDirectPlan:
+            target = next(
+                (
+                    index for index in range(
+                        colocatedSearchFrom, lastUsable)
+                    if canReserve(index, allowPressedDs=False)
+                    and partitionMfmaBase + index > entry["lastC1Mfma"]
+                ),
+                None,
+            )
+            if target is None:
+                return None
+            directTargets.append((target, entry))
+            reserve(target, entry)
+            colocatedSearchFrom = target + 1
         return stageTargets, directTargets
 
     # Preserve the square schedule's low-pressure empty-tail placement.  A
@@ -413,11 +470,18 @@ def appendScaleTailStagingReads(
     for target, entry in directTargets:
         read = copy.deepcopy(entry["readTemplate"])
         read.dst = vgpr(entry["canonicalVgpr"])
-        read.comment = (
-            "reload next C0 M-scale directly after prior value is dead; "
-            f"canonical=v{entry['canonicalVgpr']} "
-            f"last-use=M{entry['lastC1Mfma']}"
-        )
+        if getattr(read, "comment", "").startswith("SB "):
+            read.comment = (
+                "reload next C0 SB scale directly after prior value is dead; "
+                f"canonical=v{entry['canonicalVgpr']} "
+                f"last-use=M{entry['lastC1Mfma']}"
+            )
+        else:
+            read.comment = (
+                "reload next C0 M-scale directly after prior value is dead; "
+                f"canonical=v{entry['canonicalVgpr']} "
+                f"last-use=M{entry['lastC1Mfma']}"
+            )
         followers[target].append(read)
 
     items = list(prefix)
@@ -847,6 +911,216 @@ def _shadowPipeline(inst):
     if isinstance(inst, CommonInstruction):
         return "salu"
     return None
+
+
+def scheduleGlobalVmemCohorts(
+        schedule, orderedLoads, cohortSize=6, numPlacementRegions=3):
+    """Place one uniform VMEM epoch over the complete MFMA body.
+
+    Geometric partitions continue to own MFMA order, VGPRs, and logical
+    dependencies.  This transform operates after those partitions have been
+    assembled into one body, so placement-region boundaries are global MFMA
+    ranks rather than geometric-partition seams.
+
+    ``orderedLoads`` is the semantic request order captured from emitted GR
+    modules.  Each DTL request remains an atomic ``m0 + buffer_load`` bundle.
+    The A/B request count and configured cohort size must form exactly three
+    cohorts.  C0 appends its two scale requests to a short final cohort when
+    they fit; otherwise it retains them as a late subcohort.  Every request
+    stays on the same side of every VMEM wait, so the already-derived counted
+    waits remain valid.
+
+    Return a rebuilt module on success, or ``None`` when the guarded physical
+    signature is not present.
+    """
+    orderedLoads = list(orderedLoads)
+    if (
+            not (4 <= cohortSize <= 6)
+            or numPlacementRegions != 3
+            or len({id(load) for load in orderedLoads}) != len(orderedLoads)
+            or not all(_isBufferLoad(load) for load in orderedLoads)):
+        return None
+
+    items = list(schedule.flatitems())
+    mfmas = []
+    prefix = []
+    followers = []
+    currentRank = -1
+    for inst in items:
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            mfmas.append(inst)
+            followers.append([])
+            currentRank += 1
+        elif currentRank < 0:
+            prefix.append(inst)
+        else:
+            followers[currentRank].append(inst)
+
+    if len(mfmas) < numPlacementRegions * cohortSize:
+        return None
+
+    requestedIds = {id(load) for load in orderedLoads}
+    loadLocations = {}
+    for rank, group in enumerate(followers):
+        for index, inst in enumerate(group):
+            if id(inst) in requestedIds:
+                loadLocations[id(inst)] = (rank, index)
+    if set(loadLocations) != requestedIds:
+        return None
+    waitLoadPrefixes = {}
+    barrierLoadPrefixes = {}
+    targetLoadPrefix = []
+    for inst in items:
+        if id(inst) in requestedIds:
+            targetLoadPrefix.append(id(inst))
+        elif _isWaitCnt(inst) and inst.vlcnt >= 0:
+            waitLoadPrefixes[id(inst)] = tuple(targetLoadPrefix)
+        elif _isBarrier(inst):
+            barrierLoadPrefixes[id(inst)] = tuple(targetLoadPrefix)
+
+    originalRanks = {}
+    for load in orderedLoads:
+        rank, _loadIndex = loadLocations[id(load)]
+        originalRanks[id(load)] = rank
+
+    dataLoads = [
+        load for load in orderedLoads
+        if getattr(load, "comment", "").startswith(("A ", "B "))
+    ]
+    scaleLoads = [
+        load for load in orderedLoads
+        if getattr(load, "comment", "").startswith(("SA ", "SB "))
+    ]
+    if (
+            len(scaleLoads) not in (0, 2)
+            or orderedLoads != dataLoads + scaleLoads):
+        return None
+    cohorts = [
+        dataLoads[index:index + cohortSize]
+        for index in range(0, len(dataLoads), cohortSize)
+    ]
+    if (
+            len(cohorts) != numPlacementRegions
+            or any(len(cohort) != cohortSize for cohort in cohorts[:-1])
+            or not (0 < len(cohorts[-1]) <= cohortSize)):
+        return None
+    lateLoads = scaleLoads
+    if scaleLoads and len(cohorts[-1]) + len(scaleLoads) <= cohortSize:
+        cohorts[-1] = cohorts[-1] + scaleLoads
+        lateLoads = []
+
+    regionBoundaries = [
+        (len(mfmas) * index) // numPlacementRegions
+        for index in range(numPlacementRegions + 1)
+    ]
+    targetRanks = {}
+    for region, cohort in enumerate(cohorts):
+        originalStart = min(originalRanks[id(load)] for load in cohort)
+        start = max(regionBoundaries[region], originalStart)
+        if start + len(cohort) > regionBoundaries[region + 1]:
+            return None
+        for offset, load in enumerate(cohort):
+            targetRanks[id(load)] = start + offset
+    for load in lateLoads:
+        targetRanks[id(load)] = originalRanks[id(load)]
+
+    # Leave already-correct cohorts byte-for-byte in place.  Apart from
+    # avoiding gratuitous movement, this preserves dependency anchors such as
+    # the P1 barrier immediately before cohort 1.  Recover atomic DTL bundles
+    # only for requests whose global rank actually changes.
+    moved = [
+        (load, targetRanks[id(load)])
+        for load in orderedLoads
+        if originalRanks[id(load)] != targetRanks[id(load)]
+    ]
+    bundles = {}
+    removalIndices = {}
+    claimedSetups = set()
+    for load, _targetRank in moved:
+        rank, loadIndex = loadLocations[id(load)]
+        group = followers[rank]
+        setup = None
+        blocked = False
+        for candidateRank in range(rank, -1, -1):
+            candidateEnd = (
+                loadIndex - 1
+                if candidateRank == rank
+                else len(followers[candidateRank]) - 1
+            )
+            for candidateIndex in range(candidateEnd, -1, -1):
+                candidate = followers[candidateRank][candidateIndex]
+                if _isBufferLoad(candidate):
+                    blocked = True
+                    break
+                if _isM0Update(candidate):
+                    setup = (candidateRank, candidateIndex)
+                    break
+            if blocked or setup is not None:
+                break
+        if setup is None or setup in claimedSetups:
+            return None
+        setupRank, setupIndex = setup
+        claimedSetups.add(setup)
+        bundles[id(load)] = [
+            followers[setupRank][setupIndex],
+            group[loadIndex],
+        ]
+        removalIndices.setdefault(setupRank, set()).add(setupIndex)
+        removalIndices.setdefault(rank, set()).add(loadIndex)
+
+    for rank, indices in removalIndices.items():
+        followers[rank] = [
+            inst for index, inst in enumerate(followers[rank])
+            if index not in indices
+        ]
+
+    # Insert before existing followers so SALU m0 setup and VMEM issue lead a
+    # mixed shadow (in particular, before any LDS read or counted wait).
+    for load, rank in moved:
+        followers[rank][0:0] = bundles[id(load)]
+
+    rebuilt = Module(schedule.name)
+    for inst in prefix:
+        rebuilt.add(inst)
+    for mfma, group in zip(mfmas, followers):
+        rebuilt.add(mfma)
+        for inst in group:
+            rebuilt.add(inst)
+
+    # A counted wait must retain the same request membership. Reordering is
+    # allowed only when the wait count can leave the complete target suffix
+    # outstanding; otherwise request age is part of the proof.
+    targetLoadPrefix = []
+    rebuiltWaitPrefixes = {}
+    rebuiltBarrierPrefixes = {}
+    waitsById = {}
+    for inst in rebuilt.flatitems():
+        if id(inst) in requestedIds:
+            targetLoadPrefix.append(id(inst))
+        elif _isWaitCnt(inst) and inst.vlcnt >= 0:
+            rebuiltWaitPrefixes[id(inst)] = tuple(targetLoadPrefix)
+            waitsById[id(inst)] = inst
+        elif _isBarrier(inst):
+            rebuiltBarrierPrefixes[id(inst)] = tuple(targetLoadPrefix)
+    if set(rebuiltWaitPrefixes) != set(waitLoadPrefixes):
+        return None
+    for waitId, originalPrefix in waitLoadPrefixes.items():
+        rebuiltPrefix = rebuiltWaitPrefixes[waitId]
+        if set(rebuiltPrefix) != set(originalPrefix):
+            return None
+        if (
+                rebuiltPrefix != originalPrefix
+                and waitsById[waitId].vlcnt < len(rebuiltPrefix)):
+            return None
+    if set(rebuiltBarrierPrefixes) != set(barrierLoadPrefixes):
+        return None
+    for barrierId, originalPrefix in barrierLoadPrefixes.items():
+        if (
+                set(rebuiltBarrierPrefixes[barrierId])
+                != set(originalPrefix)):
+            return None
+
+    return rebuilt
 
 
 def _fitsInstructionTypeShadow(group, allowPressedDs=True):
