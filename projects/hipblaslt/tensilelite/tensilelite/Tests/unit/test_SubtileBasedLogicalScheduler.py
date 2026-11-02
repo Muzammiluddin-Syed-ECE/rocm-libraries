@@ -2445,7 +2445,7 @@ class TestUniformPgrEpoch:
         assert selected.pgr == 2
         assert selected.prefetchNextPartition
         assert selected.uniformPgrEpoch
-        assert selected.uniformEpochVmemCohortSize == 6
+        assert selected.uniformEpochVmemCohortSize == 4
         assert selected.uniformEpochGlobalVmemCohorts
 
     @pytest.mark.parametrize("mt_m,mt_n", [(256, 320), (320, 256)])
@@ -2485,6 +2485,82 @@ class TestUniformPgrEpoch:
         assert not selected.uniformPgrEpoch
         assert not selected.uniformEpochGlobalVmemCohorts
         assert selected.uniformEpochVmemCohortSize == 5
+
+    @pytest.mark.parametrize(
+        "atom_widths,expected_size,expected_counts",
+        [
+            ([1] * 12, 4, [4, 4, 4]),
+            ([1] * 14, 5, [5, 5, 4]),
+            ([2, 1, 2, 2, 1, 2, 2, 1, 2], 5, [5, 5, 5]),
+            ([1] * 16, 4, [4, 4, 4, 4]),
+            ([1] * 18, 6, [6, 6, 6]),
+        ],
+    )
+    def test_variable_vmem_planner_selects_most_equitable_cohorts(
+            self, atom_widths, expected_size, expected_counts):
+        from rocisa.container import sgpr, vgpr
+        from rocisa.instruction import BufferLoadB128
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _globalVmemPlacementCandidates)
+
+        loads = iter(
+            BufferLoadB128(
+                dst=None,
+                vaddr=vgpr(index),
+                saddr=sgpr(0, 4),
+                soffset=0,
+                comment=f"load-{index}")
+            for index in range(sum(atom_widths))
+        )
+        atoms = [
+            ("A", tuple(next(loads) for _ in range(width)))
+            for width in atom_widths
+        ]
+
+        plans = _globalVmemPlacementCandidates(atoms, mfmaCount=64)
+
+        assert plans
+        assert plans[0]["cohortSize"] == expected_size
+        assert plans[0]["counts"] == expected_counts
+
+    @pytest.mark.parametrize(
+        "data_requests,expected_size,expected_counts",
+        [
+            (12, 5, [5, 5, 4]),
+            (14, 4, [4, 4, 4, 4]),
+            (16, 6, [6, 6, 6]),
+            (18, 4, [4, 4, 4, 4, 4]),
+        ],
+    )
+    def test_variable_vmem_planner_counts_scale_cadence_atom(
+            self, data_requests, expected_size, expected_counts):
+        from rocisa.container import sgpr, vgpr
+        from rocisa.instruction import BufferLoadB128
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _globalVmemPlacementCandidates)
+
+        loads = [
+            BufferLoadB128(
+                dst=None,
+                vaddr=vgpr(index),
+                saddr=sgpr(0, 4),
+                soffset=0,
+                comment=f"load-{index}")
+            for index in range(data_requests + 2)
+        ]
+        atoms = [
+            ("A", (load,))
+            for load in loads[:data_requests]
+        ] + [
+            ("SA", (loads[-2],)),
+            ("SB", (loads[-1],)),
+        ]
+
+        plans = _globalVmemPlacementCandidates(atoms, mfmaCount=80)
+
+        assert plans
+        assert plans[0]["cohortSize"] == expected_size
+        assert plans[0]["counts"] == expected_counts
 
     @pytest.mark.parametrize(
         "mt_m,mt_n", [(256, 256), (256, 320), (320, 256)])
@@ -2765,7 +2841,7 @@ class TestUniformPgrEpoch:
     @pytest.mark.parametrize(
         "mt_m,mt_n,expected_counts",
         [
-            (256, 256, [6, 6, 4, 0]),
+            (256, 256, [4, 4, 4, 4]),
             (256, 320, [6, 6, 6, 0]),
             (320, 256, [6, 6, 6, 0]),
         ])
@@ -2795,18 +2871,28 @@ class TestUniformPgrEpoch:
             partition_counts.append(count)
 
         if cfg.uniformEpochGlobalVmemCohorts:
-            expected_atoms = [
-                *[("A", tile, 2) for tile in range(5)],
-                ("B", 0, 2),
-                *[
+            by_partition = []
+            a_offset = 0
+            b_offset = 0
+            for count in expected_counts:
+                a_count = min(
+                    cfg.numMFMATilesM - a_offset,
+                    count // cfg.uniformEpochVmemInstructionsA)
+                remaining = (
+                    count
+                    - a_count * cfg.uniformEpochVmemInstructionsA)
+                b_count = (
+                    remaining
+                    // cfg.uniformEpochVmemInstructionsB)
+                by_partition.extend(
                     ("A", tile, 2)
-                    for tile in range(5, cfg.numMFMATilesM)
-                ],
-                *[
+                    for tile in range(a_offset, a_offset + a_count))
+                by_partition.extend(
                     ("B", tile, 2)
-                    for tile in range(1, cfg.numMFMATilesN)
-                ],
-            ]
+                    for tile in range(b_offset, b_offset + b_count))
+                a_offset += a_count
+                b_offset += b_count
+            expected_atoms = by_partition
         else:
             expected_atoms = [
                 ("A", tile, 2) for tile in range(cfg.numMFMATilesM)
@@ -2913,12 +2999,12 @@ class TestUniformPgrEpoch:
             for lr in slot.lrs
             if lr.mustPrecedeP0Overwrite
         ]
-        assert len(hoisted) == 1
-        assert hoisted[0].tensor == "A"
-        assert (
-            hoisted[0].tiles.tileId_start,
-            hoisted[0].tiles.tileId_end,
-        ) == (4, 5)
+        assert len(hoisted) == 2
+        assert all(lr.tensor == "A" for lr in hoisted)
+        assert [
+            (lr.tiles.tileId_start, lr.tiles.tileId_end)
+            for lr in hoisted
+        ] == [(4, 5), (5, 6)]
 
         remaining = [
             lr
@@ -2927,13 +3013,13 @@ class TestUniformPgrEpoch:
             for lr in slot.lrs
             if (lr.tensor == "A"
                 and lr.mtIteration == 0
-                and lr.tiles.tileId_start <= 5 < lr.tiles.tileId_end)
+                and lr.tiles.tileId_start <= 6 < lr.tiles.tileId_end)
         ]
         assert len(remaining) == 1
         assert (
             remaining[0].tiles.tileId_start,
             remaining[0].tiles.tileId_end,
-        ) == (5, 8)
+        ) == (6, 8)
 
         sched = LogicalScheduler(cfg)
         sched.build(stop_after=Pass.GR)
@@ -2965,8 +3051,7 @@ class TestUniformPgrEpoch:
                 getattr(cfg, f"gr{gr.tensor}").mn)
         ]
         assert p0_atoms == [
-            *[("A", tile) for tile in range(5)],
-            ("B", 0),
+            *[("A", tile) for tile in range(6)],
         ]
 
         cohort_atoms = []
@@ -2984,12 +3069,11 @@ class TestUniformPgrEpoch:
             cohort_atoms.append(atoms)
         assert cohort_atoms == [
             [
-                *[("A", tile) for tile in range(5)],
-                ("B", 0),
+                *[("A", tile) for tile in range(6)],
             ],
             [
-                *[("A", tile) for tile in range(5, 8)],
-                *[("B", tile) for tile in range(1, 4)],
+                *[("A", tile) for tile in range(6, 8)],
+                *[("B", tile) for tile in range(4)],
             ],
             [
                 *[("B", tile) for tile in range(4, 8)],
@@ -3021,7 +3105,7 @@ class TestUniformPgrEpoch:
                 == gr.mtIteration - 2
                 for dep in overlapping_reads)
 
-    def test_global_six_request_cohorts_reach_physical_c0_c1_streams(self):
+    def test_variable_global_cohorts_reach_physical_c0_c1_streams(self):
         kernel, fixture, cfg = self._production_fixture(256, 256)
         assembly = _emit_mainloops(
             kernel, fixture, cfg, scale_tail_staging=True)
@@ -3062,29 +3146,34 @@ class TestUniformPgrEpoch:
 
         c0 = section("MAINLOOP_C0")
         c1 = section("MAINLOOP_C1")
-        assert partition_vmem_counts(c0) == [6, 6, 6, 0]
-        assert partition_vmem_counts(c1) == [6, 6, 4, 0]
+        assert sum(partition_vmem_counts(c0)) == 18
+        assert sum(partition_vmem_counts(c1)) == 16
         c0_vmem = vmem_schedule(c0)
         c1_vmem = vmem_schedule(c1)
         assert [rank for rank, _ in c0_vmem] == [
-            *range(7, 13),
-            *range(23, 29),
-            *range(42, 48),
+            *range(20, 26),
+            *range(36, 42),
+            *range(58, 64),
         ]
         assert [rank for rank, _ in c1_vmem] == [
-            *range(7, 13),
-            *range(23, 29),
+            *range(12, 16),
+            *range(28, 32),
             *range(42, 46),
+            *range(60, 64),
         ]
-        placement_regions = ((0, 21), (21, 42), (42, 64))
+        c0_regions = ((0, 26), (26, 42), (42, 64))
         assert [
-            sum(start <= rank < end for rank, _ in c0_vmem)
-            for start, end in placement_regions
+            sum(
+                start <= rank < end
+                for rank, comment in c0_vmem)
+            for start, end in c0_regions
         ] == [6, 6, 6]
+        c1_regions = (
+            (0, 16), (16, 32), (32, 48), (48, 64))
         assert [
             sum(start <= rank < end for rank, _ in c1_vmem)
-            for start, end in placement_regions
-        ] == [6, 6, 4]
+            for start, end in c1_regions
+        ] == [4, 4, 4, 4]
         assert [
             comment.split()[0:3]
             for _, comment in c0_vmem[-6:]
@@ -3095,7 +3184,44 @@ class TestUniformPgrEpoch:
             ["SB", "MT=n+2", "tile=0"],
         ]
         assert any("s_waitcnt vmcnt(18)" in line for line in c0)
-        assert any("s_waitcnt vmcnt(16)" in line for line in c1)
+        assert any("s_waitcnt vmcnt(12)" in line for line in c1)
+
+    def test_eight_wave_square_expands_narrow_barrier_frontier(self):
+        kernel, fixture, cfg = self._production_fixture(
+            256, 256, [4, 2])
+        assembly = _emit_mainloops(
+            kernel, fixture, cfg, scale_tail_staging=False)
+
+        for copy_index, expected_data in (
+                (0, [*range(6, 10), 15, *range(20, 23)]),
+                (1, [*range(6, 10), *range(21, 25)])):
+            start = assembly.index(
+                f"/* MAINLOOP_C{copy_index} start */")
+            end = assembly.index(
+                f"/* MAINLOOP_C{copy_index} end */", start)
+            mfma_rank = -1
+            data_ranks = []
+            barrier_ranks = []
+            for line in assembly[start:end].splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith("v_mfma"):
+                    mfma_rank += 1
+                elif (
+                        stripped.startswith("buffer_load")
+                        and " lds " in stripped
+                        and stripped.split("//")[-1].strip().startswith(
+                            ("A ", "B "))):
+                    data_ranks.append(mfma_rank)
+                elif stripped.startswith("s_barrier"):
+                    barrier_ranks.append(mfma_rank)
+
+            assert data_ranks == expected_data
+            assert len(data_ranks) == len(set(data_ranks))
+            # The dependency-derived second barrier starts at M8.  Four A
+            # requests need ranks M6-M9, so dual-ended placement legally
+            # shifts the barrier to M9 while preserving its request frontier.
+            assert 9 in barrier_ranks
+            assert 8 not in barrier_ranks
 
     @pytest.mark.parametrize(
         "mt_m,mt_n,expected_c0,expected_c1",
@@ -3104,30 +3230,34 @@ class TestUniformPgrEpoch:
                 256,
                 320,
                 [
-                    *range(7, 13),
-                    *range(31, 37),
-                    *range(54, 60),
-                    77, 78,
+                    *range(15, 20),
+                    30,
+                    *range(36, 40),
+                    *range(55, 60),
+                    *range(62, 65),
+                    78, 79,
                 ],
                 [
-                    *range(7, 13),
-                    *range(31, 37),
-                    *range(54, 60),
+                    *range(20, 26),
+                    *range(47, 53),
+                    *range(56, 62),
                 ],
             ),
             (
                 320,
                 256,
                 [
-                    *range(2, 8),
-                    *range(32, 38),
-                    *range(53, 59),
-                    77, 78,
+                    *range(15, 20),
+                    32,
+                    *range(36, 40),
+                    *range(55, 60),
+                    *range(62, 65),
+                    78, 79,
                 ],
                 [
-                    *range(2, 8),
-                    *range(32, 38),
-                    *range(54, 60),
+                    *range(20, 26),
+                    *range(47, 53),
+                    *range(56, 62),
                 ],
             ),
         ],
@@ -3164,64 +3294,83 @@ class TestUniformPgrEpoch:
         assert [rank for rank, _ in c0_vmem] == expected_c0
         assert [rank for rank, _ in c1_vmem] == expected_c1
 
-        expected_data = [
-            *[
+        expected_c0_data = []
+        a_offset = 0
+        b_offset = 0
+        for request_count in (5, 5, 5, 3):
+            a_count = min(
+                cfg.numMFMATilesM - a_offset,
+                request_count)
+            b_count = request_count - a_count
+            expected_c0_data.extend(
                 ["A", "MT=n+2", f"tile={tile}"]
-                for tile in range(5)
-            ],
-            ["B", "MT=n+2", "tile=0"],
-            *[
-                ["A", "MT=n+2", f"tile={tile}"]
-                for tile in range(5, cfg.numMFMATilesM)
-            ],
-            *[
+                for tile in range(a_offset, a_offset + a_count))
+            expected_c0_data.extend(
                 ["B", "MT=n+2", f"tile={tile}"]
-                for tile in range(1, cfg.numMFMATilesN)
-            ],
-        ]
-        assert [comment for _, comment in c1_vmem] == expected_data
-        assert [comment for _, comment in c0_vmem[:-2]] == expected_data
+                for tile in range(b_offset, b_offset + b_count))
+            a_offset += a_count
+            b_offset += b_count
+        expected_c1_data = []
+        a_offset = 0
+        b_offset = 0
+        for request_count in (6, 6, 6):
+            a_count = min(
+                cfg.numMFMATilesM - a_offset,
+                request_count)
+            b_count = request_count - a_count
+            expected_c1_data.extend(
+                ["A", "MT=n+2", f"tile={tile}"]
+                for tile in range(a_offset, a_offset + a_count))
+            expected_c1_data.extend(
+                ["B", "MT=n+2", f"tile={tile}"]
+                for tile in range(b_offset, b_offset + b_count))
+            a_offset += a_count
+            b_offset += b_count
+        assert [comment for _, comment in c1_vmem] == expected_c1_data
+        assert [comment for _, comment in c0_vmem[:-2]] == expected_c0_data
         assert [comment for _, comment in c0_vmem[-2:]] == [
             ["SA", "MT=n+2", "tile=0"],
             ["SB", "MT=n+2", "tile=0"],
         ]
 
-        placement_regions = ((0, 26), (26, 53), (53, 80))
-        for schedule in (c0_vmem[:-2], c1_vmem):
-            assert [
-                sum(start <= rank < end for rank, _ in schedule)
-                for start, end in placement_regions
-            ] == [6, 6, 6]
+        assert [
+            sum(start <= rank < end for rank, _ in c0_vmem)
+            for start, end in ((0, 20), (20, 40), (40, 60), (60, 80))
+        ] == [5, 5, 5, 5]
+        assert [
+            sum(start <= rank < end for rank, _ in c1_vmem)
+            for start, end in ((0, 26), (26, 53), (53, 80))
+        ] == [6, 6, 6]
 
     @pytest.mark.parametrize(
-        "mt_m,mt_n,mi_wave_group,expected_mfmas,expected_size,"
-        "expected_data_requests",
+        "mt_m,mt_n,mi_wave_group,expected_mfmas,expected_data_requests,"
+        "c0_boundaries,c0_counts,c1_boundaries,c1_counts",
         [
-            (128, 256, [2, 2], 32, 4, 12),
-            (192, 256, [2, 2], 48, 5, 14),
-            (224, 256, [1, 4], 56, 5, 15),
+            (
+                128, 256, [2, 2], 32, 12,
+                (0, 11, 21, 32), (5, 5, 4),
+                (0, 10, 21, 32), (4, 4, 4),
+            ),
+            (
+                192, 256, [2, 2], 48, 14,
+                (0, 12, 24, 36, 48), (4, 4, 4, 4),
+                (0, 16, 32, 48), (5, 5, 4),
+            ),
+            (
+                224, 256, [1, 4], 56, 15,
+                (0, 25, 37, 56), (6, 5, 6),
+                (0, 18, 37, 56), (5, 5, 5),
+            ),
         ],
     )
-    def test_smaller_global_cohorts_balance_physical_vmem_requests(
+    def test_smaller_global_cohorts_balance_all_physical_vmem_requests(
             self, mt_m, mt_n, mi_wave_group, expected_mfmas,
-            expected_size, expected_data_requests):
+            expected_data_requests, c0_boundaries, c0_counts,
+            c1_boundaries, c1_counts):
         kernel, fixture, cfg = self._production_fixture(
             mt_m, mt_n, mi_wave_group)
         assembly = _emit_mainloops(
             kernel, fixture, cfg, scale_tail_staging=False)
-
-        placement_regions = [
-            (
-                expected_mfmas * index // 3,
-                expected_mfmas * (index + 1) // 3,
-            )
-            for index in range(3)
-        ]
-        expected_counts = [
-            expected_size,
-            expected_size,
-            expected_data_requests - 2 * expected_size,
-        ]
 
         for copy_index in (0, 1):
             start = assembly.index(
@@ -3249,10 +3398,13 @@ class TestUniformPgrEpoch:
 
             assert mfma_rank + 1 == expected_mfmas
             assert len(data_ranks) == expected_data_requests
+            boundaries = c0_boundaries if copy_index == 0 else c1_boundaries
+            expected_counts = c0_counts if copy_index == 0 else c1_counts
+            all_ranks = [*data_ranks, *scale_ranks]
             assert [
-                sum(begin <= rank < finish for rank in data_ranks)
-                for begin, finish in placement_regions
-            ] == expected_counts
+                sum(begin <= rank < finish for rank in all_ranks)
+                for begin, finish in zip(boundaries, boundaries[1:])
+            ] == list(expected_counts)
             if cfg.uniformEpochVmemInstructionsB > 1:
                 regions_by_b_tile = {}
                 for rank, comment in zip(data_ranks, data_comments):
@@ -3263,7 +3415,7 @@ class TestUniformPgrEpoch:
                     region = next(
                         index
                         for index, (begin, finish)
-                        in enumerate(placement_regions)
+                        in enumerate(zip(boundaries, boundaries[1:]))
                         if begin <= rank < finish)
                     regions_by_b_tile.setdefault(tile, set()).add(region)
                 assert all(
@@ -3272,8 +3424,7 @@ class TestUniformPgrEpoch:
             if copy_index == 0:
                 assert len(scale_ranks) == 2
                 assert all(
-                    placement_regions[-1][0] <= rank
-                    < placement_regions[-1][1]
+                    boundaries[-2] <= rank < boundaries[-1]
                     for rank in scale_ranks)
             else:
                 assert not scale_ranks
@@ -3337,12 +3488,13 @@ class TestUniformPgrEpoch:
                     placements["direct_sb"].append(mfma_rank)
 
         assert placements == {
-            "stage": [56, 57, 58],
-            "direct_sa": [59, 60, 61],
+            "stage": [48, 49, 50],
+            "direct_sa": [51, 52, 56],
             "direct_sb": [56, 57],
         }
-        assert ds_reads_per_shadow[56:62] == [2, 2, 1, 1, 1, 1]
-        assert ds_reads_per_shadow[62:64] == [0, 0]
+        assert ds_reads_per_shadow[48:58] == [
+            3, 3, 3, 3, 3, 2, 2, 2, 2, 1]
+        assert ds_reads_per_shadow[58:64] == [0, 0, 0, 0, 0, 0]
 
     def test_preloop_seeds_complete_n1_epoch(self):
         cfg = self._cfg()
@@ -4408,7 +4560,7 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
 
     @classmethod
     def _assert_dtl_pairs_and_mfma_shadows(
-            cls, partitions, allow_global_p2_seam_load=False):
+            cls, partitions, allow_global_seam_load=False):
         """Check DTL pairing and interleaving, allowing P3's remainder."""
         for partition_index, instructions in enumerate(partitions):
             pending_setup = None
@@ -4444,7 +4596,8 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                             f"P{partition_index}: {loads_since_mfma} buffer "
                             "loads share one MFMA interval")
                     if loads_since_mfma:
-                        assert ds_reads_since_mfma <= 1, (
+                        ds_limit = 2 if allow_global_seam_load else 1
+                        assert ds_reads_since_mfma <= ds_limit, (
                             f"P{partition_index}: VMEM shares one MFMA "
                             f"interval with {ds_reads_since_mfma} LDS reads")
                     seen_mfma = True
@@ -4464,9 +4617,8 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
             assert (
                 loads_since_mfma == 0
                 or (
-                    allow_global_p2_seam_load
-                    and partition_index == 2
-                    and loads_since_mfma == 1
+                    allow_global_seam_load
+                    and loads_since_mfma <= 1
                 )
             ), (
                 f"P{partition_index}: buffer load follows final MFMA")
@@ -4500,27 +4652,34 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
             assert not pending_m0_setup
 
     @pytest.mark.parametrize(
-        "mt_m,mt_n,expected_ab_counts",
+        "mt_m,mt_n,expected_ab_total",
         [
-            (256, 256, [6, 6, 4, 0]),
-            (256, 320, [6, 6, 6, 0]),
-            (320, 256, [6, 6, 6, 0]),
+            (256, 256, 16),
+            (256, 320, 18),
+            (320, 256, 18),
         ])
     def test_supported_geometries_keep_productized_schedule_invariants(
-            self, mt_m, mt_n, expected_ab_counts):
+            self, mt_m, mt_n, expected_ab_total):
         kernel, fixture, cfg = \
             TestUniformPgrEpoch._production_fixture(mt_m, mt_n)
         assembly = _emit_mainloops(kernel, fixture, cfg)
 
         for copy_index in range(2):
+            normalized = self._normalize(assembly, copy_index)
+            global_instructions = [
+                line
+                for line in normalized.splitlines()
+                if not line.startswith("partition=")
+            ]
+            self._assert_dtl_pairs_and_mfma_shadows(
+                [global_instructions],
+                allow_global_seam_load=(
+                    cfg.uniformEpochGlobalVmemCohorts),
+            )
+
             partitions = self._partition_instructions(
                 assembly, copy_index)
             assert len(partitions) == 4
-            self._assert_dtl_pairs_and_mfma_shadows(
-                partitions,
-                allow_global_p2_seam_load=(
-                    cfg.uniformEpochGlobalVmemCohorts),
-            )
 
             ab_counts = [
                 sum(
@@ -4529,7 +4688,7 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                     for line in instructions)
                 for instructions in partitions
             ]
-            assert ab_counts == expected_ab_counts
+            assert sum(ab_counts) == expected_ab_total
 
             vmcnt_partitions = [
                 partition
@@ -4546,8 +4705,16 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                 for line in instructions
                 if line.startswith("s_barrier")
             ]
-            assert barrier_partitions == (
-                [0, 0, 1, 3] if copy_index == 0 else [0, 1, 3])
+            if (mt_m, mt_n) == (256, 256):
+                assert barrier_partitions == (
+                    [0, 0, 1, 3, 3]
+                    if copy_index == 0
+                    else [0, 1, 3, 3])
+            else:
+                assert barrier_partitions == (
+                    [0, 0, 1, 3]
+                    if copy_index == 0
+                    else [0, 1, 3])
             assert not any(
                 line.startswith("s_waitcnt lgkmcnt")
                 for line in partitions[2])

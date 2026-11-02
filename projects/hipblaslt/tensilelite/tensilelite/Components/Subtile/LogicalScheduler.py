@@ -25,6 +25,7 @@ from __future__ import annotations
 from ...ExecutionPolicy import hasStaticAssignment
 from dataclasses import dataclass, field
 from enum import IntEnum
+from functools import lru_cache
 from typing import Callable, ClassVar, Dict, List, Optional, Tuple, Union
 from bisect import bisect_left
 import copy
@@ -1131,17 +1132,16 @@ class LogicalScheduler:
                     slot.lrs[index:index + 1] = remaining
 
     def _order_uniform_epoch_global_vmem_atoms(self, atoms):
-        """Order one complete epoch into three geometry-derived cohorts.
+        """Order one complete epoch into geometry-derived VMEM cohorts.
 
-        Preserve each tensor's tile order and reserve at least B0 in the first
-        cohort.  This avoids pulling the next A overwrite prerequisite into an
-        already-dense P0 while keeping the first cohort full.  Within each
-        cohort, A requests precede B requests.  Weighted logical atoms must
-        terminate at a cohort boundary rather than straddling a barrier.
+        Preserve each tensor's tile order while filling C-sized cohorts plus
+        one tail.  Within each cohort, A requests precede B requests.  Weighted
+        logical atoms must terminate at a cohort boundary rather than
+        straddling a placement-window frontier.
 
         SA/SB are appended only when both fit in the short final data cohort.
         Otherwise they remain a separate late pair.  Reject any atom topology
-        that does not satisfy this bounded three-region policy.
+        that cannot satisfy the selected 4-, 5-, or 6-request policy.
         """
         if not self.config.uniformEpochGlobalVmemCohorts:
             return atoms
@@ -1156,37 +1156,32 @@ class LogicalScheduler:
         data_request_count = (
             len(by_tensor['A']) * weight_a
             + len(by_tensor['B']) * weight_b)
+        full_cohorts, tail = divmod(data_request_count, cohort_size)
+        target_request_counts = [cohort_size] * full_cohorts
+        if tail:
+            target_request_counts.append(tail)
         if (
                 not (4 <= cohort_size <= 6)
-                or not (
-                    2 * cohort_size
-                    < data_request_count
-                    <= 3 * cohort_size)
+                or not target_request_counts
                 or not by_tensor['A']
                 or not by_tensor['B']
                 or len(by_tensor['SA']) != 1
                 or len(by_tensor['SB']) != 1
                 or sum(map(len, by_tensor.values())) != len(atoms)):
             raise ValueError(
-                "global VMEM cohorts require three 4-6 request data "
-                "cohorts plus one SA and one SB request")
+                "global VMEM cohorts require 4-6 request data cohorts "
+                "plus one SA and one SB request")
 
-        target_request_counts = [
-            cohort_size,
-            cohort_size,
-            data_request_count - 2 * cohort_size,
-        ]
-
+        @lru_cache(maxsize=None)
         def choose_cohort_shapes(
                 cohort_index, remaining_a, remaining_b):
             if cohort_index == len(target_request_counts):
                 return [] if remaining_a == 0 and remaining_b == 0 else None
             target = target_request_counts[cohort_index]
-            minimum_b = 1 if cohort_index == 0 else 0
             candidates = [
                 (a_count, b_count)
                 for a_count in range(remaining_a + 1)
-                for b_count in range(minimum_b, remaining_b + 1)
+                for b_count in range(remaining_b + 1)
                 if (
                     a_count * weight_a + b_count * weight_b
                     == target)
@@ -1207,7 +1202,7 @@ class LogicalScheduler:
             0, len(by_tensor['A']), len(by_tensor['B']))
         if cohort_shapes is None:
             raise ValueError(
-                "global VMEM logical atoms cannot form three unsplit cohorts")
+                "global VMEM logical atoms cannot form unsplit cohorts")
 
         ordered_data = []
         a_offset = 0
@@ -1969,8 +1964,15 @@ class LogicalScheduler:
             for atom in atoms
             if atom[0] in ('A', 'B')
         )
+        global_data_cohorts = (
+            global_data_requests + cfg.uniformEpochVmemCohortSize - 1
+        ) // cfg.uniformEpochVmemCohortSize
+        global_final_data_cohort = (
+            global_data_requests % cfg.uniformEpochVmemCohortSize
+            or cfg.uniformEpochVmemCohortSize
+        )
         global_scales_fit_final_cohort = (
-            global_data_requests - 2 * cfg.uniformEpochVmemCohortSize + 2
+            global_final_data_cohort + 2
             <= cfg.uniformEpochVmemCohortSize
         )
         for i, (tensor, mt_val, ts, te, ks, ke, last) in enumerate(atoms):
@@ -1988,7 +1990,7 @@ class LogicalScheduler:
                 if (
                         tensor in ('SA', 'SB')
                         and not global_scales_fit_final_cohort):
-                    rel = min(3, len(dist_slots) - 1)
+                    rel = min(global_data_cohorts, len(dist_slots) - 1)
                 else:
                     rel = min(
                         global_request_offset
@@ -4480,18 +4482,59 @@ class LogicalScheduler:
         first_cell = None
         emittedMfmaCount = 0
         globalVmemLoads = None
+        globalVmemLoadAtoms = None
         if (
                 schedule
                 and self.config.uniformEpochGlobalVmemCohorts
                 and label.startswith("MAINLOOP_C")):
+            globalVmemLoadAtoms = []
+            for partition in emitted_3d:
+                for em_list in partition:
+                    for emitted in em_list:
+                        if emitted.opType != "gr":
+                            continue
+                        if emitted.source.tensor not in (
+                                "A", "B", "SA", "SB", "MXSA", "MXSB"):
+                            continue
+                        assert (
+                            len(emitted.instructionMetadata)
+                            == len(emitted.instructions)
+                        ), "GR instruction metadata must cover every instruction"
+                        index = 0
+                        while index < len(emitted.instructions):
+                            _firstConsumer, requestSize = \
+                                emitted.instructionMetadata[index]
+                            assert requestSize > 0
+                            requestEnd = index + requestSize
+                            assert requestEnd <= len(emitted.instructions)
+                            assert all(
+                                metadata[1] == requestSize
+                                for metadata in emitted.instructionMetadata[
+                                    index:requestEnd]
+                            ), "GR request metadata must preserve atom boundaries"
+                            loads = tuple(
+                                inst
+                                for inst in emitted.instructions[
+                                    index:requestEnd]
+                                if isinstance(inst, GlobalReadInstruction)
+                            )
+                            if loads:
+                                tensor = {
+                                    "MXSA": "SA",
+                                    "MXSB": "SB",
+                                }.get(
+                                    emitted.source.tensor,
+                                    emitted.source.tensor,
+                                )
+                                globalVmemLoadAtoms.append((
+                                    tensor,
+                                    loads,
+                                ))
+                            index = requestEnd
             globalVmemLoads = [
-                inst
-                for partition in emitted_3d
-                for em_list in partition
-                for emitted in em_list
-                if emitted.opType == "gr"
-                for inst in emitted.instructions
-                if isinstance(inst, GlobalReadInstruction)
+                load
+                for _tensor, loads in globalVmemLoadAtoms
+                for load in loads
             ]
 
         def mfma_count(em_list):
@@ -4636,7 +4679,7 @@ class LogicalScheduler:
             globalSchedule = scheduleGlobalVmemCohorts(
                 module,
                 globalVmemLoads,
-                cohortSize=self.config.uniformEpochVmemCohortSize,
+                orderedLoadAtoms=globalVmemLoadAtoms,
             )
             assert globalSchedule is not None, \
                 "global VMEM cohorts did not match a supported loop shape"

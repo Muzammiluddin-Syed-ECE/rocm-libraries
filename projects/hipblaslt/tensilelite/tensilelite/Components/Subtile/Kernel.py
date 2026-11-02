@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
-from functools import singledispatch
+from functools import lru_cache, singledispatch
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 from .LogicalScheduler import (
       LogicalScheduler, SchedulerConfig as MFMASchedulerConfig,
@@ -1406,13 +1406,14 @@ def _supportsUniformPgrEpoch(
 
 def _deriveGlobalVmemCohortSize(
     m, n, grA, grB, vmemInstructionsA=1, vmemInstructionsB=1):
-  """Choose three balanced data-request cohorts for a supported geometry.
+  """Choose the most equitable 4-, 5-, or 6-request VMEM cohort size.
 
-  The physical scheduler currently exposes three global placement regions.
-  Select the smallest cohort in [4, 6] that can hold one third of the complete
-  A/B epoch, and reject geometries that would not form exactly three non-empty
-  cohorts.  Rejection is deliberate: the caller retains the established
-  partition-local schedule for geometries outside this bounded policy.
+  A candidate size C splits the complete physical A/B request stream into
+  C-sized cohorts plus one tail.  The number of resulting cohorts later
+  defines the number of balanced MFMA placement windows.  Weighted logical
+  atoms must fit a cohort without splitting.  Rank candidates by cohort-size
+  range, then variance, preferring the smaller cohort on an exact tie to retain
+  more inter-cohort VMEM spacing.
   """
   if (
       grA is None or grB is None
@@ -1425,36 +1426,46 @@ def _deriveGlobalVmemCohortSize(
   dataRequests = (
       atomsA * vmemInstructionsA
       + atomsB * vmemInstructionsB)
-  cohortSize = max(4, min(6, (dataRequests + 2) // 3))
-  if not (2 * cohortSize < dataRequests <= 3 * cohortSize):
-      return None
 
-  targets = (
-      cohortSize,
-      cohortSize,
-      dataRequests - 2 * cohortSize,
-  )
+  candidates = []
+  for cohortSize in range(4, 7):
+      full, tail = divmod(dataRequests, cohortSize)
+      targets = [cohortSize] * full
+      if tail:
+          targets.append(tail)
+      if not targets:
+          continue
 
-  def canPartition(targetIndex, remainingA, remainingB):
-      if targetIndex == len(targets):
-          return remainingA == 0 and remainingB == 0
-      minimumB = 1 if targetIndex == 0 else 0
-      return any(
-          canPartition(
-              targetIndex + 1,
-              remainingA - countA,
-              remainingB - countB)
-          for countA in range(remainingA + 1)
-          for countB in range(minimumB, remainingB + 1)
-          if (
-              countA * vmemInstructionsA
-              + countB * vmemInstructionsB
-              == targets[targetIndex])
-      )
+      @lru_cache(maxsize=None)
+      def canPartition(targetIndex, remainingA, remainingB):
+          if targetIndex == len(targets):
+              return remainingA == 0 and remainingB == 0
+          return any(
+              canPartition(
+                  targetIndex + 1,
+                  remainingA - countA,
+                  remainingB - countB)
+              for countA in range(remainingA + 1)
+              for countB in range(remainingB + 1)
+              if (
+                  countA * vmemInstructionsA
+                  + countB * vmemInstructionsB
+                  == targets[targetIndex])
+          )
 
-  if not canPartition(0, atomsA, atomsB):
-      return None
-  return cohortSize
+      if not canPartition(0, atomsA, atomsB):
+          continue
+      numCohorts = len(targets)
+      varianceNumerator = sum(
+          (count * numCohorts - dataRequests) ** 2
+          for count in targets)
+      candidates.append((
+          max(targets) - min(targets),
+          varianceNumerator,
+          cohortSize,
+      ))
+
+  return min(candidates)[2] if candidates else None
 
 
 def mainLoop(writer, kernel):

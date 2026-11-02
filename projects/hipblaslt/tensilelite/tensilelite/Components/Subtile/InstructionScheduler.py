@@ -913,33 +913,115 @@ def _shadowPipeline(inst):
     return None
 
 
-def scheduleGlobalVmemCohorts(
-        schedule, orderedLoads, cohortSize=6, numPlacementRegions=3):
-    """Place one uniform VMEM epoch over the complete MFMA body.
+def _globalVmemPlacementCandidates(
+        orderedLoadAtoms, mfmaCount, cohortSizes=(4, 5, 6)):
+    """Return equity-ranked variable VMEM placement-window plans.
 
-    Geometric partitions continue to own MFMA order, VGPRs, and logical
-    dependencies.  This transform operates after those partitions have been
-    assembled into one body, so placement-region boundaries are global MFMA
-    ranks rather than geometric-partition seams.
+    ``orderedLoadAtoms`` contains ``(tensor, loads)`` pairs in semantic issue
+    order.  One atom may emit multiple physical VMEM instructions and must not
+    straddle a placement window.  The C0 SA/SB requests form one cadence atom:
+    either both fit in the preceding cohort or both start the next cohort.
 
-    ``orderedLoads`` is the semantic request order captured from emitted GR
-    modules.  Each DTL request remains an atomic ``m0 + buffer_load`` bundle.
-    The A/B request count and configured cohort size must form exactly three
-    cohorts.  C0 appends its two scale requests to a short final cohort when
-    they fit; otherwise it retains them as a late subcohort.  Every request
-    stays on the same side of every VMEM wait, so the already-derived counted
-    waits remain valid.
-
-    Return a rebuilt module on success, or ``None`` when the guarded physical
-    signature is not present.
+    A candidate cohort size greedily chunks the ordered atoms up to that
+    physical-request limit.  Its number of resulting cohorts, ``V``, defines
+    ``V`` balanced windows over the complete MFMA body.  Candidates are ranked
+    by request-count range, then variance, preferring the smaller cohort on an
+    exact equity tie to retain more inter-cohort VMEM spacing.  Physical
+    dependency/frontier feasibility is checked by the relocation pass.
     """
+    atoms = [
+        (tensor, tuple(loads))
+        for tensor, loads in orderedLoadAtoms
+        if loads
+    ]
+    if (
+            mfmaCount <= 0
+            or not atoms
+            or any(
+                not all(_isBufferLoad(load) for load in loads)
+                for _tensor, loads in atoms)):
+        return []
+
+    # Scale A/B advance on one cadence and should not be split merely because
+    # one request happens to fill the preceding data cohort.
+    if (
+            len(atoms) >= 2
+            and atoms[-2][0] == "SA"
+            and atoms[-1][0] == "SB"):
+        atoms[-2:] = [(
+            "SAB",
+            atoms[-2][1] + atoms[-1][1],
+        )]
+
+    plans = []
+    for cohortSize in sorted(set(cohortSizes)):
+        if not 4 <= cohortSize <= 6:
+            continue
+        cohorts = []
+        current = []
+        currentCount = 0
+        valid = True
+        for atom in atoms:
+            atomCount = len(atom[1])
+            if atomCount > cohortSize:
+                valid = False
+                break
+            if current and currentCount + atomCount > cohortSize:
+                cohorts.append(current)
+                current = []
+                currentCount = 0
+            current.append(atom)
+            currentCount += atomCount
+        if not valid:
+            continue
+        if current:
+            cohorts.append(current)
+
+        counts = [
+            sum(len(loads) for _tensor, loads in cohort)
+            for cohort in cohorts
+        ]
+        numWindows = len(cohorts)
+        boundaries = [
+            (mfmaCount * index) // numWindows
+            for index in range(numWindows + 1)
+        ]
+        if any(
+                count > boundaries[index + 1] - boundaries[index]
+                for index, count in enumerate(counts)):
+            continue
+
+        total = sum(counts)
+        varianceNumerator = sum(
+            (count * numWindows - total) ** 2
+            for count in counts
+        )
+        score = (
+            max(counts) - min(counts),
+            varianceNumerator,
+            cohortSize,
+            numWindows,
+        )
+        plans.append({
+            "cohortSize": cohortSize,
+            "cohorts": cohorts,
+            "counts": counts,
+            "boundaries": boundaries,
+            "score": score,
+        })
+    return sorted(plans, key=lambda plan: plan["score"])
+
+
+def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
+    """Right-align one VMEM plan while preserving all wait/barrier frontiers."""
+    def reject(_reason):
+        return None
+
     orderedLoads = list(orderedLoads)
     if (
-            not (4 <= cohortSize <= 6)
-            or numPlacementRegions != 3
-            or len({id(load) for load in orderedLoads}) != len(orderedLoads)
+            len({id(load) for load in orderedLoads}) != len(orderedLoads)
             or not all(_isBufferLoad(load) for load in orderedLoads)):
-        return None
+        return reject("invalid ordered loads")
 
     items = list(schedule.flatitems())
     mfmas = []
@@ -956,17 +1038,90 @@ def scheduleGlobalVmemCohorts(
         else:
             followers[currentRank].append(inst)
 
-    if len(mfmas) < numPlacementRegions * cohortSize:
-        return None
+    if (
+            not plan["boundaries"]
+            or plan["boundaries"][0] != 0
+            or plan["boundaries"][-1] != len(mfmas)):
+        return reject("MFMA boundaries")
 
-    requestedIds = {id(load) for load in orderedLoads}
+    targetIds = {id(load) for load in orderedLoads}
     loadLocations = {}
     for rank, group in enumerate(followers):
         for index, inst in enumerate(group):
-            if id(inst) in requestedIds:
+            if id(inst) in targetIds:
                 loadLocations[id(inst)] = (rank, index)
-    if set(loadLocations) != requestedIds:
-        return None
+    if set(loadLocations) != targetIds:
+        return reject("missing load locations")
+
+    plannedLoads = [
+        load
+        for cohort in plan["cohorts"]
+        for _tensor, loads in cohort
+        for load in loads
+    ]
+    if plannedLoads != orderedLoads:
+        return reject("atom/load order mismatch")
+
+    # Production callers include data and scale requests in cohort selection.
+    # Keep support for other auxiliary VMEM emitted outside those semantic
+    # atoms: retain its existing balanced window and include it in that
+    # window's right-hand packing so requests cannot collapse onto one rank.
+    placementCohorts = [
+        [
+            load
+            for _tensor, loads in cohort
+            for load in loads
+        ]
+        for cohort in plan["cohorts"]
+    ]
+    auxiliaryLoads = []
+    for rank, group in enumerate(followers):
+        for index, inst in enumerate(group):
+            if _isBufferLoad(inst) and id(inst) not in targetIds:
+                auxiliaryLoads.append(inst)
+                loadLocations[id(inst)] = (rank, index)
+                region = next(
+                    (
+                        candidate
+                        for candidate in range(len(plan["boundaries"]) - 1)
+                        if (
+                            plan["boundaries"][candidate] <= rank
+                            < plan["boundaries"][candidate + 1])
+                    ),
+                    None,
+                )
+                if region is None:
+                    return reject("auxiliary load outside MFMA windows")
+                placementCohorts[region].append(inst)
+
+    scheduledLoads = [*orderedLoads, *auxiliaryLoads]
+    requestedIds = {id(load) for load in scheduledLoads}
+    if len(requestedIds) != len(scheduledLoads):
+        return reject("duplicate scheduled load")
+
+    # Capture each DTL request's m0 setup by identity before either side of
+    # the bundle moves.  Recovering it later with a backward search is
+    # ambiguous when neighboring requests are assigned to different windows.
+    setupByLoad = {}
+    pendingSetup = None
+    for group in followers:
+        for inst in group:
+            if _isM0Update(inst):
+                pendingSetup = inst
+            elif _isBufferLoad(inst):
+                if id(inst) in requestedIds:
+                    if pendingSetup is None:
+                        return reject("scheduled load has no m0 setup")
+                    setupByLoad[id(inst)] = pendingSetup
+                pendingSetup = None
+    if set(setupByLoad) != requestedIds:
+        return reject("scheduled load/setup identity")
+    if len({id(setup) for setup in setupByLoad.values()}) != len(setupByLoad):
+        return reject("shared m0 setup")
+
+    # Capture semantic wait/barrier membership before moving either loads or
+    # synchronization instructions.  Later physical frontier shifts use these
+    # sets as the source of truth and validation proves they are unchanged.
     waitLoadPrefixes = {}
     barrierLoadPrefixes = {}
     targetLoadPrefix = []
@@ -978,60 +1133,409 @@ def scheduleGlobalVmemCohorts(
         elif _isBarrier(inst):
             barrierLoadPrefixes[id(inst)] = tuple(targetLoadPrefix)
 
-    originalRanks = {}
-    for load in orderedLoads:
-        rank, _loadIndex = loadLocations[id(load)]
-        originalRanks[id(load)] = rank
-
-    dataLoads = [
-        load for load in orderedLoads
-        if getattr(load, "comment", "").startswith(("A ", "B "))
-    ]
-    scaleLoads = [
-        load for load in orderedLoads
-        if getattr(load, "comment", "").startswith(("SA ", "SB "))
-    ]
-    if (
-            len(scaleLoads) not in (0, 2)
-            or orderedLoads != dataLoads + scaleLoads):
-        return None
-    cohorts = [
-        dataLoads[index:index + cohortSize]
-        for index in range(0, len(dataLoads), cohortSize)
-    ]
-    if (
-            len(cohorts) != numPlacementRegions
-            or any(len(cohort) != cohortSize for cohort in cohorts[:-1])
-            or not (0 < len(cohorts[-1]) <= cohortSize)):
-        return None
-    lateLoads = scaleLoads
-    if scaleLoads and len(cohorts[-1]) + len(scaleLoads) <= cohortSize:
-        cohorts[-1] = cohorts[-1] + scaleLoads
-        lateLoads = []
-
-    regionBoundaries = [
-        (len(mfmas) * index) // numPlacementRegions
-        for index in range(numPlacementRegions + 1)
-    ]
-    targetRanks = {}
-    for region, cohort in enumerate(cohorts):
-        originalStart = min(originalRanks[id(load)] for load in cohort)
-        start = max(regionBoundaries[region], originalStart)
-        if start + len(cohort) > regionBoundaries[region + 1]:
+    def vgprSpan(reg):
+        if reg is None or not hasattr(reg, "regType") or reg.regType != "v":
+            return ()
+        if getattr(reg, "regName", None) is not None:
             return None
-        for offset, load in enumerate(cohort):
-            targetRanks[id(load)] = start + offset
-    for load in lateLoads:
-        targetRanks[id(load)] = originalRanks[id(load)]
+        return (reg.regIdx, reg.regIdx + reg.regNum)
 
-    # Leave already-correct cohorts byte-for-byte in place.  Apart from
-    # avoiding gratuitous movement, this preserves dependency anchors such as
-    # the P1 barrier immediately before cohort 1.  Recover atomic DTL bundles
-    # only for requests whose global rank actually changes.
+    def spansOverlap(lhs, rhs):
+        return lhs[0] < rhs[1] and rhs[0] < lhs[1]
+
+    def canRelocateRead(inst, targetRank, originalRank):
+        if targetRank == originalRank:
+            return True
+        dstSpan = vgprSpan(getattr(inst, "dst", None))
+        if dstSpan is None or not dstSpan:
+            return False
+        begin = min(targetRank, originalRank) + 1
+        end = max(targetRank, originalRank) + 1
+        for mfma in mfmas[begin:end]:
+            for operandName in ("a", "b", "mxsa", "mxsb", "acc", "acc2"):
+                operandSpan = vgprSpan(getattr(mfma, operandName, None))
+                if operandSpan is None:
+                    return False
+                if operandSpan and spansOverlap(dstSpan, operandSpan):
+                    return False
+        return True
+
+    # A late overwrite barrier can otherwise consume the right edge reserved
+    # for a complete VMEM cohort (notably the square four-window topology).
+    # Compact only the recognized wrap-read stream on its left.  This is the
+    # non-VMEM half of dual-ended placement: stable-order XOR/LDS units move
+    # left under typed capacities, while the barrier moves just ahead of the
+    # right-aligned data-plus-scale VMEM suffix.
+    for region, cohort in enumerate(placementCohorts):
+        if not cohort:
+            continue
+        windowBegin = plan["boundaries"][region]
+        windowEnd = plan["boundaries"][region + 1]
+        # A synchronization instruction and the first younger VMEM request
+        # may share one MFMA shadow as long as the emitted order is
+        # barrier/wait -> m0 -> VMEM.
+        desiredBarrierRank = windowEnd - len(cohort)
+        cohortLocations = [loadLocations[id(load)] for load in cohort]
+        firstLoadRank, firstLoadIndex = min(cohortLocations)
+        barrierLocations = [
+            (rank, index, inst)
+            for rank in range(windowBegin, windowEnd)
+            for index, inst in enumerate(followers[rank])
+            if (
+                _isBarrier(inst)
+                and (
+                    rank < firstLoadRank
+                    or (
+                        rank == firstLoadRank
+                        and index < firstLoadIndex
+                    )
+                )
+            )
+        ]
+        if not barrierLocations:
+            continue
+        barrierRank, barrierIndex, barrier = barrierLocations[-1]
+        if barrierRank <= desiredBarrierRank:
+            continue
+        previousBarriers = [
+            (rank, index)
+            for rank, index, _inst in barrierLocations[:-1]
+            if rank >= windowBegin
+        ]
+        if previousBarriers:
+            previousBarrierRank, previousBarrierIndex = previousBarriers[-1]
+        else:
+            expandedEnd = barrierRank + len(cohort)
+            nextEnd = (
+                plan["boundaries"][region + 2]
+                if region + 2 < len(plan["boundaries"])
+                else None
+            )
+            nextCohortSize = (
+                len(placementCohorts[region + 1])
+                if region + 1 < len(placementCohorts)
+                else 0
+            )
+            if (
+                    nextEnd is not None
+                    and expandedEnd + nextCohortSize <= nextEnd):
+                # The first dependency barrier has no preceding delimiter
+                # from which a wrap-read stream can be compacted.  Expand the
+                # first window by the minimum amount instead; subsequent
+                # windows retain enough ranks for one VMEM per shadow.
+                plan["boundaries"][region + 1] = expandedEnd
+                continue
+            return reject("late barrier has no left synchronization anchor")
+        if desiredBarrierRank <= previousBarrierRank:
+            return reject("late barrier leaves no non-VMEM window")
+
+        movable = []
+        for rank in range(previousBarrierRank, barrierRank + 1):
+            begin = (
+                previousBarrierIndex + 1
+                if rank == previousBarrierRank
+                else 0
+            )
+            end = barrierIndex if rank == barrierRank else len(followers[rank])
+            for index in range(begin, end):
+                movable.append((rank, index, followers[rank][index]))
+        if any(
+                not isinstance(inst, (TextBlock, VXorB32))
+                and not _isDsRead(inst)
+                for _rank, _index, inst in movable):
+            return reject("late barrier prefix is not a wrap-read stream")
+
+        units = []
+        pendingText = []
+        for originalRank, _index, inst in movable:
+            if isinstance(inst, TextBlock):
+                pendingText.append(inst)
+                continue
+            units.append((originalRank, [*pendingText, inst]))
+            pendingText = []
+        barrierPrefix = pendingText
+
+        removalIndices = {}
+        for rank, index, _inst in movable:
+            removalIndices.setdefault(rank, set()).add(index)
+        removalIndices.setdefault(barrierRank, set()).add(barrierIndex)
+        for rank, indices in removalIndices.items():
+            followers[rank] = [
+                inst
+                for index, inst in enumerate(followers[rank])
+                if index not in indices
+            ]
+
+        baseFollowers = [list(group) for group in followers]
+
+        def packWrapReads(allowPressedDs):
+            rewritten = [list(group) for group in baseFollowers]
+            targetRank = previousBarrierRank + 1
+            for originalRank, unit in units:
+                physical = [
+                    inst for inst in unit
+                    if not isinstance(inst, TextBlock)
+                ]
+                placed = False
+                while targetRank < desiredBarrierRank:
+                    candidate = [*rewritten[targetRank], *unit]
+                    if (
+                            all(
+                                not _isDsRead(inst)
+                                or canRelocateRead(
+                                    inst, targetRank, originalRank)
+                                for inst in physical
+                            )
+                            and _fitsInstructionTypeShadow(
+                                candidate,
+                                allowPressedDs=allowPressedDs)):
+                        rewritten[targetRank].extend(unit)
+                        placed = True
+                        break
+                    targetRank += 1
+                if not placed:
+                    return None
+            return rewritten
+
+        rewritten = packWrapReads(allowPressedDs=False)
+        if rewritten is None:
+            rewritten = packWrapReads(allowPressedDs=True)
+        if rewritten is None:
+            return reject("wrap-read stream cannot left-pack")
+        followers = rewritten
+        followers[desiredBarrierRank].extend([*barrierPrefix, barrier])
+
+    # The preparatory left pack changes physical ranks, so recover every
+    # request location from the rewritten followers before placing VMEM.
+    loadLocations = {}
+    for rank, group in enumerate(followers):
+        for index, inst in enumerate(group):
+            if id(inst) in requestedIds:
+                loadLocations[id(inst)] = (rank, index)
+    if set(loadLocations) != requestedIds:
+        return reject("scheduled load lost during left pack")
+
+    items = list(prefix)
+    for mfma, group in zip(mfmas, followers):
+        items.append(mfma)
+        items.extend(group)
+
+    def recoverSyncRanks():
+        waitRanks = {}
+        barrierRanks = {}
+        currentRank = -1
+        for inst in [
+                *prefix,
+                *[
+                    item
+                    for mfma, group in zip(mfmas, followers)
+                    for item in (mfma, *group)
+                ],
+        ]:
+            if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+                currentRank += 1
+            elif id(inst) in waitLoadPrefixes:
+                waitRanks[id(inst)] = currentRank
+            elif id(inst) in barrierLoadPrefixes:
+                barrierRanks[id(inst)] = currentRank
+        if (
+                set(waitRanks) != set(waitLoadPrefixes)
+                or set(barrierRanks) != set(barrierLoadPrefixes)):
+            return None
+        return waitRanks, barrierRanks
+
+    syncRanks = recoverSyncRanks()
+    if syncRanks is None:
+        return reject("synchronization identity after left pack")
+    waitRanks, barrierRanks = syncRanks
+
+    # A dependency frontier can be narrower than the chosen VMEM cohort even
+    # though the surrounding placement window has room.  When the upper
+    # frontier is a barrier followed only by younger DTL bundles, slide that
+    # barrier right just far enough to expose one rank per request.  The
+    # original membership maps above remain authoritative, so final validation
+    # still proves that no request crossed the synchronization boundary.
+    for region, cohort in enumerate(placementCohorts):
+        windowBegin = plan["boundaries"][region]
+        windowEnd = plan["boundaries"][region + 1]
+        runBegin = 0
+        while runBegin < len(cohort):
+            firstId = id(cohort[runBegin])
+            signature = (
+                tuple(
+                    firstId in frontier
+                    for frontier in waitLoadPrefixes.values()),
+                tuple(
+                    firstId in frontier
+                    for frontier in barrierLoadPrefixes.values()),
+            )
+            runEnd = runBegin + 1
+            while runEnd < len(cohort):
+                loadId = id(cohort[runEnd])
+                candidateSignature = (
+                    tuple(
+                        loadId in frontier
+                        for frontier in waitLoadPrefixes.values()),
+                    tuple(
+                        loadId in frontier
+                        for frontier in barrierLoadPrefixes.values()),
+                )
+                if candidateSignature != signature:
+                    break
+                runEnd += 1
+
+            run = cohort[runBegin:runEnd]
+            runIds = {id(load) for load in run}
+            lower = windowBegin
+            synchronizationUpper = None
+            for waitId, frontier in waitLoadPrefixes.items():
+                if runIds <= set(frontier):
+                    synchronizationUpper = (
+                        waitRanks[waitId]
+                        if synchronizationUpper is None
+                        else min(synchronizationUpper, waitRanks[waitId])
+                    )
+                elif runIds.isdisjoint(frontier):
+                    lower = max(lower, waitRanks[waitId])
+            for barrierId, frontier in barrierLoadPrefixes.items():
+                if runIds <= set(frontier):
+                    synchronizationUpper = (
+                        barrierRanks[barrierId]
+                        if synchronizationUpper is None
+                        else min(
+                            synchronizationUpper,
+                            barrierRanks[barrierId],
+                        )
+                    )
+                elif runIds.isdisjoint(frontier):
+                    lower = max(lower, barrierRanks[barrierId])
+            requiredUpper = lower + len(run) - 1
+            if (
+                    requiredUpper >= windowEnd
+                    and region + 1 < len(plan["boundaries"]) - 1
+                    and (
+                        synchronizationUpper is None
+                        or requiredUpper <= synchronizationUpper
+                    )
+                    and requiredUpper < plan["boundaries"][region + 2]):
+                # A balanced nominal cut may bisect a legal dependency epoch.
+                # Nudge only that cut right far enough to hold the run; later
+                # windows retain their original end and are checked in turn.
+                plan["boundaries"][region + 1] = requiredUpper + 1
+                windowEnd = requiredUpper + 1
+            upper = windowEnd - 1
+            if synchronizationUpper is not None:
+                upper = min(upper, synchronizationUpper)
+            if upper < requiredUpper:
+                if requiredUpper >= windowEnd:
+                    return reject(
+                        "synchronization frontier exceeds window "
+                        f"region={region} window=[{windowBegin},{windowEnd}) "
+                        f"lower={lower} upper={upper} "
+                        f"requiredUpper={requiredUpper} "
+                        f"run={[getattr(load, 'comment', '') for load in run]}"
+                    )
+                if any(
+                        runIds <= set(frontier)
+                        and waitRanks[waitId] == upper
+                        for waitId, frontier in waitLoadPrefixes.items()):
+                    return reject("counted wait bounds VMEM cohort")
+                barrierIds = [
+                    barrierId
+                    for barrierId, frontier in barrierLoadPrefixes.items()
+                    if (
+                        runIds <= set(frontier)
+                        and barrierRanks[barrierId] == upper)
+                ]
+                if not barrierIds:
+                    return reject("no movable upper barrier")
+                for barrierId in barrierIds:
+                    barrierLocation = next(
+                        (
+                            (rank, index, inst)
+                            for rank, group in enumerate(followers)
+                            for index, inst in enumerate(group)
+                            if id(inst) == barrierId
+                        ),
+                        None,
+                    )
+                    if barrierLocation is None:
+                        return reject("movable upper barrier missing")
+                    oldRank, oldIndex, barrier = barrierLocation
+                    crossed = [
+                        inst
+                        for rank in range(oldRank, requiredUpper + 1)
+                        for index, inst in enumerate(followers[rank])
+                        if not (
+                            rank == oldRank
+                            and index == oldIndex)
+                    ]
+                    if any(
+                            not isinstance(inst, TextBlock)
+                            and not _isBufferLoad(inst)
+                            and not _isM0Update(inst)
+                            for inst in crossed):
+                        return reject(
+                            "upper barrier cannot cross non-VMEM work")
+                    followers[oldRank].pop(oldIndex)
+                    followers[requiredUpper].insert(0, barrier)
+                syncRanks = recoverSyncRanks()
+                if syncRanks is None:
+                    return reject("synchronization identity after shift")
+                waitRanks, barrierRanks = syncRanks
+            runBegin = runEnd
+
+    loadLocations = {}
+    for rank, group in enumerate(followers):
+        for index, inst in enumerate(group):
+            if id(inst) in requestedIds:
+                loadLocations[id(inst)] = (rank, index)
+    if set(loadLocations) != requestedIds:
+        return reject("scheduled load lost during barrier shift")
+
+    targetRanks = {}
+    for region, cohort in enumerate(placementCohorts):
+        windowBegin = plan["boundaries"][region]
+        windowEnd = plan["boundaries"][region + 1]
+        nextRank = windowEnd
+        reversedTargets = []
+        for load in reversed(cohort):
+            loadId = id(load)
+            lower = windowBegin
+            upper = windowEnd - 1
+            for waitId, frontier in waitLoadPrefixes.items():
+                if loadId in frontier:
+                    upper = min(upper, waitRanks[waitId])
+                else:
+                    lower = max(lower, waitRanks[waitId])
+            for barrierId, frontier in barrierLoadPrefixes.items():
+                if loadId in frontier:
+                    upper = min(upper, barrierRanks[barrierId])
+                else:
+                    lower = max(lower, barrierRanks[barrierId])
+            rank = min(upper, nextRank - 1)
+            if rank < lower:
+                return reject(
+                    "cohort cannot right-align inside legal frontier "
+                    f"region={region} comment="
+                    f"{getattr(load, 'comment', '')!r} "
+                    f"window=[{windowBegin},{windowEnd}) "
+                    f"legal=[{lower},{upper}] next={nextRank} "
+                    f"waits={[(waitRanks[waitId], loadId in frontier) for waitId, frontier in waitLoadPrefixes.items()]} "
+                    f"barriers={[(barrierRanks[barrierId], loadId in frontier) for barrierId, frontier in barrierLoadPrefixes.items()]}")
+            reversedTargets.append((load, rank))
+            nextRank = rank
+        for load, rank in reversed(reversedTargets):
+            targetRanks[id(load)] = rank
+
+    # Rebuild every scheduled setup/load pair, including requests whose load
+    # rank is unchanged.  Moving a neighboring request into a shadow between
+    # an unchanged setup and its load would otherwise overwrite m0 first.
+    # Synchronization instructions remain in place and constrain insertion
+    # below, so dependency anchors are still preserved.
     moved = [
         (load, targetRanks[id(load)])
-        for load in orderedLoads
-        if originalRanks[id(load)] != targetRanks[id(load)]
+        for load in scheduledLoads
     ]
     bundles = {}
     removalIndices = {}
@@ -1039,28 +1543,23 @@ def scheduleGlobalVmemCohorts(
     for load, _targetRank in moved:
         rank, loadIndex = loadLocations[id(load)]
         group = followers[rank]
-        setup = None
-        blocked = False
-        for candidateRank in range(rank, -1, -1):
-            candidateEnd = (
-                loadIndex - 1
-                if candidateRank == rank
-                else len(followers[candidateRank]) - 1
-            )
-            for candidateIndex in range(candidateEnd, -1, -1):
-                candidate = followers[candidateRank][candidateIndex]
-                if _isBufferLoad(candidate):
-                    blocked = True
-                    break
-                if _isM0Update(candidate):
-                    setup = (candidateRank, candidateIndex)
-                    break
-            if blocked or setup is not None:
-                break
-        if setup is None or setup in claimedSetups:
-            return None
+        setupInst = setupByLoad[id(load)]
+        setup = next(
+            (
+                (candidateRank, candidateIndex)
+                for candidateRank, candidateGroup in enumerate(followers)
+                for candidateIndex, candidate in enumerate(candidateGroup)
+                if id(candidate) == id(setupInst)
+            ),
+            None,
+        )
+        if setup is None or id(setupInst) in claimedSetups:
+            return reject(
+                "missing or shared m0 setup "
+                f"load={getattr(load, 'comment', '')!r} "
+                f"rank={rank} target={_targetRank} setup={setup}")
         setupRank, setupIndex = setup
-        claimedSetups.add(setup)
+        claimedSetups.add(id(setupInst))
         bundles[id(load)] = [
             followers[setupRank][setupIndex],
             group[loadIndex],
@@ -1074,10 +1573,36 @@ def scheduleGlobalVmemCohorts(
             if index not in indices
         ]
 
-    # Insert before existing followers so SALU m0 setup and VMEM issue lead a
-    # mixed shadow (in particular, before any LDS read or counted wait).
+    # Insert each atomic setup/load bundle at the exact side of any co-resident
+    # wait or barrier that its original request frontier requires.  Otherwise
+    # VMEM leads a mixed shadow, in particular before independent LDS reads.
     for load, rank in moved:
-        followers[rank][0:0] = bundles[id(load)]
+        group = followers[rank]
+        lowerIndex = 0
+        upperIndex = len(group)
+        for index, inst in enumerate(group):
+            frontier = (
+                waitLoadPrefixes.get(id(inst))
+                if id(inst) in waitLoadPrefixes
+                else barrierLoadPrefixes.get(id(inst))
+            )
+            if frontier is None:
+                continue
+            if id(load) in frontier:
+                upperIndex = min(upperIndex, index)
+            else:
+                lowerIndex = max(lowerIndex, index + 1)
+        if lowerIndex > upperIndex:
+            return reject("co-resident synchronization order")
+        firstDsRead = next(
+            (
+                index
+                for index in range(lowerIndex, upperIndex)
+                if _isDsRead(group[index])
+            ),
+            upperIndex,
+        )
+        group[firstDsRead:firstDsRead] = bundles[id(load)]
 
     rebuilt = Module(schedule.name)
     for inst in prefix:
@@ -1103,24 +1628,79 @@ def scheduleGlobalVmemCohorts(
         elif _isBarrier(inst):
             rebuiltBarrierPrefixes[id(inst)] = tuple(targetLoadPrefix)
     if set(rebuiltWaitPrefixes) != set(waitLoadPrefixes):
-        return None
+        return reject("wait identity")
     for waitId, originalPrefix in waitLoadPrefixes.items():
         rebuiltPrefix = rebuiltWaitPrefixes[waitId]
         if set(rebuiltPrefix) != set(originalPrefix):
-            return None
+            return reject("wait request frontier")
         if (
                 rebuiltPrefix != originalPrefix
                 and waitsById[waitId].vlcnt < len(rebuiltPrefix)):
-            return None
+            return reject("counted wait order")
     if set(rebuiltBarrierPrefixes) != set(barrierLoadPrefixes):
-        return None
+        return reject("barrier identity")
     for barrierId, originalPrefix in barrierLoadPrefixes.items():
         if (
                 set(rebuiltBarrierPrefixes[barrierId])
                 != set(originalPrefix)):
-            return None
+            return reject("barrier request frontier")
 
     return rebuilt
+
+
+def scheduleGlobalVmemCohorts(
+        schedule, orderedLoads=None, cohortSize=6, numPlacementRegions=3,
+        orderedLoadAtoms=None, cohortSizes=(4, 5, 6)):
+    """Place one uniform VMEM epoch in variable, dual-ended windows.
+
+    The VMEM cohort size is selected from 4, 5, and 6 by the equity of the
+    resulting physical request groups.  The number of groups defines the
+    number of balanced MFMA placement windows.  VMEM bundles are right-aligned
+    in each window; the already dependency-scheduled non-VMEM stream remains
+    on the left.  A candidate is accepted only if every counted VMEM wait and
+    LDS-overwrite barrier retains exactly the same request frontier.
+
+    ``orderedLoadAtoms`` is the production interface.  The legacy
+    ``orderedLoads``/``cohortSize`` arguments remain available for focused
+    callers and construct singleton atoms.
+    """
+    if orderedLoadAtoms is None:
+        orderedLoads = list(orderedLoads or ())
+        orderedLoadAtoms = [
+            ("", (load,))
+            for load in orderedLoads
+        ]
+        cohortSizes = (cohortSize,)
+    else:
+        orderedLoadAtoms = [
+            (tensor, tuple(loads))
+            for tensor, loads in orderedLoadAtoms
+        ]
+        flattened = [
+            load
+            for _tensor, loads in orderedLoadAtoms
+            for load in loads
+        ]
+        if orderedLoads is None:
+            orderedLoads = flattened
+        else:
+            orderedLoads = list(orderedLoads)
+            if flattened != orderedLoads:
+                return None
+
+    items = list(schedule.flatitems())
+    mfmaCount = sum(
+        isinstance(inst, (MFMAInstruction, MXMFMAInstruction))
+        for inst in items
+    )
+    candidates = _globalVmemPlacementCandidates(
+        orderedLoadAtoms, mfmaCount, cohortSizes=cohortSizes)
+    for plan in candidates:
+        rebuilt = _scheduleGlobalVmemPlacementPlan(
+            schedule, orderedLoads, plan)
+        if rebuilt is not None:
+            return rebuilt
+    return None
 
 
 def _fitsInstructionTypeShadow(group, allowPressedDs=True):
