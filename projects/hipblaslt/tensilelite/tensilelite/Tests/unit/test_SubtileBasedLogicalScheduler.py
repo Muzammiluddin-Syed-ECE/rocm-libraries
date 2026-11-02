@@ -2562,6 +2562,31 @@ class TestUniformPgrEpoch:
         assert plans[0]["cohortSize"] == expected_size
         assert plans[0]["counts"] == expected_counts
 
+    def test_frontier_aware_cohort_placement_compresses_complete_lattice(self):
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _selectEquidistantCohortRanks)
+
+        def six_request_options(first_end, last_end):
+            return {
+                end: tuple(range(end - 5, end + 1))
+                for end in range(first_end, last_end + 1)
+            }
+
+        placements = _selectEquidistantCohortRanks(
+            [
+                six_request_options(5, 25),
+                six_request_options(37, 52),
+                six_request_options(5, 61),
+            ],
+            mfmaCount=80,
+        )
+
+        assert placements == [
+            tuple(range(8, 14)),
+            tuple(range(32, 38)),
+            tuple(range(56, 62)),
+        ]
+
     @pytest.mark.parametrize(
         "mt_m,mt_n", [(256, 256), (256, 320), (320, 256)])
     def test_scale_tail_staging_adds_exactly_three_vgprs(
@@ -3152,28 +3177,23 @@ class TestUniformPgrEpoch:
         c1_vmem = vmem_schedule(c1)
         assert [rank for rank, _ in c0_vmem] == [
             *range(20, 26),
-            *range(36, 42),
+            *range(39, 45),
             *range(58, 64),
         ]
         assert [rank for rank, _ in c1_vmem] == [
-            *range(12, 16),
-            *range(28, 32),
+            *range(10, 14),
+            *range(26, 30),
             *range(42, 46),
-            *range(60, 64),
+            *range(58, 62),
         ]
-        c0_regions = ((0, 26), (26, 42), (42, 64))
         assert [
-            sum(
-                start <= rank < end
-                for rank, comment in c0_vmem)
-            for start, end in c0_regions
-        ] == [6, 6, 6]
-        c1_regions = (
-            (0, 16), (16, 32), (32, 48), (48, 64))
+            c0_vmem[index + 6][0] - c0_vmem[index][0]
+            for index in (0, 6)
+        ] == [19, 19]
         assert [
-            sum(start <= rank < end for rank, _ in c1_vmem)
-            for start, end in c1_regions
-        ] == [4, 4, 4, 4]
+            c1_vmem[index + 4][0] - c1_vmem[index][0]
+            for index in (0, 4, 8)
+        ] == [16, 16, 16]
         assert [
             comment.split()[0:3]
             for _, comment in c0_vmem[-6:]
@@ -3234,8 +3254,8 @@ class TestUniformPgrEpoch:
                     78, 79,
                 ],
                 [
-                    *range(20, 26),
-                    *range(47, 53),
+                    *range(8, 14),
+                    *range(32, 38),
                     *range(56, 62),
                 ],
             ),
@@ -3251,8 +3271,8 @@ class TestUniformPgrEpoch:
                     78, 79,
                 ],
                 [
-                    *range(20, 26),
-                    *range(47, 53),
+                    *range(8, 14),
+                    *range(32, 38),
                     *range(56, 62),
                 ],
             ),
@@ -3344,8 +3364,8 @@ class TestUniformPgrEpoch:
         [
             (
                 224, 256, [1, 4], 56, 15,
-                (0, 25, 37, 56), (6, 5, 6),
-                (0, 18, 37, 56), (5, 5, 5),
+                (0, 26, 41, 56), (6, 5, 6),
+                (0, 16, 32, 56), (5, 5, 5),
             ),
         ],
     )

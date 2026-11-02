@@ -1013,6 +1013,52 @@ def _globalVmemPlacementCandidates(
     return sorted(plans, key=lambda plan: plan["score"])
 
 
+def _selectEquidistantCohortRanks(cohortOptions, mfmaCount):
+    """Select one jointly spaced physical placement for every VMEM cohort.
+
+    ``cohortOptions`` contains one dictionary per cohort.  Each dictionary
+    maps the rank of that cohort's final request to the complete, ordered rank
+    tuple for its requests.  The options have already incorporated all
+    synchronization and SRD frontiers.
+
+    The nominal placement-window pitch is ``ceil(mfmaCount / cohortCount)``.
+    Search that pitch first, then compress it only as much as required by the
+    legal frontiers.  For a given pitch, prefer the latest legal phase.  This
+    shifts the complete placement lattice when a late cohort has an early
+    deadline instead of independently clipping that cohort into its
+    predecessor.
+    """
+    cohortCount = len(cohortOptions)
+    if (
+            mfmaCount <= 0
+            or cohortCount == 0
+            or any(not options for options in cohortOptions)):
+        return None
+
+    nominalPitch = max(
+        1, (mfmaCount + cohortCount - 1) // cohortCount)
+    for pitch in range(nominalPitch, 0, -1):
+        for finalAnchor in range(mfmaCount - 1, -1, -1):
+            anchors = [
+                finalAnchor - pitch * (cohortCount - 1 - index)
+                for index in range(cohortCount)
+            ]
+            if anchors[0] < 0:
+                continue
+            placements = [
+                options.get(anchor)
+                for options, anchor in zip(cohortOptions, anchors)
+            ]
+            if any(placement is None for placement in placements):
+                continue
+            if any(
+                    placements[index][-1] >= placements[index + 1][0]
+                    for index in range(cohortCount - 1)):
+                continue
+            return placements
+    return None
+
+
 def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
     """Right-align VMEM while preserving synchronization and SRD frontiers."""
     def reject(_reason):
@@ -1564,55 +1610,108 @@ def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
     if set(loadLocations) != requestedIds:
         return reject("scheduled load lost during barrier shift")
 
+    def legalRankBounds(load, windowBegin=0, windowEnd=None):
+        """Return this request's inclusive physical-rank frontier."""
+        if windowEnd is None:
+            windowEnd = len(mfmas)
+        loadId = id(load)
+        lower = windowBegin
+        upper = windowEnd - 1
+        for waitId, frontier in waitLoadPrefixes.items():
+            if loadId in frontier:
+                upper = min(upper, waitRanks[waitId])
+            else:
+                lower = max(lower, waitRanks[waitId])
+        for barrierId, frontier in barrierLoadPrefixes.items():
+            if loadId in frontier:
+                upper = min(upper, barrierRanks[barrierId])
+            else:
+                lower = max(lower, barrierRanks[barrierId])
+        loadSrdKey = loadSrdKeys[loadId]
+        for updateId, frontier in srdUpdateLoadPrefixes.items():
+            if srdUpdateKeys[updateId] != loadSrdKey:
+                continue
+            updateRank = srdUpdateLocations[updateId][0]
+            if loadId in frontier:
+                upper = min(upper, updateRank)
+            else:
+                lower = max(lower, updateRank)
+        return lower, upper
+
+    def crossesSrdCarry(rank):
+        return any(
+            srdUpdateLocations[lowId][0]
+            < rank
+            < srdUpdateLocations[carryId][0]
+            for lowId, carryId in carryChains
+        )
+
+    # Enumerate every legal right edge for each complete cohort.  Earlier
+    # requests are packed backwards from that edge while retaining issue
+    # order.  The joint selector below can then move the complete cohort
+    # lattice when one frontier clips a late cohort.
+    cohortOptions = []
+    for cohort in placementCohorts:
+        bounds = [legalRankBounds(load) for load in cohort]
+        options = {}
+        for finalRank in range(len(mfmas)):
+            ranks = [None] * len(cohort)
+            nextRank = finalRank + 1
+            valid = True
+            for index in range(len(cohort) - 1, -1, -1):
+                lower, upper = bounds[index]
+                if index == len(cohort) - 1:
+                    rank = finalRank
+                    if not lower <= rank <= upper:
+                        valid = False
+                        break
+                else:
+                    rank = min(upper, nextRank - 1)
+                while rank >= lower and crossesSrdCarry(rank):
+                    rank -= 1
+                if rank < lower:
+                    valid = False
+                    break
+                ranks[index] = rank
+                nextRank = rank
+            if valid:
+                options[finalRank] = tuple(ranks)
+        cohortOptions.append(options)
+
+    placements = _selectEquidistantCohortRanks(
+        cohortOptions, len(mfmas))
     targetRanks = {}
-    for region, cohort in enumerate(placementCohorts):
-        windowBegin = plan["boundaries"][region]
-        windowEnd = plan["boundaries"][region + 1]
-        nextRank = windowEnd
-        reversedTargets = []
-        for load in reversed(cohort):
-            loadId = id(load)
-            lower = windowBegin
-            upper = windowEnd - 1
-            for waitId, frontier in waitLoadPrefixes.items():
-                if loadId in frontier:
-                    upper = min(upper, waitRanks[waitId])
-                else:
-                    lower = max(lower, waitRanks[waitId])
-            for barrierId, frontier in barrierLoadPrefixes.items():
-                if loadId in frontier:
-                    upper = min(upper, barrierRanks[barrierId])
-                else:
-                    lower = max(lower, barrierRanks[barrierId])
-            loadSrdKey = loadSrdKeys[loadId]
-            for updateId, frontier in srdUpdateLoadPrefixes.items():
-                if srdUpdateKeys[updateId] != loadSrdKey:
-                    continue
-                updateRank = srdUpdateLocations[updateId][0]
-                if loadId in frontier:
-                    upper = min(upper, updateRank)
-                else:
-                    lower = max(lower, updateRank)
-            rank = min(upper, nextRank - 1)
-            while rank >= lower and any(
-                    srdUpdateLocations[lowId][0]
-                    < rank
-                    < srdUpdateLocations[carryId][0]
-                    for lowId, carryId in carryChains):
-                rank -= 1
-            if rank < lower:
-                return reject(
-                    "cohort cannot right-align inside legal frontier "
-                    f"region={region} comment="
-                    f"{getattr(load, 'comment', '')!r} "
-                    f"window=[{windowBegin},{windowEnd}) "
-                    f"legal=[{lower},{upper}] next={nextRank} "
-                    f"waits={[(waitRanks[waitId], loadId in frontier) for waitId, frontier in waitLoadPrefixes.items()]} "
-                    f"barriers={[(barrierRanks[barrierId], loadId in frontier) for barrierId, frontier in barrierLoadPrefixes.items()]}")
-            reversedTargets.append((load, rank))
-            nextRank = rank
-        for load, rank in reversed(reversedTargets):
-            targetRanks[id(load)] = rank
+    if placements is not None:
+        for cohort, ranks in zip(placementCohorts, placements):
+            for load, rank in zip(cohort, ranks):
+                targetRanks[id(load)] = rank
+    else:
+        # Preserve the prior independently right-aligned placement as a
+        # compatibility fallback for a topology with no common legal pitch.
+        for region, cohort in enumerate(placementCohorts):
+            windowBegin = plan["boundaries"][region]
+            windowEnd = plan["boundaries"][region + 1]
+            nextRank = windowEnd
+            reversedTargets = []
+            for load in reversed(cohort):
+                lower, upper = legalRankBounds(
+                    load, windowBegin, windowEnd)
+                rank = min(upper, nextRank - 1)
+                while rank >= lower and crossesSrdCarry(rank):
+                    rank -= 1
+                if rank < lower:
+                    return reject(
+                        "cohort cannot right-align inside legal frontier "
+                        f"region={region} comment="
+                        f"{getattr(load, 'comment', '')!r} "
+                        f"window=[{windowBegin},{windowEnd}) "
+                        f"legal=[{lower},{upper}] next={nextRank} "
+                        f"waits={[(waitRanks[waitId], id(load) in frontier) for waitId, frontier in waitLoadPrefixes.items()]} "
+                        f"barriers={[(barrierRanks[barrierId], id(load) in frontier) for barrierId, frontier in barrierLoadPrefixes.items()]}")
+                reversedTargets.append((load, rank))
+                nextRank = rank
+            for load, rank in reversed(reversedTargets):
+                targetRanks[id(load)] = rank
 
     # Rebuild every scheduled setup/load pair, including requests whose load
     # rank is unchanged.  Moving a neighboring request into a shadow between
