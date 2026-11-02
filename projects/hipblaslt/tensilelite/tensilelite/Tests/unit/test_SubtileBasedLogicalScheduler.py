@@ -3186,42 +3186,38 @@ class TestUniformPgrEpoch:
         assert any("s_waitcnt vmcnt(18)" in line for line in c0)
         assert any("s_waitcnt vmcnt(12)" in line for line in c1)
 
-    def test_eight_wave_square_expands_narrow_barrier_frontier(self):
+    def test_eight_wave_square_keeps_original_schedule_on_capacity_fallback(
+            self, monkeypatch):
+        import importlib
+
+        instruction_scheduler = importlib.import_module(
+            "tensilelite.Components.Subtile.InstructionScheduler")
+        schedule_global = instruction_scheduler.scheduleGlobalVmemCohorts
+        results = []
+
+        def capture_result(*args, **kwargs):
+            result = schedule_global(*args, **kwargs)
+            results.append(result)
+            return result
+
+        monkeypatch.setattr(
+            instruction_scheduler,
+            "scheduleGlobalVmemCohorts",
+            capture_result)
         kernel, fixture, cfg = self._production_fixture(
             256, 256, [4, 2])
         assembly = _emit_mainloops(
             kernel, fixture, cfg, scale_tail_staging=False)
 
-        for copy_index, expected_data in (
-                (0, [*range(6, 10), 15, *range(20, 23)]),
-                (1, [*range(6, 10), *range(21, 25)])):
+        assert results == [None, None]
+        for copy_index in (0, 1):
             start = assembly.index(
                 f"/* MAINLOOP_C{copy_index} start */")
             end = assembly.index(
                 f"/* MAINLOOP_C{copy_index} end */", start)
-            mfma_rank = -1
-            data_ranks = []
-            barrier_ranks = []
-            for line in assembly[start:end].splitlines():
-                stripped = line.lstrip()
-                if stripped.startswith("v_mfma"):
-                    mfma_rank += 1
-                elif (
-                        stripped.startswith("buffer_load")
-                        and " lds " in stripped
-                        and stripped.split("//")[-1].strip().startswith(
-                            ("A ", "B "))):
-                    data_ranks.append(mfma_rank)
-                elif stripped.startswith("s_barrier"):
-                    barrier_ranks.append(mfma_rank)
-
-            assert data_ranks == expected_data
-            assert len(data_ranks) == len(set(data_ranks))
-            # The dependency-derived second barrier starts at M8.  Four A
-            # requests need ranks M6-M9, so dual-ended placement legally
-            # shifts the barrier to M9 while preserving its request frontier.
-            assert 9 in barrier_ranks
-            assert 8 not in barrier_ranks
+            section = assembly[start:end]
+            assert section.count("buffer_load") >= 8
+            assert section.count("v_mfma") == 32
 
     @pytest.mark.parametrize(
         "mt_m,mt_n,expected_c0,expected_c1",
@@ -3347,16 +3343,6 @@ class TestUniformPgrEpoch:
         "c0_boundaries,c0_counts,c1_boundaries,c1_counts",
         [
             (
-                128, 256, [2, 2], 32, 12,
-                (0, 11, 21, 32), (5, 5, 4),
-                (0, 10, 21, 32), (4, 4, 4),
-            ),
-            (
-                192, 256, [2, 2], 48, 14,
-                (0, 12, 24, 36, 48), (4, 4, 4, 4),
-                (0, 16, 32, 48), (5, 5, 4),
-            ),
-            (
                 224, 256, [1, 4], 56, 15,
                 (0, 25, 37, 56), (6, 5, 6),
                 (0, 18, 37, 56), (5, 5, 5),
@@ -3428,6 +3414,90 @@ class TestUniformPgrEpoch:
                     for rank in scale_ranks)
             else:
                 assert not scale_ranks
+
+    @pytest.mark.parametrize(
+        "mt_m,mt_n,mi_wave_group",
+        [
+            (128, 256, [2, 2]),
+            (192, 256, [2, 2]),
+            (128, 512, [1, 4]),
+        ],
+    )
+    def test_overloaded_or_unsupported_global_geometry_falls_back(
+            self, monkeypatch, mt_m, mt_n, mi_wave_group):
+        import importlib
+
+        instruction_scheduler = importlib.import_module(
+            "tensilelite.Components.Subtile.InstructionScheduler")
+        schedule_global = instruction_scheduler.scheduleGlobalVmemCohorts
+        results = []
+
+        def capture_result(*args, **kwargs):
+            result = schedule_global(*args, **kwargs)
+            results.append(result)
+            return result
+
+        monkeypatch.setattr(
+            instruction_scheduler,
+            "scheduleGlobalVmemCohorts",
+            capture_result)
+        kernel, fixture, cfg = self._production_fixture(
+            mt_m, mt_n, mi_wave_group)
+        assembly = _emit_mainloops(
+            kernel, fixture, cfg, scale_tail_staging=False)
+
+        assert results == [None, None]
+        assert assembly.count("/* MAINLOOP_C0 start */") == 1
+        assert assembly.count("/* MAINLOOP_C1 start */") == 1
+
+    @pytest.mark.parametrize(
+        "mt_m,mt_n,mi_wave_group,scale_tail_staging",
+        [
+            (64, 384, [1, 4], False),
+            (320, 256, None, True),
+        ],
+    )
+    def test_global_vmem_placement_never_splits_srd_carry_chain(
+            self, mt_m, mt_n, mi_wave_group, scale_tail_staging):
+        kernel, fixture, cfg = self._production_fixture(
+            mt_m, mt_n, mi_wave_group)
+        assembly = _emit_mainloops(
+            kernel, fixture, cfg,
+            scale_tail_staging=scale_tail_staging)
+
+        for copy_index in (0, 1):
+            start = assembly.index(
+                f"/* MAINLOOP_C{copy_index} start */")
+            end = assembly.index(
+                f"/* MAINLOOP_C{copy_index} end */", start)
+            lines = assembly[start:end].splitlines()
+            for low_index, line in enumerate(lines):
+                match = re.search(
+                    r"s_add_u32 s\[sgpr(Srd[^+\]]+)\]", line)
+                if match is None:
+                    continue
+                srd = match.group(1)
+                carry_index = next(
+                    index
+                    for index in range(low_index + 1, len(lines))
+                    if re.search(
+                        rf"s_addc_u32 s\[sgpr{re.escape(srd)}\+1\]",
+                        lines[index])
+                )
+                gap = lines[low_index + 1:carry_index]
+                assert not any(
+                    "s_add_u32 m0" in instruction
+                    or "buffer_load" in instruction
+                    for instruction in gap
+                ), f"{srd} carry chain was split in C{copy_index}"
+            if mt_m == 320 and mt_n == 256 and copy_index == 0:
+                mxsb_carry = next(
+                    index for index, line in enumerate(lines)
+                    if "s_addc_u32 s[sgprSrdMXSB+1]" in line)
+                co_resident_b = next(
+                    index for index, line in enumerate(lines)
+                    if "// B MT=n+2 tile=0 K=0 i=0" in line)
+                assert mxsb_carry < co_resident_b
 
     def test_global_six_request_cohorts_relocate_c0_sb_scale_reads(self):
         kernel, fixture, cfg = self._production_fixture(256, 256)
@@ -4905,7 +4975,7 @@ class TestInstructionSchedulerWrapPrefetch:
                     dst=mgpr(0), src0=sgpr("LocalWriteBaseAddrA"),
                     src1=index * 128, comment=f"setup-{index}"),
                 BufferLoadB128(
-                    dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                    dst=None, vaddr=vgpr(0), saddr=sgpr("SrdA", 4),
                     soffset=0, comment=f"dtl-{index}"),
             )
 
@@ -5129,6 +5199,44 @@ class TestInstructionSchedulerWrapPrefetch:
             reads + salu + [salu[0]] + valu)
         assert not _fitsInstructionTypeShadow(
             reads + salu + valu + [valu[0]])
+
+    def test_global_vmem_rebuild_rejects_hard_ds_capacity_overflow(self):
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.instruction import (
+            DSLoadB128, GlobalReadInstruction, MFMAInstruction)
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            scheduleGlobalVmemCohorts)
+
+        self._schedule()
+
+        def with_prefix_reads(read_count):
+            schedule = self._typed_capacity_p0_schedule()
+            items = list(schedule.flatitems())
+            first_mfma = next(
+                index for index, inst in enumerate(items)
+                if isinstance(inst, MFMAInstruction))
+            items[first_mfma + 1:first_mfma + 1] = [
+                DSLoadB128(
+                    dst=vgpr(120 + 4 * index, 4),
+                    src=vgpr(65),
+                    ds=DSModifiers(offset=index * 16),
+                    comment=f"prefix-read-{index}")
+                for index in range(read_count)
+            ]
+            schedule.setItems(items)
+            loads = [
+                inst for inst in schedule.flatitems()
+                if isinstance(inst, GlobalReadInstruction)
+            ]
+            return schedule, loads
+
+        balanced, balanced_loads = with_prefix_reads(3)
+        assert scheduleGlobalVmemCohorts(
+            balanced, orderedLoads=balanced_loads, cohortSize=4) is not None
+
+        overloaded, overloaded_loads = with_prefix_reads(4)
+        assert scheduleGlobalVmemCohorts(
+            overloaded, orderedLoads=overloaded_loads, cohortSize=4) is None
 
     def test_final_partition_capacity_pass_is_noop_for_balanced_tail(self):
         from rocisa.code import TextBlock

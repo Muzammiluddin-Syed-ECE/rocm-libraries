@@ -11,7 +11,8 @@ import copy
 from typing import List, Tuple, Optional
 from rocisa.code import Module, TextBlock
 from rocisa.instruction import SWaitCnt, SBarrier, SNop, MFMAInstruction, MXMFMAInstruction, \
-    LocalReadInstruction, GlobalReadInstruction, CommonInstruction, DSLoadB32, VMovB32, VXorB32
+    LocalReadInstruction, GlobalReadInstruction, CommonInstruction, DSLoadB32, VMovB32, VXorB32, \
+    SAddU32, SAddCU32
 from rocisa.container import vgpr
 
 
@@ -1013,7 +1014,7 @@ def _globalVmemPlacementCandidates(
 
 
 def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
-    """Right-align one VMEM plan while preserving all wait/barrier frontiers."""
+    """Right-align VMEM while preserving synchronization and SRD frontiers."""
     def reject(_reason):
         return None
 
@@ -1119,19 +1120,69 @@ def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
     if len({id(setup) for setup in setupByLoad.values()}) != len(setupByLoad):
         return reject("shared m0 setup")
 
+    def srdKey(inst):
+        """Return a symbolic SRD base such as SrdA or SrdMXSB."""
+        try:
+            params = inst.getParams()
+        except (AttributeError, RuntimeError):
+            return None
+        marker = "sgprSrd"
+        for param in params:
+            text = str(param)
+            begin = text.find(marker)
+            if begin < 0:
+                continue
+            begin += len("sgpr")
+            end = begin
+            while end < len(text) and (
+                    text[end].isalnum() or text[end] == "_"):
+                end += 1
+            return text[begin:end]
+        return None
+
+    loadSrdKeys = {
+        id(load): srdKey(load)
+        for load in scheduledLoads
+    }
+    if any(key is None for key in loadSrdKeys.values()):
+        return reject("scheduled load has no symbolic SRD")
+
     # Capture semantic wait/barrier membership before moving either loads or
     # synchronization instructions.  Later physical frontier shifts use these
     # sets as the source of truth and validation proves they are unchanged.
     waitLoadPrefixes = {}
     barrierLoadPrefixes = {}
+    srdUpdateKeys = {}
+    srdUpdateLoadPrefixes = {}
+    carryChains = []
+    pendingSrdAdd = {}
     targetLoadPrefix = []
+    targetLoadPrefixBySrd = {}
     for inst in items:
         if id(inst) in requestedIds:
             targetLoadPrefix.append(id(inst))
+            targetLoadPrefixBySrd.setdefault(
+                loadSrdKeys[id(inst)], []).append(id(inst))
         elif _isWaitCnt(inst) and inst.vlcnt >= 0:
             waitLoadPrefixes[id(inst)] = tuple(targetLoadPrefix)
         elif _isBarrier(inst):
             barrierLoadPrefixes[id(inst)] = tuple(targetLoadPrefix)
+        updateKey = srdKey(inst)
+        if (
+                updateKey is not None
+                and isinstance(inst, (SAddU32, SAddCU32))):
+            srdUpdateKeys[id(inst)] = updateKey
+            srdUpdateLoadPrefixes[id(inst)] = tuple(
+                targetLoadPrefixBySrd.get(updateKey, ()))
+            if isinstance(inst, SAddU32):
+                pendingSrdAdd[updateKey] = id(inst)
+            elif updateKey in pendingSrdAdd:
+                lowId = pendingSrdAdd.pop(updateKey)
+                # The input physical stream can already contain a DTL bundle
+                # between these instructions.  Every such bundle is rebuilt
+                # below, so accept the input but require the final stream to
+                # close this SCC-clobbering gap.
+                carryChains.append((lowId, id(inst)))
 
     def vgprSpan(reg):
         if reg is None or not hasattr(reg, "regType") or reg.regType != "v":
@@ -1349,6 +1400,23 @@ def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
         return reject("synchronization identity after left pack")
     waitRanks, barrierRanks = syncRanks
 
+    def recoverSrdUpdateLocations():
+        locations = {}
+        for index, inst in enumerate(prefix):
+            if id(inst) in srdUpdateKeys:
+                locations[id(inst)] = (-1, index)
+        for rank, group in enumerate(followers):
+            for index, inst in enumerate(group):
+                if id(inst) in srdUpdateKeys:
+                    locations[id(inst)] = (rank, index)
+        if set(locations) != set(srdUpdateKeys):
+            return None
+        return locations
+
+    srdUpdateLocations = recoverSrdUpdateLocations()
+    if srdUpdateLocations is None:
+        return reject("SRD update identity after left pack")
+
     # A dependency frontier can be narrower than the chosen VMEM cohort even
     # though the surrounding placement window has room.  When the upper
     # frontier is a barrier followed only by younger DTL bundles, slide that
@@ -1483,6 +1551,9 @@ def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
                 if syncRanks is None:
                     return reject("synchronization identity after shift")
                 waitRanks, barrierRanks = syncRanks
+                srdUpdateLocations = recoverSrdUpdateLocations()
+                if srdUpdateLocations is None:
+                    return reject("SRD update identity after shift")
             runBegin = runEnd
 
     loadLocations = {}
@@ -1513,7 +1584,22 @@ def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
                     upper = min(upper, barrierRanks[barrierId])
                 else:
                     lower = max(lower, barrierRanks[barrierId])
+            loadSrdKey = loadSrdKeys[loadId]
+            for updateId, frontier in srdUpdateLoadPrefixes.items():
+                if srdUpdateKeys[updateId] != loadSrdKey:
+                    continue
+                updateRank = srdUpdateLocations[updateId][0]
+                if loadId in frontier:
+                    upper = min(upper, updateRank)
+                else:
+                    lower = max(lower, updateRank)
             rank = min(upper, nextRank - 1)
+            while rank >= lower and any(
+                    srdUpdateLocations[lowId][0]
+                    < rank
+                    < srdUpdateLocations[carryId][0]
+                    for lowId, carryId in carryChains):
+                rank -= 1
             if rank < lower:
                 return reject(
                     "cohort cannot right-align inside legal frontier "
@@ -1573,13 +1659,20 @@ def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
             if index not in indices
         ]
 
-    # Insert each atomic setup/load bundle at the exact side of any co-resident
-    # wait or barrier that its original request frontier requires.  Otherwise
-    # VMEM leads a mixed shadow, in particular before independent LDS reads.
-    for load, rank in moved:
-        group = followers[rank]
-        lowerIndex = 0
-        upperIndex = len(group)
+    srdUpdateLocations = recoverSrdUpdateLocations()
+    if srdUpdateLocations is None:
+        return reject("SRD update identity before insertion")
+
+    def intersectIntervals(intervals, lower, upper):
+        return [
+            (max(begin, lower), min(end, upper))
+            for begin, end in intervals
+            if max(begin, lower) <= min(end, upper)
+        ]
+
+    def legalInsertionIntervals(load, rank, group):
+        loadId = id(load)
+        intervals = [(0, len(group))]
         for index, inst in enumerate(group):
             frontier = (
                 waitLoadPrefixes.get(id(inst))
@@ -1588,21 +1681,69 @@ def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
             )
             if frontier is None:
                 continue
-            if id(load) in frontier:
-                upperIndex = min(upperIndex, index)
+            if loadId in frontier:
+                intervals = intersectIntervals(intervals, 0, index)
             else:
-                lowerIndex = max(lowerIndex, index + 1)
-        if lowerIndex > upperIndex:
-            return reject("co-resident synchronization order")
-        firstDsRead = next(
+                intervals = intersectIntervals(
+                    intervals, index + 1, len(group))
+
+        loadSrdKey = loadSrdKeys[loadId]
+        for updateId, frontier in srdUpdateLoadPrefixes.items():
+            if srdUpdateKeys[updateId] != loadSrdKey:
+                continue
+            updateRank, updateIndex = srdUpdateLocations[updateId]
+            if updateRank != rank:
+                continue
+            if loadId in frontier:
+                intervals = intersectIntervals(
+                    intervals, 0, updateIndex)
+            else:
+                intervals = intersectIntervals(
+                    intervals, updateIndex + 1, len(group))
+
+        for lowId, carryId in carryChains:
+            lowRank, lowIndex = srdUpdateLocations[lowId]
+            carryRank, carryIndex = srdUpdateLocations[carryId]
+            if lowRank < rank < carryRank:
+                return []
+            if rank == lowRank == carryRank:
+                before = intersectIntervals(intervals, 0, lowIndex)
+                after = intersectIntervals(
+                    intervals, carryIndex + 1, len(group))
+                intervals = [*after, *before]
+            elif rank == lowRank:
+                intervals = intersectIntervals(intervals, 0, lowIndex)
+            elif rank == carryRank:
+                intervals = intersectIntervals(
+                    intervals, carryIndex + 1, len(group))
+        return intervals
+
+    # Insert each atomic setup/load bundle at the exact side of any co-resident
+    # wait, barrier, or same-SRD update that its original request frontier
+    # requires.  A bundle also may not split an SCC-producing SRD add/carry
+    # chain.  Otherwise VMEM leads a mixed shadow, before independent LDS
+    # reads when possible.
+    for load, rank in moved:
+        group = followers[rank]
+        intervals = legalInsertionIntervals(load, rank, group)
+        if not intervals:
+            return reject("co-resident frontier order")
+        begin, end = intervals[0]
+        insertionIndex = next(
             (
                 index
-                for index in range(lowerIndex, upperIndex)
+                for index in range(begin, end)
                 if _isDsRead(group[index])
             ),
-            upperIndex,
+            end,
         )
-        group[firstDsRead:firstDsRead] = bundles[id(load)]
+        group[insertionIndex:insertionIndex] = bundles[id(load)]
+
+    if any(
+            not _fitsInstructionTypeShadow(
+                group, allowPressedDs=True)
+            for group in followers):
+        return reject("follower shadow capacity")
 
     rebuilt = Module(schedule.name)
     for inst in prefix:
@@ -1644,6 +1785,32 @@ def _scheduleGlobalVmemPlacementPlan(schedule, orderedLoads, plan):
                 set(rebuiltBarrierPrefixes[barrierId])
                 != set(originalPrefix)):
             return reject("barrier request frontier")
+
+    rebuiltSrdPrefixes = {}
+    rebuiltAllPrefixesAtSrdUpdate = {}
+    targetLoadPrefix = []
+    targetLoadPrefixBySrd = {}
+    for inst in rebuilt.flatitems():
+        if id(inst) in requestedIds:
+            targetLoadPrefix.append(id(inst))
+            targetLoadPrefixBySrd.setdefault(
+                loadSrdKeys[id(inst)], []).append(id(inst))
+        elif id(inst) in srdUpdateKeys:
+            updateKey = srdUpdateKeys[id(inst)]
+            rebuiltSrdPrefixes[id(inst)] = tuple(
+                targetLoadPrefixBySrd.get(updateKey, ()))
+            rebuiltAllPrefixesAtSrdUpdate[id(inst)] = tuple(
+                targetLoadPrefix)
+    if set(rebuiltSrdPrefixes) != set(srdUpdateLoadPrefixes):
+        return reject("SRD update identity")
+    for updateId, originalPrefix in srdUpdateLoadPrefixes.items():
+        if set(rebuiltSrdPrefixes[updateId]) != set(originalPrefix):
+            return reject("same-SRD request frontier")
+    for lowId, carryId in carryChains:
+        if (
+                rebuiltAllPrefixesAtSrdUpdate[lowId]
+                != rebuiltAllPrefixesAtSrdUpdate[carryId]):
+            return reject("SRD carry chain split")
 
     return rebuilt
 

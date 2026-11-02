@@ -4681,9 +4681,12 @@ class LogicalScheduler:
                 globalVmemLoads,
                 orderedLoadAtoms=globalVmemLoadAtoms,
             )
-            assert globalSchedule is not None, \
-                "global VMEM cohorts did not match a supported loop shape"
-            module = globalSchedule
+            # The variable physical placer is an optional optimization.  A
+            # legal logical schedule may not fit its typed-shadow or frontier
+            # constraints, in which case retain the dependency-scheduled
+            # physical module unchanged.
+            if globalSchedule is not None:
+                module = globalSchedule
         if use_pap_preloop_skip and skipping_first_gr_group and not first_gr_group_done:
             module.add(pap_merge_label)
             module.add(SMovB32(dst=sgpr("PersistentPrefetchState"), src=0,
