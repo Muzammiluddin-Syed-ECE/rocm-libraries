@@ -7,10 +7,12 @@ Interleaves non-MFMA instructions between MFMAs using a slot-based placer
 with pluggable scheduling rules.
 """
 
+import copy
 from typing import List, Tuple, Optional
 from rocisa.code import Module, TextBlock
-from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
-    LocalReadInstruction, GlobalReadInstruction, CommonInstruction
+from rocisa.instruction import Instruction, SWaitCnt, SBarrier, SNop, MFMAInstruction, MXMFMAInstruction, \
+    LocalReadInstruction, GlobalReadInstruction, CommonInstruction, VMovB32
+from rocisa.container import vgpr
 
 
 # Advance the final partition's entry anchor by this many MFMA intervals.
@@ -30,6 +32,19 @@ _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT = True
 # LGKM wait still supplies the empty seam anchor for preceding-partition DTL
 # right alignment.
 _ADVANCE_FINAL_PARTITION_FOLLOWERS = False
+# The validated C0 scale-refresh fallback for one-dimensional dual-period
+# grids must retire scale-source reads before overwriting their VGPRs.
+_GFX950_SCALE_REFRESH_WAR_WAIT_STATE = 8
+# gfx950 scaled MFMAs can retain a scale-source VGPR for nine issue slots.
+# The post-schedule verifier below supplies only the part of this window not
+# already covered by independent instructions.
+_GFX950_SCALE_SOURCE_WAR_DISTANCE = 9
+# A staged LDS read needs useful work before its consumer-side wait.  Match the
+# scheduler's existing gfx9 ds_read latency-hiding policy.
+_MIN_SCALE_REFRESH_STAGING_MFMAS = 4
+# A wait+copy costs two issue slots even when the LDS latency is fully hidden.
+# Shorter residual WAR windows are therefore cheaper as direct-write padding.
+_MIN_SCALE_REFRESH_STAGING_DEFICIT = 3
 
 
 class _DtlIntervalCapacityError(RuntimeError):
@@ -472,7 +487,8 @@ class _SchedulingRules:
     def __init__(
             self, totalSlots: int,
             minGapDsReadToWait: int = _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
-            allowReadsAcrossWait: bool = False):
+            allowReadsAcrossWait: bool = False,
+            lateScaleRefresh: bool = False):
         # Cross-path state
         self.lastDsReadPos = -1
         self.earliestWaitCntPos = totalSlots
@@ -481,8 +497,13 @@ class _SchedulingRules:
         self.p0OverwritePrerequisiteIds = set()
         self.youngerP0OverwriteIds = set()
         self.partialP0OverwriteWaitIds = set()
+        # id(ds_read) -> local MFMA rank of the scale VGPR's final consumer.
+        # The refresh may issue only after one later MFMA interval has aged
+        # that source read; a whole-loop post-pass handles any residual gap.
+        self.scaleRefreshLastConsumer = {}
         self.minGap = minGapDsReadToWait
         self.allowReadsAcrossWait = allowReadsAcrossWait
+        self.lateScaleRefresh = lateScaleRefresh
         # Per-path state
         self._resetPath()
 
@@ -588,12 +609,27 @@ class _SchedulingRules:
 
     def spreadLocalReads(self, placer, limit, inst):
         """Spread a selected LR path across all available 4-cycle slots."""
-        if not _isDsRead(inst) or self.numLocalReads <= 1:
+        if ((self.lateScaleRefresh and placer.denseToFit)
+                or not _isDsRead(inst)
+                or self.numLocalReads <= 1):
             return limit
         target = self.localReadIdx * (placer.totalSlots - 1) \
             // (self.numLocalReads - 1)
         self.localReadIdx += 1
         return max(limit, target)
+
+    def deferScaleRefreshAfterLastUse(self, placer, limit, inst):
+        """Keep a scale VGPR refresh beyond its final phase-1 MFMA use."""
+        last_consumer = self.scaleRefreshLastConsumer.get(id(inst))
+        if last_consumer is None:
+            return limit
+        # One later gfx950 MXMFMA contributes eight issue cycles, one short of
+        # the nine-cycle scale-source retirement window.  Prefer a slot after
+        # two independent MFMAs and leave only true tail deficits to padding.
+        return max(
+            limit,
+            (last_consumer + 2) * placer.slotsPerInterval,
+        )
 
     # ── Placement hook: (placer, pos, inst) -> None ──
 
@@ -727,7 +763,9 @@ def _findPartitionZeroPrefetchOrder(preMfmaOrders, emittedModules):
     return None
 
 
-def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
+def _splitPartitionZeroPrefetch(
+        preMfmaOrders, emittedModules,
+        scaleRefreshWarWaitState: Optional[int] = None):
     """Move p0's full LR drain before its independent younger reads.
 
     Returns the matched order, a pre-MFMA wait/sync prefix, the payload path
@@ -739,25 +777,63 @@ def _splitPartitionZeroPrefetch(preMfmaOrders, emittedModules):
     if order is None:
         return None
 
+    def isScaleRefresh(mid):
+        em = emittedModules[mid]
+        return (
+            scaleRefreshWarWaitState is not None
+            and
+            em.opType in ("lr", "lr_inc")
+            and getattr(em.source, "tensor", None) in ("SA", "SB")
+        )
+
+    scalePayloadOrder = [mid for mid in order if isScaleRefresh(mid)]
+    scalePayloadInsts = _flattenPath(scalePayloadOrder, emittedModules)
+
     prefixInsts = []
     syncInsts = []
-    for opType in ("wait_gr", "sync", "wait_lr"):
+    for opType in ("wait_gr", "sync"):
         for mid in order:
             em = emittedModules[mid]
             if em.opType != opType:
                 continue
             for inst in em.instructions:
-                if opType == "wait_lr" and _isWaitCnt(inst):
-                    inst.dscnt = 0
-                    inst.comment = "Wait for preloop LR before p0 MFMA"
                 item = (mid, inst)
                 prefixInsts.append(item)
-                if opType == "sync":
+                # A barrier publishing the scale producer cannot be deferred
+                # past MFMA0: C0 refreshes the same scale VGPRs.
+                if opType == "sync" and not scalePayloadInsts:
                     syncInsts.append(item)
+
+    if scalePayloadInsts and scaleRefreshWarWaitState is not None:
+        prefixInsts.append((
+            -1,
+            SNop(
+                waitState=scaleRefreshWarWaitState,
+                comment=(
+                    "retire prior gfx950 scaled-MFMA scale-source reads "
+                    "before refresh"
+                ),
+            ),
+        ))
+    prefixInsts.extend(scalePayloadInsts)
+    for mid in order:
+        em = emittedModules[mid]
+        if em.opType != "wait_lr":
+            continue
+        for inst in em.instructions:
+            if _isWaitCnt(inst):
+                inst.dscnt = 0
+                inst.comment = (
+                    "Wait for C0 scale refresh and outstanding preloop LR"
+                    if scalePayloadInsts
+                    else "Wait for preloop LR before p0 MFMA"
+                )
+            prefixInsts.append((mid, inst))
 
     payloadOrder = [
         mid for mid in order
         if emittedModules[mid].opType not in ("wait_gr", "sync", "wait_lr")
+        and not isScaleRefresh(mid)
     ]
     payloadInsts = _flattenPath(payloadOrder, emittedModules)
     return order, prefixInsts, payloadOrder, payloadInsts, syncInsts
@@ -792,7 +868,7 @@ def _orderLocalReadsByFirstConsumer(pathInsts, emittedModules):
         metadata = emittedModules[mid].instructionMetadata
         if instruction_index < 0 or instruction_index >= len(metadata):
             return None
-        rank, span = metadata[instruction_index]
+        rank, span = metadata[instruction_index][:2]
         rank = rank if rank is not None else float("inf")
         reads.append((rank, span, original_index, item))
 
@@ -825,7 +901,7 @@ def _splitAfterFirstConsumerCohort(pathInsts, emittedModules):
         metadata = emittedModules[mid].instructionMetadata
         if instruction_index < 0 or instruction_index >= len(metadata):
             return [], pathInsts
-        rank, _span = metadata[instruction_index]
+        rank, _span = metadata[instruction_index][:2]
         if rank is None:
             if saw_first_cohort:
                 split = index
@@ -886,13 +962,13 @@ def _orderGlobalReadBundlesByFirstConsumer(grPaths, emittedModules):
                 return original
             offset = 0
             while offset < len(module_items):
-                rank, span = metadata[offset]
+                rank, span = metadata[offset][:2]
                 if not isinstance(span, int) or span <= 0:
                     return original
                 end = offset + span
                 if end > len(module_items):
                     return original
-                if any(metadata[index] != (rank, span)
+                if any(metadata[index][:2] != (rank, span)
                        for index in range(offset, end)):
                     return original
                 saw_rank = saw_rank or rank is not None
@@ -921,6 +997,228 @@ def _nextPlacementSlot(placer):
         if placer._placed[pos]:
             return pos + 1
     return 0
+
+
+def _registerIndices(operand):
+    """Return concrete VGPR indices covered by a rocisa operand."""
+    if getattr(operand, "regType", None) != "v":
+        return ()
+    start = getattr(operand, "regIdx", -1)
+    count = getattr(operand, "regNum", 1)
+    if start is None or start < 0:
+        return ()
+    return range(start, start + max(1, count))
+
+
+def _issueDistance(inst):
+    """Static issue-slot distance contributed by one physical instruction."""
+    if not isinstance(inst, Instruction):
+        return 0
+    if isinstance(inst, SNop):
+        try:
+            return max(1, int(inst.getParams()[0]) + 1)
+        except (IndexError, TypeError, ValueError, RuntimeError):
+            return 1
+    get_cycles = getattr(inst, "getIssueCycles", None)
+    if get_cycles is None:
+        return 1
+    try:
+        return max(1, int(get_cycles()))
+    except (TypeError, ValueError, RuntimeError):
+        return 1
+
+
+def insertScaleRefreshWarPadding(
+        module, requiredDistance=_GFX950_SCALE_SOURCE_WAR_DISTANCE,
+        stagingVgpr=None,
+        minStagingMfmas=_MIN_SCALE_REFRESH_STAGING_MFMAS,
+        minStagingDeficit=_MIN_SCALE_REFRESH_STAGING_DEFICIT):
+    """Resolve scaled-MFMA-source -> refresh-LR WAR windows.
+
+    A late scale refresh writes the same VGPR that earlier C1 scaled MFMAs
+    consume.  gfx950 has no dependency-counter wait for retiring that source
+    read.  Track the physical instruction stream per scale VGPR, credit useful
+    issue distance after its final consumer, and resolve each residual window.
+
+    Without ``stagingVgpr``, insert one residual ``s_nop`` immediately before
+    an unsafe refresh (the validated fallback).
+
+    With one staging VGPR, expensive refreshes first read LDS into the scratch.
+    Once the old canonical scale has retired, an exact partial LGKM wait proves
+    that staged read complete and a ``v_mov_b32`` publishes it.  The scratch is
+    then reusable for the next transition.  Small windows remain direct writes
+    because their padding costs less than the wait+copy pair.
+
+    The consuming MFMA's issue is the start of the window, not useful
+    separation.  Every later physical instruction contributes one issue slot;
+    ``s_nop N`` contributes N+1.  MFMA execution latency is deliberately not
+    credited as source-retirement distance.  This makes an immediate overwrite
+    receive ``s_nop 8`` while useful intervening instructions reduce the pad.
+    """
+    if requiredDistance <= 0:
+        return module
+
+    result = Module(module.name)
+    issue_position = 0
+    last_use_end = {}
+    pending = None
+
+    def add(inst):
+        """Append one instruction while updating pending-stage accounting."""
+        nonlocal issue_position, pending
+        result.add(inst)
+        issue_position += _issueDistance(inst)
+        if pending is None:
+            return
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            pending["mfmas"] += 1
+        if _isLgkmProducer(inst) and inst is not pending["read"]:
+            pending["youngerLgkm"] += 1
+        if isinstance(inst, SWaitCnt):
+            wait_count = 0 if getattr(inst, "waitAll", False) else inst.dscnt
+            if wait_count >= 0 and wait_count <= pending["youngerLgkm"]:
+                pending["ready"] = True
+
+    def war_deficit(destination):
+        deficits = [
+            requiredDistance - (issue_position - last_use_end[index])
+            for index in _registerIndices(destination)
+            if index in last_use_end
+        ]
+        return max(deficits, default=0)
+
+    def flush_staging(force=False):
+        """Publish the pending scratch value when legal, or force it at exit."""
+        nonlocal pending
+        if pending is None:
+            return True
+        if not force and (
+                pending["mfmas"] < minStagingMfmas
+                or war_deficit(pending["destination"]) > 0):
+            return False
+
+        if not pending["ready"]:
+            # If N younger LGKM requests follow the staged read, lgkmcnt(N)
+            # proves that the older staged request retired while leaving those
+            # younger requests in flight.  gfx9 encodes at most 15; a larger
+            # suffix falls back to a conservative full drain.
+            younger = pending["youngerLgkm"]
+            wait_count = younger if younger <= _MAX_LGKMCNT else 0
+            add(SWaitCnt(
+                dscnt=wait_count,
+                vlcnt=-1,
+                vscnt=-1,
+                comment=(
+                    "Wait for staged scale value"
+                    if wait_count == 0
+                    else (
+                        "Wait for staged scale value; "
+                        f"leave {wait_count} younger LGKM requests in flight"
+                    )
+                ),
+            ))
+            pending["ready"] = True
+
+        deficit = war_deficit(pending["destination"])
+        if deficit > 0:
+            add(SNop(
+                waitState=deficit - 1,
+                comment=(
+                    "residual gfx950 scaled-MFMA scale-source WAR "
+                    f"distance before staged publish ({deficit} cycles)"
+                ),
+            ))
+
+        destination = pending["destination"]
+        add(VMovB32(
+            dst=destination,
+            src=vgpr(stagingVgpr),
+            comment="publish staged scale value",
+        ))
+        pending = None
+        return True
+
+    instructions = list(module.flatitems())
+    remaining_mfmas = [0] * len(instructions)
+    count = 0
+    for index in range(len(instructions) - 1, -1, -1):
+        remaining_mfmas[index] = count
+        if isinstance(
+                instructions[index], (MFMAInstruction, MXMFMAInstruction)):
+            count += 1
+
+    for instruction_index, inst in enumerate(instructions):
+        distance = _issueDistance(inst)
+
+        # Prefer to publish after four intervening MFMAs, before consuming
+        # another generic instruction slot.  An existing wait is handled first
+        # below so it can retire the staged read without adding a second wait.
+        if (
+                pending is not None
+                and not isinstance(inst, SWaitCnt)
+                and pending["mfmas"] >= minStagingMfmas
+                and war_deficit(pending["destination"]) <= 0):
+            flush_staging()
+
+        if isinstance(inst, MXMFMAInstruction):
+            use_end = issue_position + distance
+            for operand_name in ("mxsa", "mxsb"):
+                for index in _registerIndices(
+                        getattr(inst, operand_name, None)):
+                    last_use_end[index] = use_end
+
+        is_refresh = (
+            isinstance(inst, LocalReadInstruction)
+            and "late scale refresh" in str(getattr(inst, "comment", ""))
+        )
+        if is_refresh:
+            destination = getattr(inst, "dst", None)
+            deficit = war_deficit(destination)
+            if deficit > 0:
+                if (
+                        stagingVgpr is not None
+                        and deficit >= minStagingDeficit
+                        and remaining_mfmas[instruction_index]
+                            >= minStagingMfmas):
+                    if pending is not None:
+                        flush_staging(force=True)
+                        deficit = war_deficit(destination)
+
+                    if deficit >= minStagingDeficit:
+                        staged = copy.deepcopy(inst)
+                        staged.dst = vgpr(stagingVgpr)
+                        staged.comment = (
+                            f"{inst.comment} via reusable staging VGPR"
+                        )
+                        pending = {
+                            "destination": copy.deepcopy(destination),
+                            "read": staged,
+                            "youngerLgkm": 0,
+                            "mfmas": 0,
+                            "ready": False,
+                        }
+                        add(staged)
+                        continue
+
+                # A prior staged publish can make this refresh safe.  Recheck
+                # before retaining the direct-write fallback.
+                deficit = war_deficit(destination)
+            if deficit > 0:
+                add(SNop(
+                    waitState=deficit - 1,
+                    comment=(
+                        "residual gfx950 scaled-MFMA scale-source WAR "
+                        f"distance ({deficit} cycles)"
+                    ),
+                ))
+
+        add(inst)
+        if isinstance(inst, SWaitCnt) and pending is not None:
+            flush_staging()
+
+    flush_staging(force=True)
+
+    return result
 
 
 def safeOutstandingLocalReadSuffix(
@@ -1389,7 +1687,9 @@ def instructionSchedule(
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
         partitionPrefetch: bool = False,
         limitDtlBundlesPerMfma: bool = False,
-        uniformPgrEpoch: bool = False):
+        uniformPgrEpoch: bool = False,
+        lateScaleRefresh: bool = False,
+        scaleRefreshWarWaitState: Optional[int] = None):
     """Interleave non-MFMA instructions between MFMAs.
 
     Rules (shared):
@@ -1430,7 +1730,8 @@ def instructionSchedule(
     # mode keeps legacy MXFP4 and other subtile schedules byte-stable.
     if isMx8Cycle and partitionPrefetch:
         p0Split = _splitPartitionZeroPrefetch(
-            preMfmaOrders, emittedModules)
+            preMfmaOrders, emittedModules,
+            scaleRefreshWarWaitState=scaleRefreshWarWaitState)
     partitionPrefetchPolicy = (
         isMx8Cycle
         and not multiDU
@@ -1506,12 +1807,48 @@ def instructionSchedule(
         )
     )
     phasePathInsts = []
+    scaleRefreshPaths = []
+    mixedLeadingItems = []
+    mixedGrPaths = []
     canUseThreePhase = partitionPrefetchPolicy
     for order, _hasWaitGR in paths:
         pathInsts = _flattenPath(order, emittedModules)
+        if lateScaleRefresh and any(
+                getattr(emittedModules[mid].source, "scaleRefresh", False)
+                for mid in order):
+            scaleRefreshPaths.append((order, pathInsts))
+            continue
         hasLR = any(_isDsRead(inst) for _, inst in pathInsts)
         hasGR = any(_isBufferLoad(inst) for _, inst in pathInsts)
         if hasLR and hasGR:
+            # With late scale refresh, p0's current data reads no longer share
+            # the MFMA-entry scale path.  Dependency grouping instead yields
+            # one LR -> wait/barrier -> GR chain.  Preserve that frontier while
+            # exposing its two sides to the three-phase placer.
+            last_lr = max(
+                (
+                    index
+                    for index, (mid, _inst) in enumerate(pathInsts)
+                    if emittedModules[mid].opType == "lr"
+                ),
+                default=-1,
+            )
+            if (
+                    lateScaleRefresh
+                    and
+                    partitionPrefetchPolicy
+                    and last_lr >= 0
+                    and any(
+                        emittedModules[mid].opType == "gr"
+                        for mid, _inst in pathInsts[last_lr + 1:]
+                    )
+                    and not any(
+                        emittedModules[mid].opType == "lr"
+                        for mid, _inst in pathInsts[last_lr + 1:]
+                    )):
+                mixedLeadingItems.extend(pathInsts[:last_lr + 1])
+                mixedGrPaths.append(pathInsts[last_lr + 1:])
+                continue
             canUseThreePhase = False
         phasePathInsts.append((order, pathInsts, hasLR, hasGR))
     if canUseThreePhase:
@@ -1522,7 +1859,8 @@ def instructionSchedule(
         totalSlots=(len(mfmas) - 1) * slotsPerInterval,
         minGapDsReadToWait=minGapDsReadToWait,
         allowReadsAcrossWait=(
-            partitionPrefetchPolicy or p0Split is not None))
+            partitionPrefetchPolicy or p0Split is not None),
+        lateScaleRefresh=lateScaleRefresh)
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
                        rules.minGapDsReadToWait]
     if not (partitionPrefetchPolicy or p0Split is not None):
@@ -1531,6 +1869,8 @@ def instructionSchedule(
     # policy.  Legacy schedules use only buffer-load spreading, matching the
     # parent scheduler exactly.
     base_adjusters = [rules.spreadBufferLoads]
+    if lateScaleRefresh:
+        base_adjusters.insert(0, rules.deferScaleRefreshAfterLastUse)
     if partitionPrefetchPolicy or p0Split is not None:
         base_adjusters.insert(0, rules.spreadLocalReads)
     if partitionPrefetchPolicy or p0Split is not None:
@@ -1556,9 +1896,38 @@ def instructionSchedule(
         textBlocksConsumeSlots=not (
             partitionPrefetchPolicy or p0Split is not None))
 
+    for order, _pathInsts in scaleRefreshPaths:
+        for mid in order:
+            em = emittedModules[mid]
+            if not getattr(em.source, "scaleRefresh", False):
+                continue
+            for inst, metadata in zip(
+                    em.instructions, em.instructionMetadata):
+                if not _isDsRead(inst) or len(metadata) < 3:
+                    continue
+                last_consumer = metadata[2]
+                if last_consumer is not None:
+                    rules.scaleRefreshLastConsumer[id(inst)] = last_consumer
+
+    # Place the C1 refresh chain first.  Its wait/barrier can occupy early
+    # holes, while per-read lower bounds defer each VGPR overwrite until that
+    # scale group is dead.  Normal LR/GR phases then fill the remaining slots.
+    for _order, pathInsts in scaleRefreshPaths:
+        rules.resetPath()
+        placer.placePath(
+            pathInsts,
+            startLimit=0,
+            overflowToTail=True,
+            mfmaBetweenWaitAndBarrier=True,
+        )
+
+    scaleRefreshOrders = {tuple(order) for order, _ in scaleRefreshPaths}
+
     def _placeRegularPaths():
         for order, hasWaitGR in paths:
             if not order:
+                continue
+            if tuple(order) in scaleRefreshOrders:
                 continue
             wrapPrefetch = partitionPrefetch \
                 and (not multiDU) and hasWaitGR \
@@ -1597,8 +1966,29 @@ def instructionSchedule(
     if canUseThreePhase:
         leading = []
         trailing = []
-        grPaths = []
+        grPaths = list(mixedGrPaths)
         otherPaths = []
+
+        overwriteReads = [
+            item for item in mixedLeadingItems
+            if getattr(
+                emittedModules[item[0]].source,
+                "mustPrecedeP0Overwrite",
+                False)
+        ]
+        regularMixedReads = [
+            item for item in mixedLeadingItems
+            if not getattr(
+                emittedModules[item[0]].source,
+                "mustPrecedeP0Overwrite",
+                False)
+        ]
+        if regularMixedReads:
+            first, rest = _splitAfterFirstConsumerCohort(
+                regularMixedReads, emittedModules)
+            leading.extend(first)
+            trailing.extend(rest)
+        leading.extend(overwriteReads)
 
         for _order, pathInsts, hasLR, hasGR in phasePathInsts:
             if hasLR:
@@ -1614,9 +2004,8 @@ def instructionSchedule(
         orderedGrItems = _orderGlobalReadBundlesByFirstConsumer(
             grPaths, emittedModules)
 
-        overwriteReads = []
         if p0Split is not None:
-            overwriteReads = [
+            splitOverwriteReads = [
                 item for item in p0Payload
                 if getattr(
                     emittedModules[item[0]].source,
@@ -1636,11 +2025,12 @@ def instructionSchedule(
             # These current-epoch reads overlap the p0 future-write cohort.
             # Keep the normal next-partition LR prefix first, but issue every
             # overwrite prerequisite before the GR path's lgkmcnt+barrier.
-            leading.extend(overwriteReads)
+            leading.extend(splitOverwriteReads)
+            overwriteReads.extend(splitOverwriteReads)
             trailing.extend(rest)
-            for _, inst in overwriteReads:
-                if _isDsRead(inst):
-                    rules.p0OverwritePrerequisiteIds.add(id(inst))
+        for _, inst in overwriteReads:
+            if _isDsRead(inst):
+                rules.p0OverwritePrerequisiteIds.add(id(inst))
 
         allPhaseItems = (
             p0Sync
@@ -1687,7 +2077,22 @@ def instructionSchedule(
                     mfmaBetweenWaitAndBarrier=mfmaBetweenWaitAndBarrier)
             finally:
                 placer.denseToFit = False
-            phaseLimit = max(phaseLimit, _nextPlacementSlot(placer))
+            if lateScaleRefresh:
+                pathInstructionIds = {id(inst) for _, inst in pathInsts}
+                pathEnd = max(
+                    (
+                        pos + 1
+                        for pos, slot in enumerate(placer._placed)
+                        if any(
+                            id(inst) in pathInstructionIds
+                            for _, inst in slot
+                        )
+                    ),
+                    default=phaseLimit,
+                )
+                phaseLimit = max(phaseLimit, pathEnd)
+            else:
+                phaseLimit = max(phaseLimit, _nextPlacementSlot(placer))
 
         _placePhase(p0Sync)
         if leading:

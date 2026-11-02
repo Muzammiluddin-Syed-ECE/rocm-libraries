@@ -1391,6 +1391,16 @@ def _emitDualPeriodTailScaleSrdAlignment(kernel, unrollIdx, scaleTiA, scaleTiB):
   return module
 
 
+def _supportsUniformPgrEpoch(partitionPrefetch, pgr, partition, m, n):
+  """Whether a complete-epoch frontier is valid for this partition grid."""
+  return (
+      partitionPrefetch
+      and pgr == 2
+      and partition is not None
+      and partition[0] < m
+      and partition[1] < n)
+
+
 def mainLoop(writer, kernel):
   module = Module()
   tensorParametersA = writer.tPA
@@ -1475,6 +1485,11 @@ def mainLoop(writer, kernel):
       mnN = max(1, int(lrSBGran.mn) if lrSBGran else 1)
       forcedPartition = (MFMASchedulerConfig._even_split_size(M, mnM),
                          MFMASchedulerConfig._even_split_size(N, mnN))
+  # A consolidated complete-epoch frontier is valid only for a genuine 2-D
+  # partition cycle.  A 2x1/1x2 grid shares one operand across partitions and
+  # therefore retains its dependency-derived VMEM frontiers.
+  schedulerUniformPgrEpoch = _supportsUniformPgrEpoch(
+      schedulerPartitionPrefetch, schedulerPgr, forcedPartition, M, N)
 
   vgprBudget = writer.states.regCaps["MaxVgpr"]
   vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
@@ -1506,7 +1521,7 @@ def mainLoop(writer, kernel):
           plr=schedulerPlr,
           doubleBufferTensors=schedulerDoubleBuffer,
           prefetchNextPartition=schedulerPartitionPrefetch,
-          uniformPgrEpoch=(schedulerPartitionPrefetch and schedulerPgr == 2),
+          uniformPgrEpoch=schedulerUniformPgrEpoch,
           uniformEpochVmemCohortSize=5,
           partitionOrder=schedulerPartitionOrder,
           grPlacement=grPlacement,

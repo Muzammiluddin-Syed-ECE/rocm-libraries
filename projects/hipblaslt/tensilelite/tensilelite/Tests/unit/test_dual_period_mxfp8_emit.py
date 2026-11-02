@@ -100,17 +100,34 @@ def _emit_dual_period_kernel():
 
 
 def _mainloop_lines(src):
-    """Return the steady-state mainloop body (label_LoopBeginL .. back-branch)."""
+    """Return one steady-state mainloop epoch through its back-branch."""
     lines = src.splitlines()
+    loopback_label = (
+        "label_LoopBackC0ScaleRefreshL:"
+        if "label_LoopBackC0ScaleRefreshL:" in src
+        else "label_LoopBeginL:"
+    )
+    loopback_branch = (
+        "s_cbranch_scc0 label_LoopBackC0ScaleRefreshL"
+        if "label_LoopBackC0ScaleRefreshL:" in src
+        else "s_cbranch_scc0 label_LoopBeginL"
+    )
     start = end = None
     for i, ln in enumerate(lines):
-        if start is None and ln.strip() == "label_LoopBeginL:":
+        if start is None and ln.strip() == loopback_label:
             start = i
-        elif start is not None and "s_cbranch_scc0 label_LoopBeginL" in ln:
+        elif start is not None and loopback_branch in ln:
             end = i
             break
     assert start is not None and end is not None, "could not locate mainloop body"
     return lines[start:end + 1]
+
+
+def _section_lines(src, label):
+    begin = "/* %s start */" % label
+    end = "/* %s end */" % label
+    assert begin in src and end in src, "missing %s section" % label
+    return src[src.index(begin) + len(begin):src.index(end)].splitlines()
 
 
 @pytest.fixture(scope="module")
@@ -134,6 +151,92 @@ def test_six_scale_reads_per_epoch(dual_src):
                 for r in reads if "// SB MT=" in r)
     assert sa == [0, 2, 4, 6], "scale-A tile groups: %s" % sa
     assert sb == [0, 2], "scale-B tile groups: %s" % sb
+
+
+def test_tail_scale_refresh_moves_from_c1_to_the_loopback_c0(dual_src):
+    c0 = _section_lines(dual_src, "MAINLOOP_C0")
+    c1 = _section_lines(dual_src, "MAINLOOP_C1")
+    c0_refreshes = [
+        line for line in c0
+        if "late scale refresh" in line
+    ]
+    assert len(c0_refreshes) == 2
+    assert any("// SA MT=n+2 tile=6" in line for line in c0_refreshes)
+    assert any("// SB MT=n+2 tile=2" in line for line in c0_refreshes)
+
+    refreshes = [
+        (index, line)
+        for index, line in enumerate(c1)
+        if "late scale refresh" in line
+    ]
+    assert len(refreshes) == 4
+
+    uses = {}
+    for index, line in enumerate(c1):
+        if "v_mfma_scale" not in line:
+            continue
+        match = re.search(r", (v\d+), (v\d+) op_sel:", line)
+        assert match, line
+        for register in match.groups():
+            uses.setdefault(register, []).append(index)
+
+    staged_registers = {
+        re.search(r"ds_read_b32 (v\d+),", line).group(1)
+        for _, line in refreshes
+        if "via reusable staging VGPR" in line
+    }
+    assert len(staged_registers) == 1
+    staging_register = next(iter(staged_registers))
+    for refresh_index, line in refreshes:
+        destination = re.search(r"ds_read_b32 (v\d+),", line)
+        assert destination, line
+        destination = destination.group(1)
+        if destination == staging_register:
+            publish_index = next(
+                index
+                for index, candidate in enumerate(
+                    c1[refresh_index + 1:], refresh_index + 1)
+                if re.search(
+                    rf"v_mov_b32 v\d+, {staging_register}\b",
+                    candidate)
+            )
+            publish = re.search(
+                rf"v_mov_b32 (v\d+), {staging_register}\b",
+                c1[publish_index])
+            assert any(
+                "s_waitcnt lgkmcnt" in candidate
+                and "staged scale value" in candidate
+                for candidate in c1[refresh_index:publish_index]
+            )
+            destination = publish.group(1)
+            refresh_index = publish_index
+        assert max(uses[destination]) < refresh_index
+
+    first_refresh = refreshes[0][0]
+    producer_wait = next(
+        index for index, line in enumerate(c1[:first_refresh])
+        if "s_waitcnt vmcnt" in line
+    )
+    producer_barrier = next(
+        index for index in range(producer_wait + 1, first_refresh)
+        if "s_barrier" in c1[index]
+    )
+    assert producer_wait < producer_barrier < first_refresh
+    assert sum("swap MXSA LR vgpr" in line for line in c0) == 1
+    assert sum("swap MXSB LR vgpr" in line for line in c0) == 1
+    assert not any(
+        "swap MXS" in line and "LR vgpr" in line
+        for line in c1)
+
+    assert sum(
+        "late scale refresh" in line
+        for line in _section_lines(dual_src, "NGLL_C0")
+    ) == 6
+    assert not any(
+        "late scale refresh" in line
+        for label in ("NGLL_C1", "NLL_C0", "NLL_C1")
+        for line in _section_lines(dual_src, label)
+    )
 
 
 def test_both_scale_phases_consumed(dual_src):
@@ -246,22 +349,24 @@ def test_vgpr_within_two_wave_slot_budget(dual_src):
         "architectural VGPR %d exceeds the two-wave-slot budget (128)" % vgpr)
 
 
-def test_no_scale_local_read_in_preloop(dual_src):
-    """The pre-loop prefetches data operands but not scales.
-
-    Scale local reads are epoch-granular: the mainloop, NLL, NGLL and tail
-    paths each re-read the whole group set at their head, so a pre-loop copy
-    would be overwritten before any MFMA consumes it.  Data local reads are
-    partition-granular and must still be there, feeding partition 0's MFMAs.
-    """
+def test_preloop_seeds_complete_scale_e0_once(dual_src):
+    """The preloop seeds every scale VGPR needed by the first C0 body."""
     preloop = []
     for ln in dual_src.splitlines():
         if ln.strip() == "label_LoopBeginL:":
             break
         preloop.append(ln)
 
-    scale_lr = [l for l in preloop if "ds_read" in l and "scaleMXS" in l]
-    assert not scale_lr, "pre-loop re-reads scales the mainloop reloads: %s" % scale_lr
+    scale_lr = [
+        ln for ln in preloop
+        if re.search(r"^\s*ds_read_b32\b.*// S[AB] MT=", ln)
+    ]
+    sa = sorted(int(re.search(r"// SA MT=.* tile=(\d+)", ln).group(1))
+                for ln in scale_lr if "// SA MT=" in ln)
+    sb = sorted(int(re.search(r"// SB MT=.* tile=(\d+)", ln).group(1))
+                for ln in scale_lr if "// SB MT=" in ln)
+    assert sa == [0, 2, 4, 6]
+    assert sb == [0, 2]
 
     data_lr = [
         l for l in preloop

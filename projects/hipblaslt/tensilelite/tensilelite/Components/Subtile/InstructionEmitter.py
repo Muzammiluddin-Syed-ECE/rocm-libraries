@@ -223,7 +223,12 @@ class InstructionEmitter:
         instructions = list(instructions)
         first_consumer = self._first_consumer_rank(placement, tile_id)
         group_span = len(instructions)
-        return [(first_consumer, group_span)] * group_span
+        last_consumer = (
+            placement.lastConsumerMfma
+            if getattr(placement, "scaleRefresh", False)
+            else None
+        )
+        return [(first_consumer, group_span, last_consumer)] * group_span
 
     def emit_mfma(self, placement, unroll_iter=0, scale_phase=None):
         """Emit MFMAs, optionally selecting a scale phase independently.
@@ -337,13 +342,13 @@ class InstructionEmitter:
                             reads.flatitems(), placement, tileId))
                     module.add(reads)
         elif tensor in ('SA', 'SB'):
-            # Dual-period MXFP8: one scale dword covers both K phases of the
-            # epoch and lives in a globally-colored VGPR that survives across
-            # the scaleReuse-unrolled data iterations.  Read it once per epoch
-            # (unroll_iter 0); later data iterations reuse the resident dword
-            # (the MFMA selects the K-phase byte via op_sel_hi).  This keeps the
-            # steady-state epoch at exactly six scale ds_reads.
-            if getattr(self.config, 'dualPeriodScale', False) and unroll_iter > 0:
+            # One-dimensional dual-period grids retain the validated C0
+            # refresh policy: the scale dword is loaded once and reused by C1.
+            # Genuine 2-D grids instead carry explicit phase eligibility on
+            # their late-refresh placements.
+            if (getattr(self.config, 'dualPeriodScale', False)
+                    and not getattr(self.config, 'lateScaleRefresh', False)
+                    and unroll_iter > 0):
                 return []
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
             ti = self.tileInfoMap[tensor]
@@ -360,10 +365,13 @@ class InstructionEmitter:
                     dst=vgpr(vdst),
                     src=vgpr(ti.sharedVgprLROffset[0]),
                     ds=DSModifiers(offset=dsOffset),
-                    comment="%s MT=%s tile=%u K=%u" % (
+                    comment="%s MT=%s tile=%u K=%u%s" % (
                         tensor,
                         "n" if placement.mtIteration == 0 else "n+%d" % placement.mtIteration,
-                        tileId, placement.tiles.subIterK_start))
+                        tileId, placement.tiles.subIterK_start,
+                        " late scale refresh"
+                        if getattr(placement, "scaleRefresh", False)
+                        else ""))
                 instruction_metadata.extend(
                     self._local_read_group_metadata(
                         [read], placement, tileId))
@@ -394,15 +402,13 @@ class InstructionEmitter:
                     first_consumer = self._first_consumer_rank(
                         placement, tileId)
                     instruction_metadata.extend(
-                        [(first_consumer, len(request_instructions))]
+                        [(first_consumer, len(request_instructions), None)]
                         * len(request_instructions))
                     module.add(request)
         elif tensor in ('SA', 'SB'):
-            # Dual-period MXFP8: one scale epoch (256 K) feeds scaleReuse data
-            # iterations.  Prefetch the next epoch's scales (SRD advance + DTL
-            # load) exactly once per epoch (unroll_iter 0); later data
-            # iterations must NOT re-advance the scale SRD or re-issue the load.
-            if getattr(self.config, 'dualPeriodScale', False) and unroll_iter > 0:
+            if (getattr(self.config, 'dualPeriodScale', False)
+                    and not getattr(self.config, 'lateScaleRefresh', False)
+                    and unroll_iter > 0):
                 return []
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
             request = globalReadDoScaleSubtile(
@@ -411,7 +417,7 @@ class InstructionEmitter:
             first_consumer = self._first_consumer_rank(
                 placement, placement.tiles.tileId_start)
             instruction_metadata.extend(
-                [(first_consumer, len(request_instructions))]
+                [(first_consumer, len(request_instructions), None)]
                 * len(request_instructions))
             module.add(request)
         return list(module.flatitems())
@@ -475,13 +481,10 @@ class InstructionEmitter:
         tensor = source.tensor
         tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
         module = Module()
-        # Dual-period MXFP8: the scale LDS double-buffer is driven on the 256-K
-        # epoch cadence.  Toggle the scale LR read-half once per epoch
-        # (unroll_iter 0) so it tracks the GR write-half swap; toggling on every
-        # data iteration would net to zero over the epoch and leave the LR
-        # reading the stale half.
-        if tensor in ('SA', 'SB') and getattr(self.config, 'dualPeriodScale', False) \
-                and unroll_iter > 0:
+        if (tensor in ('SA', 'SB')
+                and getattr(self.config, 'dualPeriodScale', False)
+                and not getattr(self.config, 'lateScaleRefresh', False)
+                and unroll_iter > 0):
             return []
         module.add(localReadLDSBufferSwap(tc, self.writer, self.kernel))
         return list(module.flatitems())
@@ -492,11 +495,9 @@ class InstructionEmitter:
         tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
         module = Module()
         if tensor in ('SA', 'SB'):
-            # Dual-period MXFP8: advance the scale SRD and swap the scale LDS
-            # double-buffer once per 256-K epoch (unroll_iter 0).  Advancing on
-            # every data iteration would over-stride the scale pointer by
-            # scaleReuse and desynchronize scales from data.
-            if getattr(self.config, 'dualPeriodScale', False) and unroll_iter > 0:
+            if (getattr(self.config, 'dualPeriodScale', False)
+                    and not getattr(self.config, 'lateScaleRefresh', False)
+                    and unroll_iter > 0):
                 return []
             module.add(globalReadScalePtrUpdates(tc, self.writer, self.kernel))
         else:
@@ -858,6 +859,17 @@ class InstructionEmitter:
         for partition_emitted in emitted:
             for emitted_group in partition_emitted:
                 for em in emitted_group:
+                    if (getattr(em.source, "first_unroll_only", False)
+                            and unroll_iter > 0):
+                        em.instructions = []
+                        em.instructionMetadata = []
+                        continue
+                    emit_unrolls = getattr(em.source, "emitUnrolls", None)
+                    if (emit_unrolls is not None
+                            and unroll_iter not in emit_unrolls):
+                        em.instructions = []
+                        em.instructionMetadata = []
+                        continue
                     if em.opType == 'mfma' and mfma_scale_phase is not None:
                         em.instructions = self.emit_mfma(
                             em.source, unroll_iter,

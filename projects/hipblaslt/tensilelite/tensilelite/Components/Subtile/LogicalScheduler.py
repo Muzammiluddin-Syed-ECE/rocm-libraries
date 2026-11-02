@@ -281,6 +281,10 @@ class SchedulerConfig:
     # tensors advance / reload once per epoch (every scaleReuse data iterations)
     # rather than every data iteration.  1 = legacy single-period behavior.
     scaleReuse: int = 1
+    # Move only the phase-1 scale refreshes that cannot fit after their final
+    # consumer into the next C0 prefix.  The first C0 entry keeps the preloop
+    # seeds; only the C1 loopback path executes the deferred reads.
+    deferTailScaleRefreshToC0: bool = True
 
     # Resolve a partition spec into per-partition sizes along one dimension.
     # spec is either:
@@ -372,13 +376,6 @@ class SchedulerConfig:
         # the data K axis.  Scales carry their own epoch cadence (scaleReuse).
         self.dualPeriodScale = self.hasScale and self.scaleReuse > 1
 
-        assert self.scaleReuse >= 1, f"scaleReuse must be >= 1, got {self.scaleReuse}"
-        # Dual-period MXFP8: the scale epoch (256 K) spans scaleReuse data
-        # iterations.  The data K unroll (numSubIterK / numUnroll) must then be
-        # derived from the DATA tensors only; a scale gr.k > 1 must NOT expand
-        # the data K axis.  Scales carry their own epoch cadence (scaleReuse).
-        self.dualPeriodScale = self.hasScale and self.scaleReuse > 1
-
         grans = {'A': self.grA, 'B': self.grB}
         if self.hasScale:
             grans['SA'] = self.grSA
@@ -426,6 +423,16 @@ class SchedulerConfig:
             remainder_last=data_multi_du)
         self._prefixM = self._build_prefix(self._partitionSizesM)
         self._prefixN = self._build_prefix(self._partitionSizesN)
+        # Late C1 scale refresh relies on a genuine 2-D partition cycle.  A
+        # 2x1/1x2 grid shares one operand across partitions, and hardware
+        # validation showed that its partial VMEM producer frontier is not
+        # sufficient.  Keep the dual-period epoch cadence there, but use the
+        # prior C0 refresh policy instead.
+        self.lateScaleRefresh = (
+            self.dualPeriodScale
+            and len(self._partitionSizesM) > 1
+            and len(self._partitionSizesN) > 1
+        )
         assert self.partitionOrder in ("m-major", "n-major"), \
             f"partitionOrder must be m-major or n-major, got {self.partitionOrder}"
 
@@ -529,6 +536,10 @@ class SchedulerConfig:
 class Emittable:
     """Base for anything placed in an EmittedModule."""
     kind: str = field(init=False, default="")
+    # Optional static-unroll eligibility.  None means emit in every body.
+    # Dual-period scales use this to keep GR/pointer work in C0 while moving
+    # the next-epoch VGPR refresh into C1.
+    emitUnrolls: Optional[Tuple[int, ...]] = field(init=False, default=None)
 
 
 @dataclass
@@ -560,6 +571,12 @@ class LRPlacement(Emittable):
     partition: int = 0         # which partition this LR belongs to
     targetPartition: int = 0   # partition that consumes the loaded operands
     mustPrecedeP0Overwrite: bool = False  # hoisted read protecting p0 future write
+    # A dual-period scale refresh overwrites a scale VGPR only after that
+    # group's final phase-1 MFMA consumer.  lastConsumerMfma is local to this
+    # placement's partition and is consumed by the physical scheduler.
+    scaleRefresh: bool = False
+    lastConsumerMfma: Optional[int] = None
+    scaleProducerDeps: List['Dep'] = field(default_factory=list)
     deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     postOps: List['BaseOp'] = field(default_factory=list)    # populated by insert_gr_lr_inc()
@@ -901,6 +918,11 @@ class LogicalScheduler:
                                                       'SA': set(), 'SB': set()}
         self._tail_freed_tile_ids: Dict[str, set] = {'A': set(), 'B': set(),
                                                      'SA': set(), 'SB': set()}
+        # Genuine 2-D dual-period schedules use one reusable VGPR to decouple
+        # an unsafe late scale ds_read from the still-live canonical MFMA
+        # source.  It is allocated with the tile set and supplied to the final
+        # physical WAR-resolution pass.
+        self.scaleRefreshStagingVgpr: Optional[int] = None
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -1061,35 +1083,124 @@ class LogicalScheduler:
                     slot.lrs[index:index + 1] = remaining
 
     def _place_scale_LRs_epoch(self, partitions):
-        """Place the per-epoch scale LRs for the dual-period MXFP8 path.
+        """Select the validated scale-refresh policy for this partition grid."""
+        if self.config.lateScaleRefresh:
+            self._place_scale_LRs_epoch_late(partitions)
+        else:
+            self._place_scale_LRs_epoch_safe(partitions)
 
-        Scales live on the 256-K epoch, not on the data subIterK axis, so the
-        per-partition K-chunk placement never emits them (numSubIterK=1 while the
-        scale LR spans k=0..lrS.k).  Instead, read every mn-group across the full
-        free dimension exactly once at the epoch start (partition 0, slot 0):
-        for MIWT 8x4 that is 4 scale-A groups + 2 scale-B groups = six packed
-        ds_reads, each covering both K phases (k=0..lrS.k).  These VGPRs are then
-        reused by every partition and both K phases of the epoch.
+    def _place_scale_LRs_epoch_safe(self, partitions):
+        """Place the prior safe C0 scale-refresh cohort.
+
+        One dword covers both K phases of a dual-period scale epoch.  Read each
+        scale group once at the C0 head and let the emitter suppress the same
+        logical cohort in C1.
         """
         cfg = self.config
         slot0 = partitions[0][0]
-        # The scale LR physically reads a dword spanning both K phases of the
-        # epoch, but the logical schedule has a single data subIterK slot: tie
-        # the LR to that slot (k=0..numSubIterK) so MFMA->LR / GR->LR deps match.
-        # K-phase 0/1 selection within the epoch is an ISA detail handled by the
-        # MFMA scale-byte selector, not by a second subIterK slot.
-        for tensor, gran, numTiles in (('SA', cfg.lrSA, cfg.numMFMATilesM),
-                                       ('SB', cfg.lrSB, cfg.numMFMATilesN)):
-            for g in range(0, numTiles, gran.mn):
+        for tensor, gran, num_tiles in (
+                ('SA', cfg.lrSA, cfg.numMFMATilesM),
+                ('SB', cfg.lrSB, cfg.numMFMATilesN)):
+            for group in range(0, num_tiles, gran.mn):
                 lr = LRPlacement(
                     tensor=tensor,
                     mtIteration=0,
-                    tiles=MFMATileRange(0, cfg.numSubIterK, g, g + gran.mn),
+                    tiles=MFMATileRange(
+                        0, cfg.numSubIterK, group, group + gran.mn),
                     subIterK_slot=0,
+                    partition=0,
                     targetPartition=0,
                 )
-                lr.partition = 0
                 slot0.lrs.append(lr)
+
+    def _place_scale_LRs_epoch_late(self, partitions):
+        """Place one late phase-1 refresh for every dual-period scale group.
+
+        The regular partition-prefetch placer treats scales like A/B and would
+        create both current- and next-partition scale reads.  A dual-period
+        scale dword instead remains live for both C0 and C1, so those reads are
+        redundant and, at the C0 head, overwrite a VGPR still being consumed by
+        the preceding C1 MFMA.
+
+        Remove the regular scale placements and put each group immediately
+        after the partition containing its final C1 consumer.  The physical
+        scheduler uses ``lastConsumerMfma`` to choose the first legal follower
+        interval.  Refreshes read the scale epoch produced by the C0-only
+        ``GR(n+2)`` stream and become visible to the next C0 through the normal
+        MFMA-entry LGKM wait.
+        """
+        cfg = self.config
+        assert cfg.scaleReuse == 2, \
+            "late dual-period scale refresh currently requires scaleReuse=2"
+
+        for slots in partitions:
+            for slot in slots:
+                slot.lrs = [
+                    lr for lr in slot.lrs
+                    if lr.tensor not in ('SA', 'SB')
+                ]
+
+        last_use = {}
+        for pi in range(cfg.numPartitions):
+            tile_range = self._partition_tile_range(pi)
+            a_tiles = range(*tile_range['A'])
+            b_tiles = range(*tile_range['B'])
+            for mfma_rank, (a, b) in enumerate(
+                    (a, b) for a in a_tiles for b in b_tiles):
+                group_a = (a // cfg.lrSA.mn) * cfg.lrSA.mn
+                group_b = (b // cfg.lrSB.mn) * cfg.lrSB.mn
+                last_use[('SA', group_a)] = (pi, mfma_rank)
+                last_use[('SB', group_b)] = (pi, mfma_rank)
+
+        refreshes = []
+        for tensor, gran, num_tiles in (
+                ('SA', cfg.lrSA, cfg.numMFMATilesM),
+                ('SB', cfg.lrSB, cfg.numMFMATilesN)):
+            for group in range(0, num_tiles, gran.mn):
+                pi, mfma_rank = last_use[(tensor, group)]
+                destination_pi = pi
+                destination_rank = mfma_rank
+                mfma_count = len(
+                    partitions[pi][0].mfma.tileA.tileId_list
+                ) * len(
+                    partitions[pi][0].mfma.tileB.tileId_list
+                )
+                if (
+                        mfma_rank == mfma_count - 1
+                        and pi + 1 < len(partitions)):
+                    # A read immediately after a partition's final consumer
+                    # has no useful work with which to retire the scale-source
+                    # WAR.  Carry that dead group into the next partition,
+                    # whose first MFMA is independent by construction.
+                    destination_pi = pi + 1
+                    destination_rank = -1
+                lr = LRPlacement(
+                    tensor=tensor,
+                    # Scale GRs are the C0-only n+2 producer stream.  Matching
+                    # that logical epoch keeps GR-before-LR bounds local while
+                    # the emitted phase mask supplies the C0 -> C1 edge.
+                    mtIteration=cfg.pgr,
+                    tiles=MFMATileRange(
+                        0, cfg.numSubIterK, group, group + gran.mn),
+                    subIterK_slot=0,
+                    partition=destination_pi,
+                    targetPartition=0,
+                    scaleRefresh=True,
+                    lastConsumerMfma=destination_rank,
+                )
+                lr.emitUnrolls = (cfg.scaleReuse - 1,)
+                refreshes.append(lr)
+
+        # Earliest-dead groups first.  This order also supplies useful issue
+        # distance for groups consumed by a partition's final MFMA.
+        refreshes.sort(key=lambda lr: (
+            lr.partition,
+            lr.lastConsumerMfma,
+            self._TENSOR_ORDER[lr.tensor],
+            lr.tiles.tileId_start,
+        ))
+        for lr in refreshes:
+            partitions[lr.partition][lr.subIterK_slot].lrs.append(lr)
 
     def _create_partition_slots(self, cur: dict) -> List[SubIterKSlot]:
         """Create SubIterKSlots with MFMAs placed for one partition."""
@@ -1868,12 +1979,15 @@ class LogicalScheduler:
                                 prev.tiles.tileId_end == ts):
                             prev.tiles = MFMATileRange(ks, ke, prev.tiles.tileId_start, te)
                             continue
-                    gr_list_for_uid.append(GRPlacement(
+                    placement = GRPlacement(
                         tensor=tensor, mtIteration=mt_val,
                         tiles=MFMATileRange(ks, ke, ts, te),
                         subIterK_slot=si,
                         partition=pi,
-                        unrollId=uid))
+                        unrollId=uid)
+                    if cfg.dualPeriodScale and tensor in ('SA', 'SB'):
+                        placement.emitUnrolls = (0,)
+                    gr_list_for_uid.append(placement)
 
     @pipeline_pass(Pass.GR)
     def place_GRs(self) -> PartitionSchedule:
@@ -2634,15 +2748,25 @@ class LogicalScheduler:
                     same, cross = self._split_deps(slot.mfma.deps, pi, slot.subIterK)
                     slot.mfma.deps = same
                     slot.mfma.preOps = []
-                    has_lr_dep = any(
-                        isinstance(d.ref, LRPlacement) for d in same + cross)
+                    lr_deps = [
+                        d for d in same + cross
+                        if isinstance(d.ref, LRPlacement)
+                    ]
+                    has_lr_dep = bool(lr_deps)
                     if has_lr_dep:
-                        slot.mfma.preOps.append(WaitLROp())
+                        wait = WaitLROp()
+                        # A refresh from the preceding C1 only gates C0.  Keep
+                        # waits required by ordinary A/B reads in both copies.
+                        if all(d.ref.scaleRefresh for d in lr_deps):
+                            wait.emitUnrolls = (0,)
+                        slot.mfma.preOps.append(wait)
 
                 # ── LRs ──
                 for lr in slot.lrs:
                     gr_deps = [d for d in lr.deps
                                if isinstance(d.ref, GRPlacement)]
+                    if lr.scaleRefresh:
+                        lr.scaleProducerDeps = list(gr_deps)
                     same, cross = self._split_deps(lr.deps, pi, lr.subIterK_slot)
                     lr.deps = same
                     lr.preOps = []
@@ -2670,18 +2794,22 @@ class LogicalScheduler:
                             any_wrap = (lr.mtIteration > 0
                                         or any(d.mt_offset != 0 for d in gr_deps))
                             force_drain = (self.config.pgr == 1 and any_wrap)
-                            lr.preOps.append(WaitGROp(wait_gr_counts=counts,
-                                                      has_sync=True,
-                                                      adjustVmcnt=is_cross,
-                                                      force_drain=force_drain))
+                            wait = WaitGROp(wait_gr_counts=counts,
+                                            has_sync=True,
+                                            adjustVmcnt=is_cross,
+                                            force_drain=force_drain)
+                            wait.emitUnrolls = lr.emitUnrolls
+                            lr.preOps.append(wait)
                         else:
                             cross_set = set(id(d) for d in cross)
                             is_cross = id(dep) in cross_set
                             counts = self._compute_inflight_loads(
                                 pi, lr.subIterK_slot, dep.ref.tensor, dep)
-                            lr.preOps.append(WaitGROp(wait_gr_counts=counts,
-                                                      has_sync=True,
-                                                      adjustVmcnt=is_cross))
+                            wait = WaitGROp(wait_gr_counts=counts,
+                                            has_sync=True,
+                                            adjustVmcnt=is_cross)
+                            wait.emitUnrolls = lr.emitUnrolls
+                            lr.preOps.append(wait)
 
                 # ── GRs ──
                 for gr in slot.grs:
@@ -2690,10 +2818,17 @@ class LogicalScheduler:
                     has_lr_dep = any(
                         isinstance(d.ref, LRPlacement)
                         for d in same + cross)
-                    gr.preOps = [WaitLROp(has_sync=True)] if has_lr_dep else []
+                    if has_lr_dep:
+                        wait = WaitLROp(has_sync=True)
+                        wait.emitUnrolls = gr.emitUnrolls
+                        gr.preOps = [wait]
+                    else:
+                        gr.preOps = []
 
         if self.config.uniformPgrEpoch:
             self._apply_uniform_epoch_wait()
+        if self.config.lateScaleRefresh:
+            self._consolidate_scale_refresh_wait()
 
     def _apply_uniform_epoch_wait(self):
         """Replace per-partition VMEM waits with one complete-epoch frontier.
@@ -2723,15 +2858,25 @@ class LogicalScheduler:
             raise ValueError(
                 "uniformPgrEpoch frontier has no next-epoch A/B consumer")
 
-        # Remove every partition-local producer wait.  Their LDS overwrite
-        # waits live on GR.preOps and are deliberately not modified.
+        # Replace only partition-local A/B producer waits.  Late scale
+        # refreshes have their own C0-producer -> C1-consumer frontier.
         for partition_slots in self._partitions:
             for slot in partition_slots:
                 for lr in slot.lrs:
-                    lr.preOps = [
-                        op for op in lr.preOps
-                        if not isinstance(op, WaitGROp)
-                    ]
+                    if lr.tensor in ('A', 'B'):
+                        lr.preOps = [
+                            op for op in lr.preOps
+                            if not isinstance(op, WaitGROp)
+                        ]
+                    elif (cfg.dualPeriodScale
+                          and not cfg.lateScaleRefresh
+                          and lr.tensor in ('SA', 'SB')):
+                        # The safe C0 scale cohort has no C1 payload.  Suppress
+                        # its producer wait and paired barrier together with
+                        # the scale read in the second static body.
+                        for op in lr.preOps:
+                            if isinstance(op, WaitGROp):
+                                op.emitUnrolls = (0,)
 
         num_bodies = cfg.scaleReuse if cfg.dualPeriodScale else 1
         counts_by_unroll = []
@@ -2760,6 +2905,128 @@ class LogicalScheduler:
             wait_gr_counts_by_unroll=tuple(counts_by_unroll),
             has_sync=True,
             adjustVmcnt=True))
+
+    def _consolidate_scale_refresh_wait(self):
+        """Publish the C0 scale producer once before the first C1 refresh.
+
+        Every scale group depends on the same pair of epoch-level SA/SB DTL
+        requests.  Dependency lowering initially gives each group a producer
+        wait.  Select the latest producer (VMEM FIFO ordering then covers the
+        other tensor), recompute its younger-request count at the earliest
+        refresh location, and retain exactly one wait+barrier there.
+        """
+        refreshes = sorted(
+            (
+                lr
+                for slots in self._partitions
+                for slot in slots
+                for lr in slot.lrs
+                if lr.scaleRefresh
+            ),
+            key=lambda lr: (
+                lr.partition,
+                lr.subIterK_slot,
+                lr.lastConsumerMfma,
+                self._TENSOR_ORDER[lr.tensor],
+                lr.tiles.tileId_start,
+            ),
+        )
+        if not refreshes:
+            return
+
+        for lr in refreshes:
+            lr.preOps = [
+                op for op in lr.preOps
+                if not isinstance(op, WaitGROp)
+            ]
+
+        producer_deps = [
+            dep
+            for lr in refreshes
+            for dep in lr.scaleProducerDeps
+            if isinstance(dep.ref, GRPlacement)
+        ]
+        if not producer_deps:
+            raise ValueError("late scale refresh has no scale GR producer")
+
+        def producer_order(dep):
+            gr = dep.ref
+            same_slot = sorted(
+                self._partitions[gr.partition][gr.subIterK_slot].grs,
+                key=self._gr_sort_key,
+            )
+            return (
+                dep.mt_offset,
+                gr.partition,
+                gr.subIterK_slot,
+                same_slot.index(gr),
+            )
+
+        latest = max(producer_deps, key=producer_order)
+        first = refreshes[0]
+        counts = self._compute_scale_refresh_inflight_loads(
+            latest.ref, first)
+        wait = WaitGROp(
+            wait_gr_counts=counts,
+            has_sync=True,
+            adjustVmcnt=True,
+        )
+        wait.emitUnrolls = first.emitUnrolls
+        first.preOps.insert(0, wait)
+
+    def _compute_scale_refresh_inflight_loads(
+            self, producer: GRPlacement,
+            consumer: LRPlacement) -> WaitGRCounts:
+        """Count requests younger than a C0 scale GR at its C1 refresh.
+
+        Scale GRs emit only in C0 while refresh LRs emit only in C1, so the
+        ordinary same-body backward walk cannot represent this phase edge.
+        Count the C0 suffix after ``producer`` plus complete C1 cells before
+        ``consumer``.  Requests in the consumer's own cell are intentionally
+        excluded: the physical scheduler's vmcnt post-pass adds exactly those
+        it places before the wait.
+        """
+        numK = self.config.numSubIterK
+        producer_flat = producer.partition * numK + producer.subIterK_slot
+        consumer_flat = consumer.partition * numK + consumer.subIterK_slot
+        counts = WaitGRCounts()
+
+        def phase_eligible(gr, phase):
+            phases = getattr(gr, "emitUnrolls", None)
+            return phases is None or phase in phases
+
+        def add(gr):
+            atoms = self._count_gr_atoms(gr)
+            setattr(counts, gr.tensor, getattr(counts, gr.tensor) + atoms)
+
+        flat_slots = [
+            slot
+            for partition in self._partitions
+            for slot in partition
+        ]
+        producer_seen = False
+        for flat, slot in enumerate(flat_slots):
+            if flat < producer_flat:
+                continue
+            for gr in sorted(slot.grs, key=self._gr_sort_key):
+                if flat == producer_flat and not producer_seen:
+                    if gr is producer:
+                        producer_seen = True
+                    continue
+                if producer_seen and phase_eligible(gr, 0):
+                    add(gr)
+
+        if not producer_seen:
+            raise ValueError("late scale refresh producer is not scheduled")
+
+        for flat, slot in enumerate(flat_slots):
+            if flat >= consumer_flat:
+                break
+            for gr in sorted(slot.grs, key=self._gr_sort_key):
+                if phase_eligible(gr, self.config.scaleReuse - 1):
+                    add(gr)
+
+        return counts
 
 
     def _per_uid_k(self, tensor: str) -> int:
@@ -2793,6 +3060,10 @@ class LogicalScheduler:
         multiDU = self._is_multi_du() and self.config.pgr == 1
         previous_partition_last_gr = None
 
+        def phase_bound(op, placement):
+            op.emitUnrolls = placement.emitUnrolls
+            return op
+
         for pi, slots in enumerate(self._partitions):
             this_partition_last_gr = None
             for slot in slots:
@@ -2806,13 +3077,18 @@ class LogicalScheduler:
                     mt_changed = tensor in last_lr_mt and last_lr_mt[tensor] != mt
                     uid_changed = tensor in last_lr_uid and last_lr_uid[tensor] != lr_uid
                     if mt_changed and uid_changed:
-                        lr.preOps.append(LRIncOp(tensor=tensor, isUnrollSwap=True, unrollId=lr_uid))
+                        lr.preOps.append(phase_bound(
+                            LRIncOp(tensor=tensor, isUnrollSwap=True, unrollId=lr_uid),
+                            lr))
                         lr_inc_tensors.add(tensor)
                     elif mt_changed:
-                        lr.preOps.append(LRIncOp(tensor=tensor, unrollId=lr_uid))
+                        lr.preOps.append(phase_bound(
+                            LRIncOp(tensor=tensor, unrollId=lr_uid), lr))
                         lr_inc_tensors.add(tensor)
                     elif uid_changed:
-                        lr.preOps.append(LRIncOp(tensor=tensor, isUnrollSwap=True, unrollId=lr_uid))
+                        lr.preOps.append(phase_bound(
+                            LRIncOp(tensor=tensor, isUnrollSwap=True, unrollId=lr_uid),
+                            lr))
                     last_lr[tensor] = lr
                     last_lr_mt[tensor] = mt
                     last_lr_uid[tensor] = lr_uid
@@ -2829,7 +3105,8 @@ class LogicalScheduler:
                             prev_mt = 0
                         if prev_mt != mt:
                             if gr.tiles.tileId_start == 0:
-                                inc = GRIncOp(tensor=tensor, unrollId=uid)
+                                inc = phase_bound(
+                                    GRIncOp(tensor=tensor, unrollId=uid), gr)
                                 if (self.config.uniformPgrEpoch
                                         and previous_partition_last_gr is not None):
                                     # Fill the preceding partition's scalar
@@ -2847,7 +3124,8 @@ class LogicalScheduler:
 
         if multiDU:
             for (tensor, uid), gr in last_gr.items():
-                gr.postOps.append(GRIncOp(tensor=tensor, unrollId=uid))
+                gr.postOps.append(phase_bound(
+                    GRIncOp(tensor=tensor, unrollId=uid), gr))
 
         # ---- LR buffer-swap placement (keyed off plr, NOT pgr) ----
         # plr==0 (single operand set): the read has no double buffer, so the
@@ -2867,11 +3145,15 @@ class LogicalScheduler:
                     # the next buffer while MFMA consumes the previous set.
                     lr = first_lr[tensor]
                     first_uid = lr.tiles.subIterK_start // self._per_uid_k(tensor)
-                    lr.preOps.append(LRIncOp(tensor=tensor, unrollId=first_uid))
+                    lr.preOps.append(phase_bound(
+                        LRIncOp(tensor=tensor, unrollId=first_uid), lr))
                 else:
                     # Single operand set: swap AFTER the read (postOp).
-                    last_lr[tensor].postOps.append(
-                        LRIncOp(tensor=tensor, unrollId=last_lr_uid.get(tensor, 0)))
+                    last = last_lr[tensor]
+                    last.postOps.append(phase_bound(
+                        LRIncOp(tensor=tensor,
+                                unrollId=last_lr_uid.get(tensor, 0)),
+                        last))
         else:
             for tensor, lr in first_lr.items():
                 if tensor not in lr_inc_tensors:
@@ -2884,19 +3166,24 @@ class LogicalScheduler:
                     # current epoch, reading one epoch too early.
                     if self.config.dualPeriodScale and tensor in ('SA', 'SB'):
                         last = last_lr[tensor]
-                        last.postOps.append(
+                        last.postOps.append(phase_bound(
                             LRIncOp(tensor=tensor,
-                                    unrollId=last_lr_uid.get(tensor, 0)))
+                                    unrollId=last_lr_uid.get(tensor, 0)),
+                            last))
                     else:
                         first_uid = lr.tiles.subIterK_start // self._per_uid_k(tensor)
-                        lr.preOps.append(LRIncOp(tensor=tensor, unrollId=first_uid))
+                        lr.preOps.append(phase_bound(
+                            LRIncOp(tensor=tensor, unrollId=first_uid), lr))
 
             if self._is_multi_du():
                 for tensor, lr in first_lr.items():
                     per_uid_k = self._per_uid_k(tensor)
                     first_uid = lr.tiles.subIterK_start // per_uid_k
                     if first_uid != 0:
-                        lr.preOps.insert(0, LRIncOp(tensor=tensor, isUnrollSwap=True, unrollId=first_uid))
+                        lr.preOps.insert(0, phase_bound(
+                            LRIncOp(tensor=tensor, isUnrollSwap=True,
+                                    unrollId=first_uid),
+                            lr))
 
         # ---- GR buffer-swap placement (keyed off pgr) ----
         # PGR=0 (no prefetch): the global load happens in-loop, so the GR write
@@ -2910,7 +3197,8 @@ class LogicalScheduler:
                         last_gr_per_key[(gr.tensor, gr.unrollId)] = gr
             for (tensor, uid), gr in last_gr_per_key.items():
                 if (tensor, uid) in last_gr_mt:
-                    gr.postOps.append(GRIncOp(tensor=tensor, unrollId=uid))
+                    gr.postOps.append(phase_bound(
+                        GRIncOp(tensor=tensor, unrollId=uid), gr))
 
         # GL2 prefetch: append increment + load ops after the last GR in
         # the schedule so they fire once per iteration after all GR_INCs.
@@ -3008,13 +3296,19 @@ class LogicalScheduler:
             if len(dynamic_counts) > 1:
                 raise ValueError(
                     "cannot merge multiple body-specific wait_gr frontiers")
-            result.append(WaitGROp(wait_gr_counts=merged_counts,
-                                   wait_gr_counts_by_unroll=(
-                                       dynamic_counts[0]
-                                       if dynamic_counts else None),
-                                   has_sync=has_wait_gr_sync,
-                                   adjustVmcnt=adjust,
-                                   force_drain=merged_force_drain))
+            merged_wait = WaitGROp(
+                wait_gr_counts=merged_counts,
+                wait_gr_counts_by_unroll=(
+                    dynamic_counts[0] if dynamic_counts else None),
+                has_sync=has_wait_gr_sync,
+                adjustVmcnt=adjust,
+                force_drain=merged_force_drain)
+            phase_masks = {
+                op.emitUnrolls for op, _ in wait_gr_by_lr
+            }
+            if len(phase_masks) == 1:
+                merged_wait.emitUnrolls = phase_masks.pop()
+            result.append(merged_wait)
         result.extend(others)
         return result
 
@@ -3046,27 +3340,39 @@ class LogicalScheduler:
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
                 # ── Phase 1: LR chain ──
-                ordered_lrs = sorted(
-                    slot.lrs,
+                normal_lrs = sorted(
+                    (lr for lr in slot.lrs if not lr.scaleRefresh),
                     key=lambda lr: order.index(lr.tensor))
+                refresh_lrs = sorted(
+                    (lr for lr in slot.lrs if lr.scaleRefresh),
+                    key=lambda lr: (
+                        lr.lastConsumerMfma,
+                        order.index(lr.tensor),
+                        lr.tiles.tileId_start,
+                    ))
 
-                if len(ordered_lrs) > 1:
-                    # Merge preOps onto first LR
-                    lr_tensors = ([lr.tensor for lr in ordered_lrs]
-                                  if self._is_multi_du() else None)
-                    merged = self._merge_preops(
-                        [lr.preOps for lr in ordered_lrs],
-                        lr_tensors)
-                    ordered_lrs[0].preOps = merged
-                    for lr in ordered_lrs[1:]:
-                        lr.preOps = []
+                def chain_lrs(ordered_lrs):
+                    if len(ordered_lrs) > 1:
+                        lr_tensors = ([lr.tensor for lr in ordered_lrs]
+                                      if self._is_multi_du() else None)
+                        merged = self._merge_preops(
+                            [lr.preOps for lr in ordered_lrs],
+                            lr_tensors)
+                        ordered_lrs[0].preOps = merged
+                        for lr in ordered_lrs[1:]:
+                            lr.preOps = []
+                        for index in range(1, len(ordered_lrs)):
+                            ordered_lrs[index].deps = [
+                                Dep(ref=ordered_lrs[index - 1], mt_offset=0)]
+                    return ordered_lrs[-1] if ordered_lrs else None
 
-                    # Build chain: each LR depends on the previous
-                    for i in range(1, len(ordered_lrs)):
-                        ordered_lrs[i].deps = [
-                            Dep(ref=ordered_lrs[i - 1], mt_offset=0)]
-
-                last_lr = ordered_lrs[-1] if ordered_lrs else None
+                normal_last_lr = chain_lrs(normal_lrs)
+                refresh_last_lr = chain_lrs(refresh_lrs)
+                ordered_lrs = normal_lrs + refresh_lrs
+                # Ordinary A/B reads remain the collision anchor for the
+                # current-body GR stream.  A slot containing only refreshes
+                # falls back to that refresh chain.
+                last_lr = normal_last_lr or refresh_last_lr
 
                 # ── Phase 2: GR chain ──
                 ordered_grs = sorted(
@@ -3110,30 +3416,36 @@ class LogicalScheduler:
                 # chain: GR_group → LR_group to avoid shared parents.
                 if ordered_grs and ordered_lrs:
                     slot_gr_set = set(id(gr) for gr in ordered_grs)
-                    lr_has_gr_dep = any(
-                        any(id(d.ref) in slot_gr_set for d in lr.deps)
-                        for lr in ordered_lrs if lr.deps)
-                    if lr_has_gr_dep:
-                        last_gr = ordered_grs[-1]
-                        # Clear LR deps that point to GRs in this slot
-                        for lr in ordered_lrs:
+                    last_gr = ordered_grs[-1]
+                    for lr_group in (normal_lrs, refresh_lrs):
+                        lr_has_gr_dep = any(
+                            any(id(d.ref) in slot_gr_set for d in lr.deps)
+                            for lr in lr_group if lr.deps)
+                        if not lr_has_gr_dep:
+                            continue
+                        for lr in lr_group:
                             lr.deps = [d for d in lr.deps
                                        if id(d.ref) not in slot_gr_set]
-                        # First LR points to last GR
-                        ordered_lrs[0].deps = [
+                        lr_group[0].deps = [
                             Dep(ref=last_gr, mt_offset=0)]
 
                 # ── Phase 4: Consolidate MFMA deps ──
                 # After chaining, MFMA only needs the tail of its dep chain.
-                if slot.mfma and last_lr is not None:
-                    slot_lr_set = set(id(lr) for lr in ordered_lrs)
-                    lr_deps = [d for d in slot.mfma.deps
-                               if id(d.ref) in slot_lr_set]
-                    if len(lr_deps) > 1:
-                        other_deps = [d for d in slot.mfma.deps
-                                      if id(d.ref) not in slot_lr_set]
-                        slot.mfma.deps = other_deps + [
-                            Dep(ref=last_lr, mt_offset=lr_deps[0].mt_offset)]
+                if slot.mfma:
+                    for lr_group, group_last in (
+                            (normal_lrs, normal_last_lr),
+                            (refresh_lrs, refresh_last_lr)):
+                        if group_last is None:
+                            continue
+                        slot_lr_set = set(id(lr) for lr in lr_group)
+                        lr_deps = [d for d in slot.mfma.deps
+                                   if id(d.ref) in slot_lr_set]
+                        if len(lr_deps) > 1:
+                            other_deps = [d for d in slot.mfma.deps
+                                          if id(d.ref) not in slot_lr_set]
+                            slot.mfma.deps = other_deps + [
+                                Dep(ref=group_last,
+                                    mt_offset=lr_deps[0].mt_offset)]
 
 
     @pipeline_pass(Pass.REMOVE_WAIT_LR_SYNC)
@@ -3200,9 +3512,15 @@ class LogicalScheduler:
                         node = ref
                     if has_lr_dep:
                         continue
-                    gr.preOps = [
-                        SyncOp() if (isinstance(op, WaitLROp) and op.has_sync) else op
-                        for op in gr.preOps]
+                    replacement = []
+                    for op in gr.preOps:
+                        if isinstance(op, WaitLROp) and op.has_sync:
+                            sync = SyncOp()
+                            sync.emitUnrolls = op.emitUnrolls
+                            replacement.append(sync)
+                        else:
+                            replacement.append(op)
+                    gr.preOps = replacement
 
 
     @pipeline_pass(Pass.REMOVE_WAIT_GR_SYNC)
@@ -3329,19 +3647,25 @@ class LogicalScheduler:
                             if firstPreOpId is None:
                                 firstPreOpId = depId
                             if preOp.has_sync:
-                                depId = add(SyncOp())
+                                sync = SyncOp()
+                                sync.emitUnrolls = preOp.emitUnrolls
+                                depId = add(sync)
                                 setBefore(depId, prevId)
                                 prevId = depId
                                 lastDepId = depId
                             continue
                         elif isinstance(preOp, WaitLROp) and preOp.has_sync:
-                            depId = add(WaitLROp())
+                            wait_lr = WaitLROp()
+                            wait_lr.emitUnrolls = preOp.emitUnrolls
+                            depId = add(wait_lr)
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
                             if firstPreOpId is None:
                                 firstPreOpId = depId
-                            depId = add(SyncOp())
+                            sync = SyncOp()
+                            sync.emitUnrolls = preOp.emitUnrolls
+                            depId = add(sync)
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
@@ -3468,7 +3792,13 @@ class LogicalScheduler:
 
                 for em in new_emitted:
                     src = em.source
-                    if em.opType == 'gr':
+                    if (self.config.lateScaleRefresh
+                            and getattr(src, 'emitUnrolls', None) is not None):
+                        # NLL has no phase-0 successor.  A phase-1 scale
+                        # refresh, its producer wait/barrier, and its LDS
+                        # pointer swap would be dead work.
+                        removed.add(em.moduleId)
+                    elif em.opType == 'gr':
                         removed.add(em.moduleId)
                     elif em.opType == 'lr' and src.mtIteration == 1:
                         removed.add(em.moduleId)
@@ -3704,13 +4034,63 @@ class LogicalScheduler:
             placements.append(lr)
         return placements
 
-    def _make_depops_all_tensors(self, cls) -> List[BaseOp]:
+    def _make_scale_seed_ops(self) -> List[Emittable]:
+        """Seed epoch-zero scale VGPRs from LDS before entering C0.
+
+        Reuse the globally colored tile maps assigned to the steady C1
+        refresh placements, then advance each scale LDS read pointer once so
+        C1 reads the alternate half written by C0.
+        """
+        if not self.config.lateScaleRefresh:
+            return []
+
+        refreshes = sorted(
+            (
+                lr
+                for slots in self._partitions
+                for slot in slots
+                for lr in slot.lrs
+                if lr.scaleRefresh
+            ),
+            key=lambda lr: (
+                self._TENSOR_ORDER[lr.tensor],
+                lr.tiles.tileId_start,
+            ),
+        )
+        result = []
+        for tensor in ('SA', 'SB'):
+            tensor_refreshes = [
+                lr for lr in refreshes if lr.tensor == tensor
+            ]
+            for refresh in tensor_refreshes:
+                seed = copy.deepcopy(refresh)
+                seed.mtIteration = 0
+                seed.partition = 0
+                seed.subIterK_slot = 0
+                seed.scaleRefresh = False
+                seed.lastConsumerMfma = None
+                seed.scaleProducerDeps = []
+                seed.deps = []
+                seed.preOps = []
+                seed.postOps = []
+                seed.emitUnrolls = None
+                result.append(seed)
+            if tensor_refreshes:
+                result.append(LRIncOp(tensor=tensor))
+        return result
+
+    def _make_depops_all_tensors(
+            self, cls, includeScales: bool = True) -> List[BaseOp]:
         """Create a BaseOp subclass instance for each tensor (and uid for GRIncOp)."""
+        tensors = [
+            tensor for tensor in self.tensors
+            if includeScales or tensor not in ('SA', 'SB')
+        ]
         if cls is GRIncOp:
             return [GRIncOp(tensor=t, unrollId=uid)
-                    for t in self.tensors
+                    for t in tensors
                     for uid in range(self.config.numUnroll.get(t, 1))]
-        return [cls(tensor=tensor) for tensor in self.tensors]
+        return [cls(tensor=tensor) for tensor in tensors]
 
     def _make_gr_all_tensors_uid(self, mt: int, tiles: dict, uid: int) -> List[GRPlacement]:
         """Create GR placements for a single uid across all tensors.
@@ -3739,13 +4119,16 @@ class LogicalScheduler:
                                       unrollId=uid))
         return result
 
-    def _make_depops_uid(self, cls, uid: int) -> List[BaseOp]:
+    def _make_depops_uid(
+            self, cls, uid: int, includeScales: bool = True) -> List[BaseOp]:
         """Create a BaseOp subclass instance for a single uid across all tensors.
 
         Only emits for tensors where uid < numUnroll[tensor].
         """
         result = []
         for tensor in self.tensors:
+            if not includeScales and tensor in ('SA', 'SB'):
+                continue
             nUnroll = self.config.numUnroll.get(tensor, 1)
             if uid >= nUnroll:
                 continue
@@ -3788,6 +4171,8 @@ class LogicalScheduler:
                         items.append(('SA', target_range['A'], cfg.grSA))
                         items.append(('SB', target_range['B'], cfg.grSB))
                     for tensor, (t_start, t_end), gr_gran in items:
+                        if cfg.lateScaleRefresh and tensor in ('SA', 'SB'):
+                            continue
                         if (cfg.uniformPgrEpoch
                                 and tensor in ('SA', 'SB')
                                 and pi >= cfg.offsetPartition):
@@ -3842,6 +4227,8 @@ class LogicalScheduler:
                     items.append(('SA', target_range['A'], cfg.grSA))
                     items.append(('SB', target_range['B'], cfg.grSB))
                 for tensor, (t_start, t_end), gr_gran in items:
+                    if cfg.lateScaleRefresh and tensor in ('SA', 'SB'):
+                        continue
                     if (cfg.uniformPgrEpoch
                             and tensor in ('SA', 'SB')
                             and pi >= cfg.offsetPartition):
@@ -3988,6 +4375,7 @@ class LogicalScheduler:
             lr_tiles['SA'] = MFMATileRange(0, cfg.lrSA.k, *part0['A'])
             lr_tiles['SB'] = MFMATileRange(0, cfg.lrSB.k, *part0['B'])
 
+        scale_seed_ops = self._make_scale_seed_ops()
         initC_op = self._make_initC_op()
 
         if cfg.pgr == 1:
@@ -3996,13 +4384,16 @@ class LogicalScheduler:
                 preloop_ops = []
                 for uid in range(maxUnroll):
                     preloop_ops.extend(self._make_gr_all_tensors_uid(0, all_tiles, uid))
-                    preloop_ops.extend(self._make_depops_uid(GRIncOp, uid))
+                    preloop_ops.extend(self._make_depops_uid(
+                        GRIncOp, uid,
+                        includeScales=not cfg.lateScaleRefresh))
                 emitted = self._to_emitted([
                     *preloop_ops,
                     initC_op,
                     WaitGROp(wait_gr_counts=WaitGRCounts()),
                     SyncOp(),
                     *self._make_lr_all_tensors(lr_tiles),
+                    *scale_seed_ops,
                     SkipOp(compare='LE', value=1, target='NLL'),
                 ])
             else:
@@ -4012,6 +4403,7 @@ class LogicalScheduler:
                     WaitGROp(wait_gr_counts=WaitGRCounts()),
                     SyncOp(),
                     *self._make_lr_all_tensors(lr_tiles),
+                    *scale_seed_ops,
                     SkipOp(compare='LE', value=1, target='NLL'),
                 ])
         else:
@@ -4026,11 +4418,15 @@ class LogicalScheduler:
                 preloop_ops = []
                 for uid in range(maxUnroll):
                     preloop_ops.extend(self._make_gr_all_tensors_uid(0, all_tiles, uid))
-                    preloop_ops.extend(self._make_depops_uid(GRIncOp, uid))
+                    preloop_ops.extend(self._make_depops_uid(
+                        GRIncOp, uid,
+                        includeScales=not cfg.lateScaleRefresh))
                 mt1_ops = []
                 for uid in range(maxUnroll):
                     mt1_ops.extend(self._make_preloop_mt1_grs_uid(uid))
-                    mt1_ops.extend(self._make_depops_uid(GRIncOp, uid))
+                    mt1_ops.extend(self._make_depops_uid(
+                        GRIncOp, uid,
+                        includeScales=not cfg.lateScaleRefresh))
                 if cfg.uniformPgrEpoch:
                     mt1_counts = self._wait_gr_counts_for_ops(mt1_ops)
                     no_mt1_label = "SubtilePreloopNoMT1"
@@ -4049,6 +4445,7 @@ class LogicalScheduler:
                         self._make_internal_label_op(wait_done_label),
                         SyncOp(),
                         *self._make_lr_all_tensors(lr_tiles),
+                        *scale_seed_ops,
                         SkipOp(compare='LE', value=1, target='NLL'),
                         *gl2_preloop_ops,
                         SkipOp(compare='LE', value=2, target='NGLL'),
@@ -4060,6 +4457,7 @@ class LogicalScheduler:
                         WaitGROp(wait_gr_counts=WaitGRCounts()),
                         SyncOp(),
                         *self._make_lr_all_tensors(lr_tiles),
+                        *scale_seed_ops,
                         SkipOp(compare='LE', value=1, target='NLL'),
                         *mt1_ops,
                         *gl2_preloop_ops,
@@ -4073,7 +4471,9 @@ class LogicalScheduler:
                     wait_done_label = "SubtilePreloopWaitDone"
                     emitted = self._to_emitted([
                         *self._make_gr_all_tensors(0, all_tiles),
-                        *self._make_depops_all_tensors(GRIncOp),
+                        *self._make_depops_all_tensors(
+                            GRIncOp,
+                            includeScales=not cfg.lateScaleRefresh),
                         initC_op,
                         SkipOp(compare='LE', value=1, target=no_mt1_label,
                                rawLabel=True,
@@ -4086,6 +4486,7 @@ class LogicalScheduler:
                         self._make_internal_label_op(wait_done_label),
                         SyncOp(),
                         *self._make_lr_all_tensors(lr_tiles),
+                        *scale_seed_ops,
                         SkipOp(compare='LE', value=1, target='NLL'),
                         *gl2_preloop_ops,
                         SkipOp(compare='LE', value=2, target='NGLL'),
@@ -4093,11 +4494,14 @@ class LogicalScheduler:
                 else:
                     emitted = self._to_emitted([
                         *self._make_gr_all_tensors(0, all_tiles),
-                        *self._make_depops_all_tensors(GRIncOp),
+                        *self._make_depops_all_tensors(
+                            GRIncOp,
+                            includeScales=not cfg.lateScaleRefresh),
                         initC_op,
                         WaitGROp(wait_gr_counts=WaitGRCounts()),
                         SyncOp(),
                         *self._make_lr_all_tensors(lr_tiles),
+                        *scale_seed_ops,
                         SkipOp(compare='LE', value=1, target='NLL'),
                         *mt1_ops,
                         *gl2_preloop_ops,
@@ -4120,9 +4524,11 @@ class LogicalScheduler:
             _ADVANCE_FINAL_PARTITION_FOLLOWERS,
             _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT,
             _FINAL_ENTRY_ANCHOR_ADVANCE_MFMAS,
+            _GFX950_SCALE_REFRESH_WAR_WAIT_STATE,
             _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX,
             advancePartitionInterleave,
             eliminateRedundantLgkmDrains,
+            insertScaleRefreshWarPadding,
             instructionSchedule,
             safeOutstandingLocalReadSuffix,
             _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
@@ -4140,6 +4546,13 @@ class LogicalScheduler:
         minGapDsReadToWait = (_MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250
                               if isGfx1250
                               else _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT)
+        scaleRefreshWarWaitState = (
+            _GFX950_SCALE_REFRESH_WAR_WAIT_STATE
+            if (self.config.dualPeriodScale
+                and not self.config.lateScaleRefresh
+                and tuple(kernel.get("ISA", ())) == (9, 5, 0))
+            else None
+        )
 
         module = Module(label)
         module.addComment0(f"{label} start")
@@ -4190,7 +4603,9 @@ class LogicalScheduler:
                             minGapDsReadToWait=minGapDsReadToWait,
                             partitionPrefetch=self.config.prefetchNextPartition,
                             limitDtlBundlesPerMfma=self.config.dualPeriodScale,
-                            uniformPgrEpoch=self.config.uniformPgrEpoch)
+                            uniformPgrEpoch=self.config.uniformPgrEpoch,
+                            lateScaleRefresh=self.config.lateScaleRefresh,
+                            scaleRefreshWarWaitState=scaleRefreshWarWaitState)
                     except _DtlIntervalCapacityError:
                         # Dependency windows can make the simple request-count
                         # capacity check optimistic. Retry only this cell with
@@ -4201,7 +4616,9 @@ class LogicalScheduler:
                             minGapDsReadToWait=minGapDsReadToWait,
                             partitionPrefetch=self.config.prefetchNextPartition,
                             limitDtlBundlesPerMfma=False,
-                            uniformPgrEpoch=self.config.uniformPgrEpoch)
+                            uniformPgrEpoch=self.config.uniformPgrEpoch,
+                            lateScaleRefresh=self.config.lateScaleRefresh,
+                            scaleRefreshWarWaitState=scaleRefreshWarWaitState)
                     if (
                             self.config.uniformPgrEpoch
                             and self.config.numSubIterK == 1
@@ -4260,6 +4677,12 @@ class LogicalScheduler:
             # later full LGKM-only drain when an earlier full drain dominates
             # it and no LDS/SMEM producer intervenes.
             eliminateRedundantLgkmDrains(module)
+        if (
+                self.config.lateScaleRefresh
+                and tuple(kernel.get("ISA", (9, 5, 0))) == (9, 5, 0)
+                and label.startswith(("MAINLOOP", "NGLL"))):
+            module = insertScaleRefreshWarPadding(
+                module, stagingVgpr=self.scaleRefreshStagingVgpr)
         if use_pap_preloop_skip and skipping_first_gr_group and not first_gr_group_done:
             module.add(pap_merge_label)
             module.add(SMovB32(dst=sgpr("PersistentPrefetchState"), src=0,
@@ -4319,6 +4742,320 @@ class LogicalScheduler:
                 src0=sgpr(lwName),
                 src1=sgpr(swapName),
                 comment=f"PGR=2 tail align: parity-swap LW_base for {tc}"))
+        return module
+
+    def _extract_deferred_tail_scale_refreshes(
+            self, emitted_3d) -> Tuple[EmittedSchedule, Optional[dict]]:
+        """Remove C1 refreshes that overflow their MFMA cell.
+
+        A refresh with ``lastConsumerMfma >= mfma_count - 3`` has a scheduler
+        lower bound at or beyond the last regular issue slot: the refresh rule
+        starts it two MFMA intervals after its final consumer, while a cell with
+        ``N`` MFMAs has only ``N - 1`` regular intervals.  Return those reads,
+        plus their final scale-LR pointer swaps, as a payload for the next C0
+        loopback prefix.
+
+        The complete refresh chain is retained when a tensor's final refresh
+        is not part of the deferred cohort.  Moving a non-final read without
+        its pointer swap would make the remaining C1 reads use the wrong LDS
+        half.
+        """
+        if not (
+                self.config.deferTailScaleRefreshToC0
+                and self.config.lateScaleRefresh
+                and self.unroll_factor == 2):
+            return emitted_3d, None
+
+        trimmed = copy.deepcopy(emitted_3d)
+        cells = []
+        all_refreshes = []
+        selected = []
+
+        final_partition = len(trimmed) - 1
+        for partition_index, partition_emitted in enumerate(trimmed):
+            for em_list in partition_emitted:
+                mfma_count = sum(
+                    len(em.instructions)
+                    for em in em_list
+                    if em.opType == "mfma")
+                refreshes = [
+                    em for em in em_list
+                    if em.opType == "lr"
+                    and getattr(em.source, "scaleRefresh", False)
+                ]
+                all_refreshes.extend(refreshes)
+                # Interior-cell overflow is deliberately handled by
+                # advancePartitionInterleave; only the final cell has no later
+                # partition in which to hide its suffix.
+                if partition_index != final_partition or mfma_count < 3:
+                    continue
+                tail = [
+                    em for em in refreshes
+                    if getattr(em.source, "lastConsumerMfma", -1)
+                    >= mfma_count - 3
+                ]
+                if tail:
+                    cells.append((em_list, tail))
+                    selected.extend(tail)
+
+        if not selected:
+            return emitted_3d, None
+
+        selected_tensors = {
+            em.source.tensor for em in selected
+        }
+        # Each moved tensor must include its final scale group, which owns the
+        # one LR pointer swap for the whole scale epoch.
+        for tensor in selected_tensors:
+            all_ends = [
+                em.source.tiles.tileId_end
+                for em in all_refreshes
+                if em.source.tensor == tensor
+            ]
+            moved_ends = [
+                em.source.tiles.tileId_end
+                for em in selected
+                if em.source.tensor == tensor
+            ]
+            if not all_ends or max(moved_ends) != max(all_ends):
+                return emitted_3d, None
+        # A producer wait/barrier belongs to the first refresh in the chain and
+        # must stay in C1.  Tail reads are expected to have no private preOps.
+        if any(em.source.preOps for em in selected):
+            return emitted_3d, None
+
+        reads = []
+        increments = {}
+        for em_list, tail in cells:
+            tail_ids = {em.moduleId for em in tail}
+            increment_tensors = {
+                post.tensor
+                for em in tail
+                for post in em.source.postOps
+                if isinstance(post, LRIncOp)
+            }
+            if increment_tensors != {
+                    em.source.tensor for em in tail
+                    if em.source.tiles.tileId_end == max(
+                        candidate.source.tiles.tileId_end
+                        for candidate in all_refreshes
+                        if candidate.source.tensor == em.source.tensor)
+            }:
+                return emitted_3d, None
+
+            for em in em_list:
+                if em.moduleId in tail_ids:
+                    reads.append({
+                        "tensor": em.source.tensor,
+                        "tile_start": em.source.tiles.tileId_start,
+                        "instructions": copy.deepcopy(em.instructions),
+                    })
+
+            increment_ids = set()
+            for em in em_list:
+                if (
+                        em.opType == "lr_inc"
+                        and getattr(em.source, "tensor", None)
+                        in increment_tensors):
+                    tensor = em.source.tensor
+                    if tensor in increments:
+                        return emitted_3d, None
+                    increments[tensor] = copy.deepcopy(em.instructions)
+                    increment_ids.add(em.moduleId)
+
+            if increment_tensors - increments.keys():
+                return emitted_3d, None
+            em_list[:] = self._rewire_before(
+                em_list, tail_ids | increment_ids)
+
+        if selected_tensors != increments.keys():
+            return emitted_3d, None
+        return trimmed, {
+            "reads": reads,
+            "increments": increments,
+        }
+
+    @staticmethod
+    def _register_indices(operand) -> set:
+        """Return the physical register indices covered by a rocisa operand."""
+        start = getattr(operand, "regIdx", -1)
+        count = max(1, getattr(operand, "regNum", 1))
+        return set(range(start, start + count)) if start >= 0 else set()
+
+    def _split_c0_for_deferred_scale_refresh(
+            self, loop_body, payload):
+        """Build first-entry, loopback, and shared C0 modules.
+
+        The first entry executes the original prefix and skips the refreshes so
+        the preloop-seeded scales remain live.  The C1 loopback executes a
+        duplicated prefix with one deferred read after each eligible MFMA, then
+        joins the shared suffix.  A full LGKM drain must dominate the first
+        consumer of every refreshed VGPR.
+        """
+        from .InstructionScheduler import (
+            _GFX950_SCALE_SOURCE_WAR_DISTANCE, _issueDistance)
+        from rocisa.code import Module
+        from rocisa.instruction import (
+            LocalReadInstruction, MFMAInstruction, MXMFMAInstruction,
+            SWaitCnt)
+
+        reads = payload["reads"]
+        if not reads:
+            return None
+
+        last_read = {}
+        for index, read in enumerate(reads):
+            last_read[read["tensor"]] = index
+        units = []
+        for index, read in enumerate(reads):
+            units.append(read["instructions"])
+            tensor = read["tensor"]
+            if last_read[tensor] == index:
+                units.append(payload["increments"][tensor])
+
+        target_registers = set()
+        for read in reads:
+            for instruction in read["instructions"]:
+                if isinstance(instruction, LocalReadInstruction):
+                    target_registers.update(
+                        self._register_indices(instruction.dst))
+        if not target_registers:
+            return None
+
+        def uses_target(instruction):
+            if not isinstance(instruction, MXMFMAInstruction):
+                return False
+            operands = (
+                self._register_indices(instruction.mxsa)
+                | self._register_indices(instruction.mxsb)
+            )
+            return bool(operands & target_registers)
+
+        items = loop_body.flatitems()
+        issue_position = 0
+        mfma_indices = []
+        first_target_use = None
+        # C1's decrement, compare, and taken branch contribute three issue
+        # slots before the duplicated C0 prefix starts.
+        needed_prefix = max(
+            0, _GFX950_SCALE_SOURCE_WAR_DISTANCE - 3)
+        for index, instruction in enumerate(items):
+            distance = _issueDistance(instruction)
+            if isinstance(
+                    instruction, (MFMAInstruction, MXMFMAInstruction)):
+                if uses_target(instruction) and first_target_use is None:
+                    first_target_use = index
+                if (
+                        issue_position + distance >= needed_prefix
+                        and first_target_use is None):
+                    mfma_indices.append(index)
+            issue_position += distance
+
+        # Keep the new payload genuinely interleaved.  Use at most one payload
+        # instruction per MFMA interval and reject an interval that would then
+        # contain more than three issue-consuming followers.
+        anchors = []
+        unit_index = 0
+        for mfma_index, anchor in enumerate(mfma_indices):
+            if unit_index == len(units):
+                break
+            next_mfma = (
+                mfma_indices[mfma_index + 1]
+                if mfma_index + 1 < len(mfma_indices)
+                else first_target_use
+            )
+            if next_mfma is None:
+                break
+            existing_followers = sum(
+                _issueDistance(instruction)
+                for instruction in items[anchor + 1:next_mfma]
+            )
+            unit_distance = sum(
+                _issueDistance(instruction)
+                for instruction in units[unit_index]
+            )
+            if existing_followers + unit_distance <= 3:
+                anchors.append(anchor)
+                unit_index += 1
+
+        if len(anchors) < len(units):
+            return None
+        split_index = anchors[-1]
+
+        # The deferred reads are asynchronous.  Require an existing full LDS
+        # drain before any target scale reaches an MFMA.
+        if first_target_use is not None:
+            has_full_drain = any(
+                isinstance(instruction, SWaitCnt)
+                and (
+                    getattr(instruction, "waitAll", False)
+                    or getattr(instruction, "dscnt", -1) == 0)
+                for instruction in items[split_index + 1:first_target_use]
+            )
+            if not has_full_drain:
+                return None
+
+        marker_text = {
+            "/* MAINLOOP_C0 start */",
+            "/* partition=0 subIterK=0 */",
+        }
+        first_entry = Module("MAINLOOP_C0 first-entry prefix")
+        first_entry.addComment0(
+            "MAINLOOP_C0 first entry: preserve preloop scale seeds")
+        for item in items[:split_index + 1]:
+            if str(item).strip() not in marker_text:
+                first_entry.add(copy.deepcopy(item))
+
+        loopback = Module("MAINLOOP_C0 loopback prefix")
+        anchor_to_unit = {
+            anchor: index for index, anchor in enumerate(anchors)
+        }
+        for item_index, item in enumerate(items[:split_index + 1]):
+            loopback.add(copy.deepcopy(item))
+            payload_index = anchor_to_unit.get(item_index)
+            if payload_index is None:
+                continue
+            for instruction in units[payload_index]:
+                loopback.add(copy.deepcopy(instruction))
+
+        suffix = Module("MAINLOOP_C0 shared suffix")
+        for item in items[split_index + 1:]:
+            suffix.add(copy.deepcopy(item))
+        return first_entry, loopback, suffix
+
+    @staticmethod
+    def _make_exit_only_scale_refresh(payload):
+        """Emit the deferred payload only when the final C1 branch exits."""
+        from .InstructionScheduler import (
+            _GFX950_SCALE_SOURCE_WAR_DISTANCE)
+        from rocisa.code import Module
+        from rocisa.instruction import SNop
+
+        module = Module("C1 exit-only deferred scale refresh")
+        module.addComment0(
+            "C1 exit only: complete scale refresh before NGLL_C1")
+        # The C1 decrement, compare, and not-taken branch provide three issue
+        # slots.  Pad this cold path for the remainder of gfx950's nine-slot
+        # scale-source WAR window.
+        pad_cycles = max(
+            0, _GFX950_SCALE_SOURCE_WAR_DISTANCE - 3)
+        if pad_cycles:
+            module.add(SNop(
+                waitState=pad_cycles - 1,
+                comment=(
+                    "cold C1-exit scale-source WAR distance "
+                    f"({pad_cycles} cycles)")))
+
+        last_read = {}
+        for index, read in enumerate(payload["reads"]):
+            last_read[read["tensor"]] = index
+        for index, read in enumerate(payload["reads"]):
+            for instruction in read["instructions"]:
+                module.add(copy.deepcopy(instruction))
+            tensor = read["tensor"]
+            if last_read[tensor] == index:
+                for instruction in payload["increments"][tensor]:
+                    module.add(copy.deepcopy(instruction))
         return module
 
     def emitMainAndExitLoops(self, writer, kernel, tensorParametersA=None, tensorParametersB=None):
@@ -4447,6 +5184,42 @@ class LogicalScheduler:
         # ── Mainloop ──
         module.addComment0("MAINLOOP")
         loopBegin = Label("LoopBeginL", "", alignment=16)
+        loopBackC0 = None
+        sharedC0 = None
+
+        candidate_payload = None
+        mainloop_emitted = list(self._emitted_per_unroll)
+        if tuple(kernel.get("ISA", (9, 5, 0))) == (9, 5, 0) and uf == 2:
+            trimmed_c1, candidate_payload = \
+                self._extract_deferred_tail_scale_refreshes(
+                    self._emitted_per_unroll[1])
+            if candidate_payload is not None:
+                mainloop_emitted[1] = trimmed_c1
+        loopBodies = [
+            self._emitLoop(
+                writer, kernel, f"MAINLOOP_C{ui}",
+                mainloop_emitted[ui])
+            for ui in range(uf)
+        ]
+        deferred_payload = None
+        c0_paths = None
+        if candidate_payload is not None:
+            candidate_paths = \
+                self._split_c0_for_deferred_scale_refresh(
+                    loopBodies[0], candidate_payload)
+            # If C0 has neither enough independent MFMAs nor a full LDS
+            # drain before the first target-scale consumer, retain the
+            # validated all-C1 schedule unchanged.
+            if candidate_paths is not None:
+                deferred_payload = candidate_payload
+                c0_paths = candidate_paths
+                loopBackC0 = Label(
+                    "LoopBackC0ScaleRefreshL", "", alignment=16)
+                sharedC0 = Label("C0AfterScaleRefreshL", "")
+            else:
+                loopBodies[1] = self._emitLoop(
+                    writer, kernel, "MAINLOOP_C1",
+                    self._emitted_per_unroll[1])
 
         exitValue = self.config.pgr
 
@@ -4460,7 +5233,8 @@ class LogicalScheduler:
             from rocisa.container import mgpr
             from rocisa.instruction import SMovB32 as _SMovB32
             from rocisa.instruction import STtraceData as _STtraceData
-        for ui in range(uf):
+
+        def emit_trace_marker():
             if emitTraceMarker:
                 # Mainloop iteration marker for SQTT / trace decoder: write
                 # LoopCounterL into M0 then emit it via s_ttracedata. Decoder
@@ -4468,8 +5242,22 @@ class LogicalScheduler:
                 module.add(_SMovB32(dst=mgpr(0), src=sgpr("LoopCounterL"),
                                     comment="trace: M0 = LoopCounterL"))
                 module.add(_STtraceData(comment="trace: emit M0 to SQTT"))
-            loopBody = self._emitLoop(writer, kernel, f"MAINLOOP_C{ui}",
-                                      self._emitted_per_unroll[ui])
+
+        for ui in range(uf):
+            loopBody = loopBodies[ui]
+            if ui == 0 and c0_paths is not None:
+                first_entry, loopback, loopBody = c0_paths
+                emit_trace_marker()
+                module.add(first_entry)
+                module.add(SBranch(
+                    labelName=sharedC0.getLabelName(),
+                    comment="first C0 entry: keep preloop scale seeds"))
+                module.add(loopBackC0)
+                emit_trace_marker()
+                module.add(loopback)
+                module.add(sharedC0)
+            else:
+                emit_trace_marker()
             # dec + compare that produce the SCC the loop-control branch reads.
             setupInsts = [
                 SSubU32(dst=sgpr("LoopCounterL"),
@@ -4484,11 +5272,21 @@ class LogicalScheduler:
                     comment=f"copy {ui} exit → NGLL_C{ui}")
             else:
                 branch = SCBranchSCC0(
-                    labelName=loopBegin.getLabelName(),
+                    labelName=(
+                        loopBackC0.getLabelName()
+                        if loopBackC0 is not None
+                        else loopBegin.getLabelName()),
                     comment="restart mainloop")
             _emitBodySetupBranch(module, loopBody, setupInsts, branch, hoist=isGfx1250)
 
         # ── NGLL + NLL exit paths ──
+        # A taken C1 branch executes the loopback C0 payload.  The one final,
+        # not-taken branch instead completes that same payload on this cold
+        # path before falling into NGLL_C1.  Preloop skips target the labels
+        # below and therefore do not execute it.
+        if deferred_payload is not None:
+            module.add(self._make_exit_only_scale_refresh(
+                deferred_payload))
         hasNGLL = self.config.pgr >= 2
         module.add(Label("SkipMainloop", ""))
         if hasNGLL:
@@ -4623,8 +5421,10 @@ class LogicalScheduler:
 
     def getNumVgpr(self, tileInfoA, tileInfoB,
                         scaleTileInfoA=None, scaleTileInfoB=None) -> int:
-        """Return the total number of VGPRs needed across all tensors (A, B, SA, SB)
-        without performing any allocation.
+        """Return the scheduler's VGPR budget without allocating it.
+
+        This includes tensor tiles (A, B, SA, SB) and, for late dual-period
+        scale refreshes, one reusable staging VGPR.
 
         Returns max(mainloop_peak, flat_tail_peak) — the two layouts don't
         coexist (the tail frees and reallocates at entry), so the kernel
@@ -4650,7 +5450,8 @@ class LogicalScheduler:
         mainloop_total = _total_for(self.tile_peaks)
         _, flat_peaks = self._compute_flat_tail_tile_state()
         tail_total = _total_for(flat_peaks)
-        return max(mainloop_total, tail_total)
+        staging_count = int(cfg.lateScaleRefresh)
+        return max(mainloop_total, tail_total) + staging_count
 
     def allocVgprTiles(self, writer, tileInfoA, tileInfoB,
                        scaleTileInfoA=None, scaleTileInfoB=None):
@@ -4690,6 +5491,13 @@ class LogicalScheduler:
             self.vgprTilesSA = []
             self.vgprTilesSB = []
 
+        self.scaleRefreshStagingVgpr = (
+            writer.vgprPool.checkOut(
+                1, tag="lateScaleRefresh_reusableStagingVgpr")
+            if cfg.lateScaleRefresh
+            else None
+        )
+
         # Stash tile-info so _realloc_tail_tiles_flat can reallocate the
         # tail's flat tile set without the caller plumbing them in again.
         self._alloc_tile_info = {
@@ -4712,6 +5520,9 @@ class LogicalScheduler:
         _dealloc_tiles(self.vgprTilesB,  self._tail_freed_tile_ids['B'])
         _dealloc_tiles(self.vgprTilesSA, self._tail_freed_tile_ids['SA'])
         _dealloc_tiles(self.vgprTilesSB, self._tail_freed_tile_ids['SB'])
+        if self.scaleRefreshStagingVgpr is not None:
+            writer.vgprPool.checkIn(self.scaleRefreshStagingVgpr)
+            self.scaleRefreshStagingVgpr = None
         self.vgprTilesA = []
         self.vgprTilesB = []
         self.vgprTilesSA = []

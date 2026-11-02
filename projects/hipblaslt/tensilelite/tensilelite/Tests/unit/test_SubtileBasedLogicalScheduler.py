@@ -2442,7 +2442,7 @@ class TestUniformPgrEpoch:
 
     @pytest.mark.parametrize(
         "mt_m,mt_n", [(256, 256), (256, 320), (320, 256)])
-    def test_production_geometries_use_three_phase_p0_for_c0_c1(
+    def test_production_geometries_use_three_phase_for_c0_c1(
             self, monkeypatch, mt_m, mt_n):
         import importlib
 
@@ -2456,18 +2456,15 @@ class TestUniformPgrEpoch:
             writer, ti_a, ti_b,
             scaleTileInfoA=ti_sa, scaleTileInfoB=ti_sb)
 
-        split_results = []
-        split_p0 = instruction_scheduler._splitPartitionZeroPrefetch
+        slot_counts = []
+        original_init = instruction_scheduler._SlotPlacer.__init__
 
-        def record_split(*args, **kwargs):
-            result = split_p0(*args, **kwargs)
-            split_results.append(result is not None)
-            return result
+        def record_slots(placer, *args, **kwargs):
+            slot_counts.append(kwargs["slotsPerInterval"])
+            original_init(placer, *args, **kwargs)
 
         monkeypatch.setattr(
-            instruction_scheduler,
-            "_splitPartitionZeroPrefetch",
-            record_split)
+            instruction_scheduler._SlotPlacer, "__init__", record_slots)
         assert not hasattr(instruction_scheduler, "_splitItemsAfterHalf")
         try:
             scheduler.populate_instructions(
@@ -2479,12 +2476,16 @@ class TestUniformPgrEpoch:
                 scaleTileInfoB=ti_sb)
             assert len(scheduler._emitted_per_unroll) == 2
             for body, emitted in enumerate(scheduler._emitted_per_unroll):
-                begin = len(split_results)
+                begin = len(slot_counts)
                 scheduler._emitLoop(
                     writer, kernel, f"MAINLOOP_C{body}", emitted)
-                # Exactly the partition-zero cell in each body has a
-                # successful split, so production takes three-phase placement.
-                assert split_results[begin:].count(True) == 1
+                body_slots = slot_counts[begin:]
+                # The first N placements are the production partition cells.
+                # A later two-slot call, when present, is the WAR-distance
+                # verifier's synthetic padding cell rather than a scheduler
+                # retry.
+                assert body_slots[:cfg.numPartitions] \
+                    == [3] * cfg.numPartitions
         finally:
             scheduler.deallocVgprTiles(writer)
 
@@ -2528,7 +2529,14 @@ class TestUniformPgrEpoch:
         assert ab_atoms == expected_atoms
         assert partition_counts == expected_counts
         assert sum(
-            isinstance(op, WaitGROp)
+            isinstance(op, WaitGROp) and not lr.scaleRefresh
+            for partition in scheduler._partitions
+            for slot in partition
+            for lr in slot.lrs
+            for op in lr.preOps
+        ) == 1
+        assert sum(
+            isinstance(op, WaitGROp) and lr.scaleRefresh
             for partition in scheduler._partitions
             for slot in partition
             for lr in slot.lrs
@@ -2664,24 +2672,169 @@ class TestUniformPgrEpoch:
         ]
         assert p0_atoms == [("A", tile) for tile in range(5)]
 
-    def test_preloop_seeds_complete_n1_epoch(self):
+    def test_preloop_seeds_complete_data_n1_and_scale_e0_epochs(self):
         cfg = self._cfg()
         sched = LogicalScheduler(cfg)
         sched.build()
         sched.build_preloop()
 
-        mt1 = [
+        preloop_sources = [
             em.source
             for partition in sched._preloop_emitted
             for group in partition
             for em in group
-            if isinstance(em.source, GRPlacement)
-            and em.source.mtIteration == 1
         ]
-        assert sorted(self._tile_atoms(mt1, 'A', cfg.grA)) == list(range(8))
-        assert sorted(self._tile_atoms(mt1, 'B', cfg.grB)) == list(range(8))
-        assert sum(gr.tensor == 'SA' for gr in mt1) == 1
-        assert sum(gr.tensor == 'SB' for gr in mt1) == 1
+        mt1_grs = [
+            source for source in preloop_sources
+            if isinstance(source, GRPlacement) and source.mtIteration == 1
+        ]
+        assert sorted(self._tile_atoms(mt1_grs, 'A', cfg.grA)) == list(range(8))
+        assert sorted(self._tile_atoms(mt1_grs, 'B', cfg.grB)) == list(range(8))
+        assert not [
+            gr for gr in mt1_grs if gr.tensor in ('SA', 'SB')
+        ]
+
+        scale_seed_lrs = [
+            source for source in preloop_sources
+            if isinstance(source, LRPlacement)
+            and source.tensor in ('SA', 'SB')
+        ]
+        logical_scale_refresh = [
+            lr
+            for partition in sched._partitions
+            for slot in partition
+            for lr in slot.lrs
+            if lr.tensor in ('SA', 'SB') and lr.scaleRefresh
+        ]
+        for tensor, granularity in (('SA', cfg.lrSA), ('SB', cfg.lrSB)):
+            assert sorted(self._tile_atoms(
+                scale_seed_lrs, tensor, granularity
+            )) == sorted(self._tile_atoms(
+                logical_scale_refresh, tensor, granularity
+            ))
+        assert not [
+            lr for lr in scale_seed_lrs if lr.mtIteration != 0
+        ]
+
+    def test_scale_refreshes_are_c1_only_and_follow_final_consumers(self):
+        cfg = self._cfg()
+        sched = LogicalScheduler(cfg)
+        sched.build()
+
+        refreshes = [
+            lr
+            for partition in sched._partitions
+            for slot in partition
+            for lr in slot.lrs
+            if lr.tensor in ('SA', 'SB')
+        ]
+        assert refreshes
+        assert all(lr.scaleRefresh for lr in refreshes)
+        assert all(lr.emitUnrolls == (1,) for lr in refreshes)
+        assert all(lr.mtIteration == cfg.pgr for lr in refreshes)
+
+        final_consumers = {}
+        partition_mfma_counts = {}
+        for partition in range(cfg.numPartitions):
+            tile_range = sched._partition_tile_range(partition)
+            consumers = [
+                (a, b)
+                for a in range(*tile_range['A'])
+                for b in range(*tile_range['B'])
+            ]
+            partition_mfma_counts[partition] = len(consumers)
+            for rank, (a, b) in enumerate(consumers):
+                final_consumers[('SA', a // cfg.lrSA.mn * cfg.lrSA.mn)] = (
+                    partition, rank)
+                final_consumers[('SB', b // cfg.lrSB.mn * cfg.lrSB.mn)] = (
+                    partition, rank)
+
+        for refresh in refreshes:
+            group = refresh.tiles.tileId_start
+            consumer_partition, consumer_rank = final_consumers[
+                (refresh.tensor, group)
+            ]
+            if (
+                    consumer_rank
+                    == partition_mfma_counts[consumer_partition] - 1
+                    and consumer_partition + 1 < cfg.numPartitions):
+                assert (refresh.partition, refresh.lastConsumerMfma) == (
+                    consumer_partition + 1, -1)
+            else:
+                assert (refresh.partition, refresh.lastConsumerMfma) == (
+                    consumer_partition, consumer_rank)
+
+    def test_scale_refresh_has_one_phase_bound_producer_frontier_and_swap(self):
+        sched = LogicalScheduler(self._cfg())
+        sched.build()
+
+        refreshes = [
+            lr
+            for partition in sched._partitions
+            for slot in partition
+            for lr in slot.lrs
+            if lr.scaleRefresh
+        ]
+        waits = [
+            (lr, op)
+            for lr in refreshes
+            for op in lr.preOps
+            if isinstance(op, WaitGROp)
+        ]
+        assert len(waits) == 1
+        wait_lr, wait = waits[0]
+        assert wait_lr is min(
+            refreshes,
+            key=lambda lr: (
+                lr.partition,
+                lr.subIterK_slot,
+                lr.lastConsumerMfma,
+                sched._TENSOR_ORDER[lr.tensor],
+                lr.tiles.tileId_start,
+            ),
+        )
+        assert wait.has_sync
+        assert wait.emitUnrolls == (1,)
+        assert wait.wait_gr_counts.A + wait.wait_gr_counts.B > 0
+        assert wait.wait_gr_counts.SA == 0
+        assert wait.wait_gr_counts.SB == 0
+
+        scale_swaps = [
+            op
+            for lr in refreshes
+            for op in lr.preOps + lr.postOps
+            if getattr(op, 'kind', None) == 'lr_inc'
+            and op.tensor in ('SA', 'SB')
+        ]
+        assert sorted(op.tensor for op in scale_swaps) == ['SA', 'SB']
+        assert all(op.emitUnrolls == (1,) for op in scale_swaps)
+
+    def test_ngll_retains_refresh_but_nll_drops_dead_refresh_cohort(self):
+        sched = LogicalScheduler(self._cfg())
+        sched.build()
+        ngll = sched.build_ngll()
+        nll = sched.build_nll()
+
+        ngll_refreshes = [
+            em.source
+            for partition in ngll
+            for group in partition
+            for em in group
+            if getattr(em.source, 'scaleRefresh', False)
+        ]
+        assert ngll_refreshes
+        assert all(lr.emitUnrolls == (1,) for lr in ngll_refreshes)
+        assert not [
+            em
+            for partition in nll
+            for group in partition
+            for em in group
+            if getattr(em.source, 'scaleRefresh', False)
+            or (
+                getattr(em.source, 'tensor', None) in ('SA', 'SB')
+                and getattr(em.source, 'emitUnrolls', None) is not None
+            )
+        ]
 
     def test_n2_overwrites_depend_on_overlapping_old_buffer_reads(self):
         sched = LogicalScheduler(self._cfg())
@@ -2710,6 +2863,7 @@ class TestUniformPgrEpoch:
             for lr in slot.lrs
             for op in lr.preOps
             if isinstance(op, WaitGROp)
+            and op.wait_gr_counts_by_unroll is not None
         ]
 
         assert len(waits) == 1
@@ -2748,7 +2902,8 @@ class TestUniformPgrEpoch:
             for slot in partition
             for lr in slot.lrs
             for op in lr.preOps
-            if isinstance(op, WaitGROp))
+            if isinstance(op, WaitGROp)
+            and op.wait_gr_counts_by_unroll is not None)
         frontier = sched._uniform_epoch_frontier_slot()
         frontier_grs = [
             gr
@@ -2807,12 +2962,58 @@ class TestUniformPgrEpoch:
         assert sorted(self._tile_atoms(ab_grs, 'A', cfg.grA)) == list(range(m))
         assert sorted(self._tile_atoms(ab_grs, 'B', cfg.grB)) == list(range(n))
         assert all(gr.mtIteration == 2 for gr in ab_grs)
+        expected_late_refresh = (
+            cfg.numPartitionsM > 1 and cfg.numPartitionsN > 1
+        )
+        assert cfg.lateScaleRefresh is expected_late_refresh
         assert sum(
-            isinstance(op, WaitGROp)
+            isinstance(op, WaitGROp) and not lr.scaleRefresh
             for partition in sched._partitions
             for slot in partition
             for lr in slot.lrs
             for op in lr.preOps) == 1
+        assert sum(
+            isinstance(op, WaitGROp) and lr.scaleRefresh
+            for partition in sched._partitions
+            for slot in partition
+            for lr in slot.lrs
+            for op in lr.preOps) == int(expected_late_refresh)
+
+        scale_lrs = [
+            lr
+            for partition in sched._partitions
+            for slot in partition
+            for lr in slot.lrs
+            if lr.tensor in ('SA', 'SB')
+        ]
+        if expected_late_refresh:
+            assert all(lr.scaleRefresh for lr in scale_lrs)
+            assert all(lr.emitUnrolls == (1,) for lr in scale_lrs)
+        else:
+            assert all(not lr.scaleRefresh for lr in scale_lrs)
+            safe_c0_cohort = [
+                lr for lr in scale_lrs
+                if (lr.partition == 0
+                    and lr.mtIteration == 0
+                    and lr.targetPartition == 0)
+            ]
+            assert safe_c0_cohort
+            for tensor, granularity, tile_count in (
+                    ('SA', cfg.lrSA, m), ('SB', cfg.lrSB, n)):
+                assert sorted(self._tile_atoms(
+                    safe_c0_cohort, tensor, granularity
+                )) == list(range(0, tile_count, granularity.mn))
+
+    def test_uniform_epoch_requires_a_genuine_two_dimensional_grid(self):
+        from tensilelite.Components.Subtile.Kernel import (
+            _supportsUniformPgrEpoch)
+
+        assert _supportsUniformPgrEpoch(True, 2, (4, 4), 8, 8)
+        assert not _supportsUniformPgrEpoch(True, 2, (4, 8), 8, 8)
+        assert not _supportsUniformPgrEpoch(True, 2, (8, 4), 8, 8)
+        assert not _supportsUniformPgrEpoch(True, 2, None, 8, 8)
+        assert not _supportsUniformPgrEpoch(True, 1, (4, 4), 8, 8)
+        assert not _supportsUniformPgrEpoch(False, 2, (4, 4), 8, 8)
 
     def test_legacy_policy_and_pgr1_default_remain_unchanged(self):
         legacy = make_cfg_du128_4wave()
@@ -3662,8 +3863,8 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
     """
 
     _EXPECTED = {
-        0: (180, "ca4f07114f874f89cc6fd8802f837240fc8be0278f377ba574cab1e35e07ab56"),
-        1: (150, "93518cec9c744055c8c49aae5f23e8a9cf5f71216d5c0ea1b5f514f52e99da91"),
+        0: (168, "b3c4a16b53fdf76910637c09b911d1775803a5d20f8917afcf1624e0d5660481"),
+        1: (169, "efd84b4e834717f7cdc36de0d8e3c59bb465cecb2fa4b6acf4df9f531f22362e"),
     }
 
     @staticmethod
@@ -3717,6 +3918,15 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
             assert partitions, f"instruction precedes first partition: {line}"
             partitions[-1].append(" ".join(line.split()))
         return partitions
+
+    @staticmethod
+    def _section_lines(assembly, label):
+        begin = f"/* {label} start */"
+        end = f"/* {label} end */"
+        assert begin in assembly and end in assembly
+        return assembly[
+            assembly.index(begin) + len(begin):assembly.index(end)
+        ].splitlines()
 
     @staticmethod
     def _dtl_tensor(line):
@@ -3836,7 +4046,9 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                 for line in instructions
                 if line.startswith("s_waitcnt vmcnt")
             ]
-            assert vmcnt_partitions == [3]
+            assert vmcnt_partitions == (
+                [3] if copy_index == 0 else [1, 3]
+            )
 
             barrier_partitions = [
                 partition
@@ -3844,10 +4056,333 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
                 for line in instructions
                 if line.startswith("s_barrier")
             ]
-            assert barrier_partitions == [0, 1, 3]
-            assert not any(
-                line.startswith("s_waitcnt lgkmcnt")
-                for line in partitions[2])
+            assert barrier_partitions == (
+                [0, 1, 3] if copy_index == 0 else [0, 1, 1, 3]
+            )
+            p2_lgkm_waits = [
+                line
+                for line in partitions[2]
+                if line.startswith("s_waitcnt lgkmcnt")
+            ]
+            assert bool(p2_lgkm_waits) == (copy_index == 1)
+
+    def test_emitted_scale_refresh_contract_and_exit_paths(self):
+        import re
+
+        assembly = _emit_du128_mxfp8_mainloops()
+        c0 = self._section_lines(assembly, "MAINLOOP_C0")
+        c1 = self._section_lines(assembly, "MAINLOOP_C1")
+
+        c0_refreshes = [
+            line for line in c0
+            if "late scale refresh" in line
+        ]
+        assert len(c0_refreshes) == 3
+        assert any("// SB MT=n+2 tile=4" in line for line in c0_refreshes)
+        assert any("// SA MT=n+2 tile=6" in line for line in c0_refreshes)
+        assert any("// SB MT=n+2 tile=6" in line for line in c0_refreshes)
+        refreshes = [
+            (index, line)
+            for index, line in enumerate(c1)
+            if "late scale refresh" in line
+        ]
+        assert len(refreshes) == 5
+
+        mfma_scale_regs = {}
+        for index, line in enumerate(c1):
+            if "v_mfma_scale" not in line:
+                continue
+            match = re.search(r", (v\d+), (v\d+) op_sel:", line)
+            assert match, line
+            for register in match.groups():
+                mfma_scale_regs.setdefault(register, []).append(index)
+
+        staged = [
+            (index, line) for index, line in refreshes
+            if "via reusable staging VGPR" in line
+        ]
+        assert len(staged) == 4
+        staging_registers = {
+            re.search(r"ds_read_b32 (v\d+),", line).group(1)
+            for _, line in staged
+        }
+        assert len(staging_registers) == 1
+        staging_register = next(iter(staging_registers))
+
+        for refresh_index, line in refreshes:
+            destination = re.search(r"ds_read_b32 (v\d+),", line)
+            assert destination, line
+            destination = destination.group(1)
+            if destination == staging_register:
+                publish_index = next(
+                    index
+                    for index, candidate in enumerate(
+                        c1[refresh_index + 1:], refresh_index + 1)
+                    if re.search(
+                        rf"v_mov_b32 v\d+, {staging_register}\b",
+                        candidate)
+                )
+                publish = re.search(
+                    rf"v_mov_b32 (v\d+), {staging_register}\b",
+                    c1[publish_index])
+                canonical = publish.group(1)
+                assert any(
+                    "s_waitcnt lgkmcnt" in candidate
+                    and "staged scale value" in candidate
+                    for candidate in c1[refresh_index:publish_index]
+                )
+                assert not any(
+                    "via reusable staging VGPR" in candidate
+                    for candidate in c1[refresh_index + 1:publish_index]
+                )
+                refresh_index = publish_index
+                destination = canonical
+
+            uses = mfma_scale_regs[destination]
+            assert uses
+            assert max(uses) < refresh_index
+
+        first_refresh = refreshes[0][0]
+        producer_wait = next(
+            index for index, line in enumerate(c1[:first_refresh])
+            if "s_waitcnt vmcnt" in line
+        )
+        producer_barrier = next(
+            index for index, line in enumerate(c1[producer_wait + 1:], 1)
+            if "s_barrier" in line
+        ) + producer_wait
+        assert producer_wait < producer_barrier < first_refresh
+        assert c0.count("/* Emit code to swap MXSA LR vgpr offsets */") == 1
+        assert c0.count("/* Emit code to swap MXSB LR vgpr offsets */") == 1
+        assert c1.count("/* Emit code to swap MXSA LR vgpr offsets */") == 0
+        assert c1.count("/* Emit code to swap MXSB LR vgpr offsets */") == 0
+
+        assert sum(
+            "late scale refresh" in line
+            for line in self._section_lines(assembly, "NGLL_C0")
+        ) == 8
+        assert not any(
+            "late scale refresh" in line
+            for label in ("NGLL_C1", "NLL_C0", "NLL_C1")
+            for line in self._section_lines(assembly, label)
+        )
+
+        preloop = self._section_lines(assembly, "PRELOOP")
+        scale_seeds = [
+            index for index, line in enumerate(preloop)
+            if "ds_read_b32" in line and "// S" in line
+        ]
+        direct_exit = next(
+            index for index, line in enumerate(preloop)
+            if "s_cbranch_scc1 label_SkipToNLL" in line
+        )
+        assert len(scale_seeds) == 8
+        assert max(scale_seeds) < direct_exit
+
+        nll_entry = assembly.index("label_SkipToNLL:")
+        nll_suffix = assembly[nll_entry:].splitlines()
+        first_mfma = next(
+            index for index, line in enumerate(nll_suffix)
+            if "v_mfma_scale" in line
+        )
+        assert any(
+            "s_waitcnt lgkmcnt" in line
+            for line in nll_suffix[:first_mfma]
+        )
+
+    def test_tail_refresh_deferral_has_distinct_first_entry_loopback_and_exit_paths(
+            self):
+        import re
+
+        assembly = _emit_du128_mxfp8_mainloops()
+
+        first_entry = assembly[
+            assembly.index("label_LoopBeginL:"):
+            assembly.index("label_LoopBackC0ScaleRefreshL:")
+        ]
+        assert "late scale refresh" not in first_entry
+        assert (
+            "s_branch label_C0AfterScaleRefreshL"
+            in first_entry
+        )
+
+        loopback = assembly[
+            assembly.index("label_LoopBackC0ScaleRefreshL:"):
+            assembly.index("label_C0AfterScaleRefreshL:")
+        ]
+        loopback_lines = loopback.splitlines()
+        refresh_indices = [
+            index for index, line in enumerate(loopback_lines)
+            if "late scale refresh" in line
+        ]
+        assert len(refresh_indices) == 3
+        # Every moved read gets a distinct MFMA shadow.
+        for previous, current in zip(
+                refresh_indices, refresh_indices[1:]):
+            assert any(
+                "v_mfma_scale" in line
+                for line in loopback_lines[previous + 1:current]
+            )
+
+        c1 = "\n".join(self._section_lines(
+            assembly, "MAINLOOP_C1"))
+        for tail in (
+                "SB MT=n+2 tile=4",
+                "SA MT=n+2 tile=6",
+                "SB MT=n+2 tile=6"):
+            assert tail not in c1
+        assert (
+            "s_cbranch_scc0 label_LoopBackC0ScaleRefreshL"
+            in assembly
+        )
+
+        exit_only = assembly[
+            assembly.index(
+                "/* C1 exit only: complete scale refresh before NGLL_C1 */"):
+            assembly.index("label_SkipMainloop:")
+        ]
+        assert exit_only.count("late scale refresh") == 3
+        assert "s_nop 5" in exit_only
+        # Preloop SkipMainloop/SkipToNGLL entries land after the cold payload.
+        assert assembly.index("label_SkipMainloop:") < \
+            assembly.index("label_SkipToNGLL:")
+
+        c0_lines = self._section_lines(assembly, "MAINLOOP_C0")
+        last_refresh = max(
+            index for index, line in enumerate(c0_lines)
+            if "late scale refresh" in line
+        )
+        first_deferred_consumer = next(
+            index for index, line in enumerate(c0_lines)
+            if "v_mfma_scale" in line
+            and re.search(r", (?:v147|v150|v151)(?:,| op_sel:)", line)
+        )
+        assert any(
+            "s_waitcnt lgkmcnt(0)" in line
+            for line in c0_lines[last_refresh:first_deferred_consumer]
+        )
+
+    def test_emitted_refreshes_meet_per_vgpr_war_distance(self):
+        from rocisa.instruction import (
+            Instruction, LocalReadInstruction, MXMFMAInstruction, SNop,
+            SWaitCnt, VMovB32)
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _issueDistance)
+
+        kernel, fixture, cfg = TestUniformPgrEpoch._production_fixture()
+        writer, ti_a, ti_b, ti_sa, ti_sb, dest = fixture
+        scheduler = LogicalScheduler(cfg)
+        scheduler.build()
+        used_before = (
+            writer.vgprPool.size() - writer.vgprPool.available()
+        )
+        scheduler.allocVgprTiles(
+            writer, ti_a, ti_b,
+            scaleTileInfoA=ti_sa, scaleTileInfoB=ti_sb)
+        staging_vgpr = scheduler.scaleRefreshStagingVgpr
+        assert staging_vgpr is not None
+        try:
+            scheduler.populate_instructions(
+                writer, kernel,
+                tileInfoA=ti_a,
+                tileInfoB=ti_b,
+                dtileInfo=dest,
+                scaleTileInfoA=ti_sa,
+                scaleTileInfoB=ti_sb)
+            body = scheduler._emitLoop(
+                writer, kernel, "MAINLOOP_C1",
+                scheduler._emitted_per_unroll[1])
+        finally:
+            scheduler.deallocVgprTiles(writer)
+        assert scheduler.scaleRefreshStagingVgpr is None
+        assert (
+            writer.vgprPool.size() - writer.vgprPool.available()
+        ) == used_before
+
+        def register_indices(operand):
+            start = getattr(operand, "regIdx", -1)
+            count = getattr(operand, "regNum", 1)
+            return range(start, start + max(1, count))
+
+        def issue_distance(instruction):
+            if not isinstance(instruction, Instruction):
+                return 0
+            if isinstance(instruction, SNop):
+                return int(instruction.getParams()[0]) + 1
+            cycles = getattr(instruction, "getIssueCycles", None)
+            return max(1, int(cycles())) if cycles is not None else 1
+
+        issue_position = 0
+        last_use_end = {}
+        refresh_count = 0
+        residual_nops = []
+        first_mfma = None
+        staged_read_count = 0
+        staged_publish_count = 0
+        pending_stage = None
+        for instruction in body.flatitems():
+            distance = issue_distance(instruction)
+            opened_stage = False
+            if isinstance(instruction, MXMFMAInstruction):
+                first_mfma = first_mfma or instruction
+                for operand in (instruction.mxsa, instruction.mxsb):
+                    for register in register_indices(operand):
+                        last_use_end[register] = issue_position + distance
+            if (
+                    isinstance(instruction, LocalReadInstruction)
+                    and "late scale refresh" in instruction.comment):
+                refresh_count += 1
+                destination = tuple(register_indices(instruction.dst))
+                if destination == (staging_vgpr,):
+                    assert pending_stage is None
+                    pending_stage = {
+                        "younger_lgkm": 0,
+                        "ready": False,
+                    }
+                    opened_stage = True
+                    staged_read_count += 1
+                else:
+                    for register in destination:
+                        assert issue_position - last_use_end[register] >= 9
+            if (
+                    pending_stage is not None
+                    and not opened_stage
+                    and isinstance(instruction, LocalReadInstruction)):
+                pending_stage["younger_lgkm"] += 1
+            if pending_stage is not None and isinstance(instruction, SWaitCnt):
+                wait_count = (
+                    0 if getattr(instruction, "waitAll", False)
+                    else instruction.dscnt
+                )
+                if (
+                        wait_count >= 0
+                        and wait_count <= pending_stage["younger_lgkm"]):
+                    pending_stage["ready"] = True
+            if (
+                    isinstance(instruction, VMovB32)
+                    and "publish staged scale value" in instruction.comment):
+                assert pending_stage is not None
+                assert tuple(register_indices(
+                    instruction.getParams()[1])) == (staging_vgpr,)
+                assert pending_stage["ready"]
+                for register in register_indices(instruction.dst):
+                    assert issue_position - last_use_end[register] >= 9
+                pending_stage = None
+                staged_publish_count += 1
+            if (
+                    isinstance(instruction, SNop)
+                    and "scale-source WAR" in instruction.comment):
+                residual_nops.append(instruction)
+            issue_position += distance
+
+        assert refresh_count == 8
+        assert staged_read_count == staged_publish_count == 3
+        assert pending_stage is None
+        assert first_mfma.getIssueLatency() == 8
+        assert _issueDistance(first_mfma) == 1
+        assert [
+            int(nop.getParams()[0]) + 1 for nop in residual_nops
+        ] == [2, 1, 5, 3]
 
 
 class TestLegacyMXFP4ScheduleFingerprint:
