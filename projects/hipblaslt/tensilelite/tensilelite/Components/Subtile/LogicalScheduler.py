@@ -1000,6 +1000,10 @@ class LogicalScheduler:
         self._tail_freed_tile_ids: Dict[str, set] = {'A': set(), 'B': set(),
                                                      'SA': set(), 'SB': set()}
         self._kernel = None
+        # Minimal dual-period scale shadowing.  The concrete plan is derived
+        # after register allocation/population because scale-source VGPRs are
+        # only known in the emitted instruction stream.
+        self._scaleShadowPlan = None
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -4947,6 +4951,113 @@ class LogicalScheduler:
         self._preloop_emitted = [[emitted]]
         return self._preloop_emitted
 
+    @staticmethod
+    def _flatEmittedInstructions(emitted_3d):
+        """Yield concrete instructions from a populated emitted schedule."""
+        for partition in emitted_3d:
+            for em_list in partition:
+                for emitted in em_list:
+                    for inst in emitted.instructions:
+                        if isinstance(inst, Module):
+                            yield from inst.flatitems()
+                        else:
+                            yield inst
+
+    def _prepareScaleShadowPlan(self):
+        """Derive geometry-specific entry scales moved to preloop/C1."""
+        if self._scaleShadowPlan is not None:
+            return self._scaleShadowPlan
+
+        cfg = self.config
+        first = self._partition_tile_range(0)
+        candidate = (
+            tuple(self._kernel.get("ISA", (9, 5, 0))) == (9, 5, 0)
+            and cfg.dualPeriodScale
+            and cfg.scaleReuse == 2
+            and cfg.pgr == 2
+            and cfg.prefetchNextPartition
+            and cfg.uniformPgrEpoch
+            # This rewrite targets the productized five-request VMEM epoch.
+            # Alternate cohort experiments retain their original schedule.
+            and cfg.uniformEpochVmemCohortSize == 5
+            and cfg.numSubIterK == 1
+            and cfg.numPartitionsM > 1
+            and cfg.numPartitionsN > 1
+            and first['A'][0] == 0
+            and first['B'][0] == 0
+            and (first['A'][1] - first['A'][0]) % cfg.lrSA.mn == 0
+            and (first['B'][1] - first['B'][0]) % cfg.lrSB.mn == 0
+            and cfg.lrSA.mn == 2
+            and cfg.lrSB.mn == 2
+            and self.unroll_factor == 2
+        )
+        if not candidate:
+            self._scaleShadowPlan = []
+            return self._scaleShadowPlan
+
+        from .InstructionScheduler import selectScaleShadowPlan
+
+        firstPartitionMfmas = (
+            (first['A'][1] - first['A'][0])
+            * (first['B'][1] - first['B'][0])
+            * cfg.numSubIterK
+        )
+        plan = selectScaleShadowPlan(
+            list(self._flatEmittedInstructions(
+                self._emitted_per_unroll[0])),
+            list(self._flatEmittedInstructions(
+                self._emitted_per_unroll[1])),
+            firstPartitionMfmas,
+            (
+                (first['A'][1] - first['A'][0]) // cfg.lrSA.mn,
+                (first['B'][1] - first['B'][0]) // cfg.lrSB.mn,
+            ),
+        )
+        expectedReads = (
+            (first['A'][1] - first['A'][0]) // cfg.lrSA.mn
+            + (first['B'][1] - first['B'][0]) // cfg.lrSB.mn
+        )
+        assert plan and len(plan["entry"]) == expectedReads, \
+            "supported scale-shadow topology did not cover C0 P0 scales"
+        self._scaleShadowPlan = plan
+        return plan
+
+    @staticmethod
+    def _makeScaleShadowSeed(plan):
+        """Build the preloop reads that initialize C0-entry scale VGPRs."""
+        module = Module("Preloop C0-entry scale seed")
+        module.addComment0(
+            "Seed ScaleA/ScaleB reads needed by C0 partition zero")
+        for entry in plan:
+            read = copy.deepcopy(entry["readTemplate"])
+            read.comment = (
+                "preloop seed for C0 entry scale; "
+                f"{entry['tensor']} canonical=v{entry['canonicalVgpr']}"
+            )
+            module.add(read)
+        return module
+
+    @classmethod
+    def _insertScaleShadowSeed(cls, preloop, plan):
+        """Insert entry scales before the NLL/NGLL preloop dispatch."""
+        items = list(preloop.flatitems())
+        nllBranch = next(
+            (
+                index for index, inst in enumerate(items)
+                if getattr(inst, "comment", "") == "skip to NLL"
+            ),
+            None,
+        )
+        assert nllBranch is not None and nllBranch > 0, \
+            "scale shadowing could not find the preloop NLL dispatch"
+        compare = items[nllBranch - 1]
+        assert getattr(compare, "comment", "") == "LoopCounter LE 1?", \
+            "scale shadowing found an unexpected preloop NLL dispatch shape"
+        seed = list(cls._makeScaleShadowSeed(plan).flatitems())
+        items[nllBranch - 1:nllBranch - 1] = seed
+        preloop.setItems(items)
+        return preloop
+
     def _emitLoop(self, writer, kernel, label, emitted_3d, schedule=True,
                   injectAfterPartition=None, injectBeforeSlot=None):
         """Emit a loop section from a 3D emitted structure.
@@ -4971,7 +5082,10 @@ class LogicalScheduler:
             _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT,
             _FINAL_ENTRY_ANCHOR_ADVANCE_MFMAS,
             _RIGHT_ALIGN_PREVIOUS_DTL_BEFORE_ADVANCED_SUFFIX,
+            _MXFP8_FOLLOWER_SLOTS,
             advancePartitionInterleave,
+            appendC1ScaleShadowReads,
+            dropEntryScaleReads,
             eliminateRedundantLgkmDrains,
             instructionSchedule,
             relaxWaitGrForOutstandingStores,
@@ -5017,6 +5131,20 @@ class LogicalScheduler:
         )
         previous_schedule = None
         first_cell = None
+        write_floor = {}
+        if schedule and label == "MAINLOOP_C0" and self._scaleShadowPlan:
+            # Entry scales are preloop-seeded.  Drop those rereads before
+            # placement so data reads can take the early shadows, and hand
+            # the placer the C1-derived overwrite floor for what remains.
+            emitted_3d = copy.deepcopy(emitted_3d)
+            dropEntryScaleReads(
+                emitted_3d,
+                {
+                    entry["canonicalVgpr"]
+                    for entry in self._scaleShadowPlan["entry"]
+                })
+            write_floor = self._scaleShadowPlan.get("writeFloor", {})
+        body_mfma_base = 0
 
         def mfma_count(em_list):
             return sum(
@@ -5050,25 +5178,27 @@ class LogicalScheduler:
                             current_mfma_count,
                         )
                         _set_entry_wait_lr_count(em_list, safe_count)
+                    schedule_kwargs = dict(
+                        multiDU=self._is_multi_du(),
+                        minGapDsReadToWait=minGapDsReadToWait,
+                        partitionPrefetch=self.config.prefetchNextPartition,
+                        uniformPgrEpoch=self.config.uniformPgrEpoch,
+                        earliestWriteShadow=write_floor,
+                        mfmaBase=body_mfma_base)
                     try:
                         scheduled = instructionSchedule(
                             em_list,
-                            multiDU=self._is_multi_du(),
-                            minGapDsReadToWait=minGapDsReadToWait,
-                            partitionPrefetch=self.config.prefetchNextPartition,
                             limitDtlBundlesPerMfma=self.config.dualPeriodScale,
-                            uniformPgrEpoch=self.config.uniformPgrEpoch)
+                            **schedule_kwargs)
                     except _DtlIntervalCapacityError:
                         # Dependency windows can make the simple request-count
                         # capacity check optimistic. Retry only this cell with
                         # the prior legal density policy.
                         scheduled = instructionSchedule(
                             em_list,
-                            multiDU=self._is_multi_du(),
-                            minGapDsReadToWait=minGapDsReadToWait,
-                            partitionPrefetch=self.config.prefetchNextPartition,
                             limitDtlBundlesPerMfma=False,
-                            uniformPgrEpoch=self.config.uniformPgrEpoch)
+                            **schedule_kwargs)
+                    body_mfma_base += current_mfma_count
                     if (
                             self.config.uniformPgrEpoch
                             and self.config.numSubIterK == 1
@@ -5087,7 +5217,12 @@ class LogicalScheduler:
                             dropRedundantFinalLgkm=(
                                 _DROP_REDUNDANT_FINAL_PARTITION_LGKM_WAIT),
                             advanceFinalFollowers=(
-                                _ADVANCE_FINAL_PARTITION_FOLLOWERS))
+                                _ADVANCE_FINAL_PARTITION_FOLLOWERS),
+                            maxPhysicalFollowers=(
+                                _MXFP8_FOLLOWER_SLOTS
+                                if (self.config.dualPeriodScale
+                                    and self.config.prefetchNextPartition)
+                                else 3))
                     partModule.add(scheduled)
                     if use_partial_lr_waits:
                         if first_cell is None:
@@ -5173,6 +5308,32 @@ class LogicalScheduler:
                 first_mfma_count,
             )
             _set_entry_wait_lr_count(first_em_list, safe_count)
+        if self._scaleShadowPlan and label == "MAINLOOP_C1":
+            final = self._partition_tile_range(
+                self.config.numPartitions - 1)
+            finalPartitionMfmas = (
+                (final['A'][1] - final['A'][0])
+                * (final['B'][1] - final['B'][0])
+                * self.config.numSubIterK
+            )
+            assert appendC1ScaleShadowReads(
+                module,
+                self._scaleShadowPlan["entry"],
+                finalPartitionMfmas), \
+                "scale shadowing could not place C1 tail refreshes"
+        if self._scaleShadowPlan and label == "NGLL_C0":
+            # C0 leaves the current scale epoch in the entry VGPRs and has
+            # already swapped the LDS read pointer.  NGLL_C0 still consumes
+            # that epoch.  The following NLL_C0 is the next epoch, and its
+            # opening wait retires these reads before its first scaled MFMA.
+            for entry in self._scaleShadowPlan["entry"]:
+                read = copy.deepcopy(entry["readTemplate"])
+                read.comment = (
+                    f"{getattr(read, 'comment', '')}; "
+                    "load next scale epoch for NLL after NGLL; "
+                    f"{entry['tensor']} canonical=v{entry['canonicalVgpr']}"
+                )
+                module.add(read)
         if use_partial_lr_waits:
             # Dependency lowering creates correctness waits independently.
             # Once every partition has its final physical placement, remove a
@@ -6769,8 +6930,14 @@ class LogicalScheduler:
                 before=None,
                 source=None))
 
-        module.add(self._emitLoop(writer, kernel, "PRELOOP",
-                                  preloop_emitted, schedule=False))
+        preloop = self._emitLoop(writer, kernel, "PRELOOP",
+                                 preloop_emitted, schedule=False)
+        if self._scaleShadowPlan:
+            # Seed before the short-loop dispatch so mainloop, NLL, and NGLL
+            # entries all reach their first scaled MFMA with initialized data.
+            self._insertScaleShadowSeed(
+                preloop, self._scaleShadowPlan["entry"])
+        module.add(preloop)
         return module
 
     def _emitMainloopPhase(self, writer, kernel, plsin, isGfx1250, exitLabels):
@@ -6860,6 +7027,7 @@ class LogicalScheduler:
 
         module = Module("MainAndExitLoops")
         uf = self.unroll_factor
+        scaleShadowPlan = self._prepareScaleShadowPlan()
 
         # gfx1250 requires a loop-back/exit s_cbranch to be alone/first after an
         # MFMA, so hoist the per-copy dec+compare above the body's last MFMA.

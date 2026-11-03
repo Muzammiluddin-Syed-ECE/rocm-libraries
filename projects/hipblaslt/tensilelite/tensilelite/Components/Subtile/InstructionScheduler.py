@@ -7,10 +7,314 @@ Interleaves non-MFMA instructions between MFMAs using a slot-based placer
 with pluggable scheduling rules.
 """
 
+import copy
 from typing import List, Tuple, Optional
 from rocisa.code import Module, TextBlock
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
     LocalReadInstruction, GlobalReadInstruction, GlobalWriteInstruction, CommonInstruction
+
+
+# gfx950 scaled MFMAs retain their scale-source VGPR reads for nine issue
+# positions.  A direct write of that VGPR has to stay this far beyond the
+# last reader.  The loop edge between the last C1 consumer and a C0 shadow
+# is three loop-control instructions plus the C0 entry wait.  The write
+# itself issues after the target MFMA, so the earliest shadow is one less
+# than the remaining retain distance.
+_SCALE_SOURCE_WAR_MFMA_GAP = 9
+_SOURCE_WAR_LOOP_EDGE = 3 + 1
+# gfx950 MXFP8 MFMA is 32 cycles. The issue takes 8 and LD_PRELOAD
+# takes 4. LD_PRELOAD is the scale-operand issue, separate from an
+# SA or SB ds_read. The remaining 20 cycles are five follower slots.
+# Every ds_read, including SA and SB, uses one of those slots and
+# counts toward two per interval, or three when a two-read schedule
+# cannot fit.
+_MXFP8_FOLLOWER_SLOTS = 5
+_MXFP8_DATA_DS_READS = 2
+_MXFP8_DATA_DS_READ_OVERFLOW = 3
+
+
+def _physicalInstructionCount(items):
+    """Count emitted instructions while ignoring comments/text markers."""
+    return sum(not isinstance(inst, TextBlock) for inst in items)
+
+
+def _registerIndex(register):
+    """Return a concrete VGPR index, or None for a symbolic/non-VGPR operand."""
+    if register is None or getattr(register, "regType", None) != "v":
+        return None
+    index = getattr(register, "regIdx", None)
+    return index if isinstance(index, int) else None
+
+
+def _sourceWriteShadow(lastUse, totalMfmas):
+    """Earliest C0 MFMA shadow that may overwrite a VGPR last read in C1."""
+    later = totalMfmas - 1 - lastUse
+    return max(
+        0,
+        _SCALE_SOURCE_WAR_MFMA_GAP - later - _SOURCE_WAR_LOOP_EDGE - 1)
+
+
+def selectScaleShadowPlan(
+        c0Instructions, c1Instructions, firstPartitionMfmas,
+        expectedScaleReads):
+    """Select the canonical scales needed before C0 partition zero can issue.
+
+    The count is whatever this macrotile consumes inside partition zero.  It
+    is not a fixed two-ScaleA plus two-ScaleB split.  Those values are seeded
+    in the preloop and refreshed directly in the prior C1 tail.  Every other
+    scale read stays in C0 and overlaps compute that already has its operands.
+    """
+    c0Reads = {}
+    tensorByRegister = {}
+    for inst in c0Instructions:
+        if not isinstance(inst, LocalReadInstruction):
+            continue
+        destination = _registerIndex(getattr(inst, "dst", None))
+        comment = getattr(inst, "comment", "")
+        tensor = next(
+            (name for name in ("SA", "SB") if comment.startswith(name + " ")),
+            None)
+        if destination is None or tensor is None:
+            continue
+        c0Reads.setdefault(destination, copy.deepcopy(inst))
+        tensorByRegister[destination] = tensor
+
+    c0FirstUse = {}
+    c1LastUse = {}
+    c0Rank = 0
+    for inst in c0Instructions:
+        if not isinstance(inst, MXMFMAInstruction):
+            continue
+        for register in (inst.mxsa, inst.mxsb):
+            index = _registerIndex(register)
+            if index is not None:
+                c0FirstUse.setdefault(index, c0Rank)
+        c0Rank += 1
+
+    c1Rank = 0
+    for inst in c1Instructions:
+        if not isinstance(inst, MXMFMAInstruction):
+            continue
+        for register in (inst.mxsa, inst.mxsb):
+            index = _registerIndex(register)
+            if index is not None:
+                c1LastUse[index] = c1Rank
+        c1Rank += 1
+
+    selected = [
+        register for register in c0Reads
+        if c0FirstUse.get(register, firstPartitionMfmas) < firstPartitionMfmas
+        and register in c1LastUse
+    ]
+    selected.sort(
+        key=lambda register: (
+            0 if tensorByRegister[register] == "SA" else 1,
+            c0FirstUse[register],
+            register))
+    expectedSA, expectedSB = expectedScaleReads
+    if len(selected) != expectedSA + expectedSB:
+        return []
+    if [tensorByRegister[register] for register in selected].count("SA") != expectedSA:
+        return []
+    if [tensorByRegister[register] for register in selected].count("SB") != expectedSB:
+        return []
+
+    entries = [
+        {
+            "canonicalVgpr": register,
+            "tensor": tensorByRegister[register],
+            "readTemplate": c0Reads[register],
+            "firstC0Mfma": c0FirstUse[register],
+            "lastC1Mfma": c1LastUse[register],
+        }
+        for register in c0Reads
+        if register in c0FirstUse and register in c1LastUse
+    ]
+    entries.sort(
+        key=lambda entry: (
+            entry["firstC0Mfma"],
+            0 if entry["tensor"] == "SA" else 1,
+            entry["canonicalVgpr"]))
+    selectedSet = set(selected)
+    writeFloor = {}
+    for register, lastUse in c1LastUse.items():
+        shadow = _sourceWriteShadow(lastUse, c1Rank)
+        if shadow > 0:
+            writeFloor[register] = shadow
+    return {
+        "entry": [
+            entry for entry in entries
+            if entry["canonicalVgpr"] in selectedSet
+        ],
+        "deferred": [
+            entry for entry in entries
+            if entry["canonicalVgpr"] not in selectedSet
+        ],
+        "totalMfmas": c1Rank,
+        "writeFloor": writeFloor,
+    }
+
+
+def dropEntryScaleReads(emitted3d, entryRegisters):
+    """Remove preloop-seeded scale reads before C0 placement.
+
+    Those VGPRs are already live from the preloop seed and are refreshed in
+    the C1 tail.  Leaving the reread in the LR payload occupies an early
+    shadow a data read can use, and the placer would overwrite a value C0
+    still consumes.  A later copy of a scale VGPR that is already being
+    read in this C0 body is the same dword and is dropped too.
+    """
+    if not entryRegisters:
+        return
+    seen = set()
+    for partition in emitted3d:
+        for cell in partition:
+            for emitted in cell:
+                instructions = emitted.instructions
+                metadata = emitted.instructionMetadata
+                aligned = len(metadata) == len(instructions)
+                kept = []
+                keptMeta = []
+                for index, inst in enumerate(instructions):
+                    destination = _registerIndex(getattr(inst, "dst", None))
+                    comment = getattr(inst, "comment", "") or ""
+                    scaleRead = (
+                        isinstance(inst, LocalReadInstruction)
+                        and destination is not None
+                        and (
+                            comment.startswith("SA ")
+                            or comment.startswith("SB "))
+                    )
+                    if scaleRead and (
+                            destination in entryRegisters
+                            or destination in seen):
+                        continue
+                    if scaleRead:
+                        seen.add(destination)
+                    kept.append(inst)
+                    if aligned:
+                        keptMeta.append(metadata[index])
+                if len(kept) != len(instructions):
+                    emitted.instructions = kept
+                    if aligned:
+                        emitted.instructionMetadata = keptMeta
+
+
+def appendC1ScaleShadowReads(
+        schedule, plan, finalPartitionMfmas,
+        warGap=_SCALE_SOURCE_WAR_MFMA_GAP):
+    """Refresh C0-entry scales in dependency-safe C1 P3 MFMA shadows.
+
+    Prefer an empty final-partition suffix.  A scale ds_read then counts
+    toward the same two-read cap as a data read, and uses three only when
+    a two-read schedule cannot fit.  It also occupies one of the five
+    follower slots.  Every direct write issues at least ``warGap``
+    positions after that scale's final C1 consumer.
+    """
+    if not plan:
+        return False
+
+    prefix = []
+    mfmas = []
+    followers = []
+    for inst in schedule.flatitems():
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+            mfmas.append(inst)
+            followers.append([])
+        elif not mfmas:
+            prefix.append(inst)
+        else:
+            followers[-1].append(inst)
+
+    if len(mfmas) < finalPartitionMfmas or finalPartitionMfmas <= 0:
+        return False
+    finalStart = len(mfmas) - finalPartitionMfmas
+    barrierShadows = [
+        index for index in range(finalStart, len(followers))
+        if any(isinstance(inst, SBarrier) for inst in followers[index])
+    ]
+    if not barrierShadows:
+        return False
+    afterBarrier = barrierShadows[-1]
+
+    def canAppend(index, requireEmpty, reserved, maxLocalReads):
+        group = followers[index]
+        if requireEmpty and _physicalInstructionCount(group):
+            return False
+        if (_physicalInstructionCount(group) + reserved[index]
+                >= _MXFP8_FOLLOWER_SLOTS):
+            return False
+        localReads = sum(
+            isinstance(inst, LocalReadInstruction) for inst in group)
+        return localReads + reserved[index] < maxLocalReads
+
+    orderedPlan = sorted(
+        plan,
+        key=lambda entry: (
+            entry["lastC1Mfma"],
+            0 if entry["tensor"] == "SA" else 1,
+            entry["canonicalVgpr"]))
+
+    occupied = [
+        index for index in range(finalStart, len(followers))
+        if _physicalInstructionCount(followers[index])
+    ]
+    emptyTailStart = occupied[-1] + 1 if occupied else finalStart
+
+    def makePlacement(start, requireEmpty, maxLocalReads):
+        placements = []
+        reserved = [0] * len(followers)
+        searchFrom = max(start, finalStart, afterBarrier)
+        for entry in orderedPlan:
+            earliest = max(
+                searchFrom,
+                # The LDS write follows the target MFMA, so target-last+1 is
+                # the direct-write issue distance.
+                entry["lastC1Mfma"] + warGap - 1)
+            target = next(
+                (
+                    index for index in range(earliest, len(followers))
+                    if canAppend(
+                        index, requireEmpty, reserved, maxLocalReads)
+                ),
+                None)
+            if target is None:
+                return None
+            placements.append((target, entry))
+            reserved[target] += 1
+            searchFrom = target
+        return placements
+
+    placements = makePlacement(
+        emptyTailStart, requireEmpty=True,
+        maxLocalReads=_MXFP8_DATA_DS_READS)
+    if placements is None:
+        placements = makePlacement(
+            finalStart, requireEmpty=False,
+            maxLocalReads=_MXFP8_DATA_DS_READS)
+    if placements is None:
+        placements = makePlacement(
+            finalStart, requireEmpty=False,
+            maxLocalReads=_MXFP8_DATA_DS_READ_OVERFLOW)
+    if placements is None:
+        return False
+
+    for target, entry in placements:
+        read = copy.deepcopy(entry["readTemplate"])
+        read.comment = (
+            f"{getattr(read, 'comment', '')}; "
+            "refresh next C0 entry scale in prior C1 shadow; "
+            f"{entry['tensor']} canonical=v{entry['canonicalVgpr']} "
+            f"last-use=M{entry['lastC1Mfma']}"
+        )
+        followers[target].append(read)
+
+    items = list(prefix)
+    for mfma, group in zip(mfmas, followers):
+        items.append(mfma)
+        items.extend(group)
+    schedule.setItems(items)
+    return True
 
 
 # Advance the final partition's entry anchor by this many MFMA intervals.
@@ -53,11 +357,15 @@ class _SlotPlacer:
                  slotsPerInterval: int = 2,
                  oneDtlPerInterval: bool = False,
                  maxInstructionsPerInterval: Optional[int] = None,
+                 maxPerSlot: int = 2,
+                 dataDsReadCap: Optional[Tuple[int, int]] = None,
                  textBlocksConsumeSlots: bool = False):
         self.slotsPerInterval = slotsPerInterval
         self.totalSlots = intervals * slotsPerInterval
         self.oneDtlPerInterval = oneDtlPerInterval
         self.maxInstructionsPerInterval = maxInstructionsPerInterval
+        self.maxPerSlot = maxPerSlot
+        self.dataDsReadCap = dataDsReadCap
         self.textBlocksConsumeSlots = textBlocksConsumeSlots
         self._n = numModules
         self._prevInPath: List[int] = [-1] * numModules
@@ -113,8 +421,14 @@ class _SlotPlacer:
         )
 
     def _nextForwardLimit(self, pos: int, remainingItems: int) -> int:
-        """Reuse a slot only when a two-follower schedule cannot fit."""
-        if (self.denseToFit
+        """Advance one slot. A shared slot is reused only as overflow.
+
+        One-instruction slots never reuse. A third data read takes the
+        next open slot. Schedules that still allow two instructions in
+        one slot reuse it only when a two-follower schedule cannot fit.
+        """
+        if (self.maxPerSlot > 1
+                and self.denseToFit
                 and remainingItems
                 > self._remainingCapacityWithIntervalCap(pos, 2)):
             return pos
@@ -128,7 +442,7 @@ class _SlotPlacer:
         if sum(
                 self.textBlocksConsumeSlots
                 or not isinstance(item[1], TextBlock)
-                for item in self._placed[pos]) >= 2:
+                for item in self._placed[pos]) >= self.maxPerSlot:
             return False
         if (self.maxInstructionsPerInterval is not None
                 and self._intervalInstructionCount(pos)
@@ -225,8 +539,9 @@ class _SlotPlacer:
             for loadPos in range(
                     max(setupPos, loadLo),
                     min(intervalEnd, loadHi) + 1):
-                if (loadPos == setupPos
-                        and any(
+                if loadPos == setupPos and (
+                        self.maxPerSlot <= 1
+                        or any(
                             not isinstance(item[1], TextBlock)
                             for item in self._placed[setupPos])):
                     continue
@@ -249,6 +564,8 @@ class _SlotPlacer:
             )
             setupPos = max(first, intervalBegin)
             loadPos = max(setupPos, loadLo)
+            if self.maxPerSlot <= 1 and loadPos <= setupPos:
+                loadPos = setupPos + 1
             if ((not self.oneDtlPerInterval
                     or not self._intervalHasDtlLoad(setupPos))
                     and (self.maxInstructionsPerInterval is None
@@ -484,6 +801,10 @@ class _SchedulingRules:
         self.partialP0OverwriteWaitIds = set()
         self.minGap = minGapDsReadToWait
         self.allowReadsAcrossWait = allowReadsAcrossWait
+        # VGPR -> earliest C0 MFMA shadow that may overwrite it.  mfmaBase
+        # is this cell's first MFMA in that same C0 numbering.
+        self.earliestWriteShadow = {}
+        self.mfmaBase = 0
         # Per-path state
         self._resetPath()
 
@@ -498,17 +819,28 @@ class _SchedulingRules:
     # ── Validators: (placer, pos, inst) -> bool ──
 
     def oneDsReadPerInterval(self, placer, pos, inst):
-        """Use at most the non-leading slot count for DS reads per interval."""
+        """Cap ds_reads in one MFMA interval.
+
+        The MXFP8 budget is 2, or 3 when denseToFit says a 2-read
+        schedule cannot fit. SA and SB ds_reads count. LD_PRELOAD is
+        outside these slots. Other schedules keep one open slot, or
+        the full width when denseToFit is set.
+        """
         if not _isDsRead(inst):
             return True
+        explicit = placer.dataDsReadCap
         first = (pos // placer.slotsPerInterval) * placer.slotsPerInterval
         end = min(first + placer.slotsPerInterval, placer.totalSlots)
         reads = sum(
             _isDsRead(item[1])
             for slot in range(first, end)
             for item in placer._placed[slot])
-        limit = placer.slotsPerInterval \
-            if placer.denseToFit else placer.slotsPerInterval - 1
+        if explicit is not None:
+            ideal, overflow = explicit
+            limit = overflow if placer.denseToFit else ideal
+        else:
+            limit = placer.slotsPerInterval \
+                if placer.denseToFit else placer.slotsPerInterval - 1
         return reads < limit
 
     def oneDtlLoadPerInterval(self, placer, pos, inst):
@@ -516,7 +848,11 @@ class _SchedulingRules:
         return not _isDtlLoad(inst) or not placer._intervalHasDtlLoad(pos)
 
     def noDsReadOrValuInFirstSlot(self, placer, pos, inst):
-        """Reserve each p0 interval's first slot from DS reads and VALU."""
+        """Reserve each interval's first slot from DS reads and VALU.
+
+        SALU, m0, waits, and the barrier may use it. On the MXFP8 path
+        this leaves four VALU slots in the five-slot interval.
+        """
         if pos % placer.slotsPerInterval != 0:
             return True
         return not (_isDsRead(inst) or _isVALU(inst))
@@ -595,6 +931,24 @@ class _SchedulingRules:
             // (self.numLocalReads - 1)
         self.localReadIdx += 1
         return max(limit, target)
+
+    def deferLiveSourceWrite(self, placer, limit, inst):
+        """Hold a ds_read until its destination's prior reader has retired.
+
+        earliestWriteShadow maps a destination VGPR to the earliest C0 MFMA
+        shadow that may overwrite it.  mfmaBase converts that global shadow
+        into this cell.  A register absent from the map is unconstrained.
+        """
+        if not _isDsRead(inst) or not self.earliestWriteShadow:
+            return limit
+        dest = _registerIndex(getattr(inst, "dst", None))
+        floor = self.earliestWriteShadow.get(dest)
+        if not floor:
+            return limit
+        local = floor - self.mfmaBase
+        if local <= 0:
+            return limit
+        return max(limit, local * placer.slotsPerInterval)
 
     # ── Placement hook: (placer, pos, inst) -> None ──
 
@@ -801,6 +1155,49 @@ def _orderLocalReadsByFirstConsumer(pathInsts, emittedModules):
         return None
     reads.sort(key=lambda entry: entry[:3])
     return [item for _, _, _, item in reads] + nonReads
+
+
+def _orderReadsAroundLiveSourceWrites(pathInsts, earliestWriteShadow, mfmaBase):
+    """Issue unconstrained ds_reads before one whose VGPR is still live.
+
+    The placer walks a path with one cursor.  A personal overwrite floor
+    raises that cursor, and every later instruction inherits it.  Reads that
+    do not write the live VGPR stay in their existing order and keep the
+    earlier slots.  The constrained read then waits at its own floor, and
+    pointer updates stay behind the reads they belong to.
+    """
+    if not pathInsts or not earliestWriteShadow:
+        return pathInsts
+
+    def blocked(inst):
+        if not _isDsRead(inst):
+            return False
+        dest = _registerIndex(getattr(inst, "dst", None))
+        floor = earliestWriteShadow.get(dest) or 0
+        return floor - mfmaBase > 0
+
+    if not any(blocked(inst) for _, inst in pathInsts):
+        return pathInsts
+
+    prefix = []
+    unconstrained = []
+    deferred = []
+    tail = []
+    seenRead = False
+    for item in pathInsts:
+        inst = item[1]
+        if not _isDsRead(inst):
+            if seenRead:
+                tail.append(item)
+            else:
+                prefix.append(item)
+            continue
+        seenRead = True
+        if blocked(inst):
+            deferred.append(item)
+        else:
+            unconstrained.append(item)
+    return prefix + unconstrained + deferred + tail
 
 
 def _splitAfterFirstConsumerCohort(pathInsts, emittedModules):
@@ -1099,7 +1496,8 @@ def eliminateRedundantLgkmDrains(schedule) -> int:
 def advancePartitionInterleave(
         previousSchedule, finalSchedule, advanceMfmas,
         rightAlignPreviousDtl=False, maxPreviousDtlLoads=None,
-        dropRedundantFinalLgkm=False, advanceFinalFollowers=True):
+        dropRedundantFinalLgkm=False, advanceFinalFollowers=True,
+        maxPhysicalFollowers=3):
     """Move a final partition's interleaving stream earlier by whole MFMAs.
 
     The entry prefix is the interval immediately before the final partition's
@@ -1108,7 +1506,7 @@ def advancePartitionInterleave(
     by the same number of MFMA intervals.  This is deliberately a narrow,
     partition-local transform: only empty intervals in the preceding partition
     may receive work, no local read may cross the partition boundary, and each
-    destination keeps the strict three-follower cap.
+    destination keeps maxPhysicalFollowers instructions.
 
     When maxPreviousDtlLoads is set, stop advancing at the first complete
     follower group that would exceed that DTL-load count.  Keep that group and
@@ -1245,7 +1643,9 @@ def advancePartitionInterleave(
     def physicalCount(group):
         return sum(not isinstance(inst, TextBlock) for inst in group)
 
-    if any(physicalCount(group) > 3 for group in combinedFollowers):
+    if any(
+            physicalCount(group) > maxPhysicalFollowers
+            for group in combinedFollowers):
         return False
 
     def assemble(prefix, mfmas, followers):
@@ -1390,15 +1790,19 @@ def instructionSchedule(
         minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
         partitionPrefetch: bool = False,
         limitDtlBundlesPerMfma: bool = False,
-        uniformPgrEpoch: bool = False):
+        uniformPgrEpoch: bool = False,
+        earliestWriteShadow=None,
+        mfmaBase: int = 0):
     """Interleave non-MFMA instructions between MFMAs.
 
     Rules (shared):
       - MFMA order is preserved.
       - The legacy schedule uses 2 placement slots between adjacent MFMAs.
-      - Strict partition-prefetch scheduling permits a third slot when needed,
-        while capping physical follower instructions at three per MFMA.
-      - DS reads occupy only non-leading placement slots.
+      - MXFP8 partition prefetch uses five follower slots, one instruction
+        each. Every ds_read, including SA and SB, takes two per interval,
+        or three when a two-read schedule cannot fit. LD_PRELOAD is
+        outside these slots.
+      - DS reads and VALU occupy only non-leading placement slots.
       - Before dependencies are respected at module order level.
       - Minimm distance between ds_read and it waitcnt (hardcoded for now)
       - Module-internal instruction order is preserved.
@@ -1447,6 +1851,8 @@ def instructionSchedule(
         if reordered is not None:
             p0Payload = reordered
             p0PayloadReordered = True
+        p0Payload = _orderReadsAroundLiveSourceWrites(
+            p0Payload, earliestWriteShadow or {}, mfmaBase)
 
     strictDtlSpacing = (
         partitionPrefetchPolicy
@@ -1454,12 +1860,11 @@ def instructionSchedule(
         and _hasDtlIntervalCapacity(
             pathOrders, emittedModules, max(0, len(mfmas) - 1))
     )
-    # The strict partition-prefetch policy normally emits two instructions
-    # between adjacent MFMAs.  A third placement slot lets the leading LDS
-    # cohort issue a second read when necessary, so it completes before the
-    # first future-epoch DTL bundle without stacking multiple DTL bundles in
-    # one MFMA interval.
-    slotsPerInterval = 3 if strictDtlSpacing else 2
+    # Five follower slots are the 20 cycles left after an 8-cycle MFMA
+    # issue and a 4-cycle scale load. Direct-to-LDS spacing stays its
+    # own rule and does not choose the width.
+    slotsPerInterval = (
+        _MXFP8_FOLLOWER_SLOTS if partitionPrefetchPolicy else 2)
     placementPathOrders = list(pathOrders)
     if p0Split is not None and not p0PayloadReordered:
         placementPathOrders.append(p0Split[2])
@@ -1509,7 +1914,10 @@ def instructionSchedule(
     phasePathInsts = []
     canUseThreePhase = partitionPrefetchPolicy
     for order, _hasWaitGR in paths:
-        pathInsts = _flattenPath(order, emittedModules)
+        pathInsts = _orderReadsAroundLiveSourceWrites(
+            _flattenPath(order, emittedModules),
+            earliestWriteShadow or {},
+            mfmaBase)
         hasLR = any(_isDsRead(inst) for _, inst in pathInsts)
         hasGR = any(_isBufferLoad(inst) for _, inst in pathInsts)
         if hasLR and hasGR:
@@ -1524,6 +1932,8 @@ def instructionSchedule(
         minGapDsReadToWait=minGapDsReadToWait,
         allowReadsAcrossWait=(
             partitionPrefetchPolicy or p0Split is not None))
+    rules.earliestWriteShadow = earliestWriteShadow or {}
+    rules.mfmaBase = mfmaBase
     base_validators = [rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait,
                        rules.minGapDsReadToWait]
     if not (partitionPrefetchPolicy or p0Split is not None):
@@ -1532,6 +1942,8 @@ def instructionSchedule(
     # policy.  Legacy schedules use only buffer-load spreading, matching the
     # parent scheduler exactly.
     base_adjusters = [rules.spreadBufferLoads]
+    if rules.earliestWriteShadow:
+        base_adjusters.insert(0, rules.deferLiveSourceWrite)
     if partitionPrefetchPolicy or p0Split is not None:
         base_adjusters.insert(0, rules.spreadLocalReads)
     if partitionPrefetchPolicy or p0Split is not None:
@@ -1551,9 +1963,11 @@ def instructionSchedule(
             strictDtlSpacing
             and (partitionPrefetchPolicy or p0Split is not None)),
         maxInstructionsPerInterval=(
-            3 if strictDtlSpacing
-            and (partitionPrefetchPolicy or p0Split is not None)
-            else None),
+            _MXFP8_FOLLOWER_SLOTS if partitionPrefetchPolicy else None),
+        maxPerSlot=(1 if partitionPrefetchPolicy else 2),
+        dataDsReadCap=(
+            (_MXFP8_DATA_DS_READS, _MXFP8_DATA_DS_READ_OVERFLOW)
+            if partitionPrefetchPolicy else None),
         textBlocksConsumeSlots=not (
             partitionPrefetchPolicy or p0Split is not None))
 
@@ -1582,7 +1996,7 @@ def instructionSchedule(
                         multiDU=True)
                     placer.placePath(
                         pathInsts[syncEnd:],
-                        startLimit=2,
+                        startLimit=slotsPerInterval,
                         overflowToTail=True)
                     continue
 
@@ -1721,10 +2135,11 @@ def instructionSchedule(
                     # wait is converted to lgkmcnt(N) below, so these requests
                     # may remain pending while the older overlapping read is
                     # guaranteed complete.
+                    # Two data reads per interval. Using the full open
+                    # width would let the five-slot interval admit four.
                     budget = max(
                         0,
-                        (rules.minGap - 1)
-                        * (slotsPerInterval - 1))
+                        (rules.minGap - 1) * _MXFP8_DATA_DS_READS)
                     preWaitTail = []
                     postWaitTail = []
                     used = 0

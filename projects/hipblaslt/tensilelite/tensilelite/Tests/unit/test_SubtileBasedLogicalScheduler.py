@@ -2551,6 +2551,158 @@ class TestUniformPgrEpoch:
             scheduler.deallocVgprTiles(writer)
 
     @pytest.mark.parametrize(
+        "mt_m,mt_n,seed_sa,seed_sb",
+        [(256, 256, 2, 2), (256, 320, 2, 3), (320, 256, 3, 2)])
+    def test_production_scale_reads_seed_p0_and_refresh_in_c1_tail(
+            self, mt_m, mt_n, seed_sa, seed_sb):
+        kernel, fixture, cfg = self._production_fixture(mt_m, mt_n)
+        asm = _emit_mainloops(kernel, fixture, cfg).splitlines()
+
+        c0_begin = next(
+            i for i, line in enumerate(asm)
+            if "MAINLOOP_C0 start" in line)
+        c0_end = next(
+            i for i, line in enumerate(asm[c0_begin:], c0_begin)
+            if "MAINLOOP_C0 end" in line)
+        c1_begin = next(
+            i for i, line in enumerate(asm)
+            if "MAINLOOP_C1 start" in line)
+        c1_end = next(
+            i for i, line in enumerate(asm[c1_begin:], c1_begin)
+            if "MAINLOOP_C1 end" in line)
+
+        preloop_end = next(
+            i for i, line in enumerate(asm[:c0_begin])
+            if "PRELOOP end" in line)
+        seed_indices = [
+            i for i, line in enumerate(asm[:preloop_end])
+            if "preloop seed for C0 entry scale" in line
+        ]
+        seed_lines = [asm[i] for i in seed_indices]
+        assert len(seed_lines) == seed_sa + seed_sb
+        assert sum(" SA canonical=" in line for line in seed_lines) == seed_sa
+        assert sum(" SB canonical=" in line for line in seed_lines) == seed_sb
+        nll_dispatch = next(
+            i for i, line in enumerate(asm[:preloop_end])
+            if "skip to NLL" in line)
+        assert max(seed_indices) < nll_dispatch
+
+        seed_registers = {
+            line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
+            for line in seed_lines
+        }
+
+        def scale_comment(line):
+            comment = line.split("//", 1)[-1].strip() if "//" in line else ""
+            if comment.startswith("SA "):
+                return "SA"
+            if comment.startswith("SB "):
+                return "SB"
+            return None
+
+        c0_scale_reads = [
+            line for line in asm[c0_begin:c0_end]
+            if "ds_read_b32 " in line and scale_comment(line) is not None
+        ]
+        assert len(c0_scale_reads) == 4
+        assert not seed_registers.intersection(
+            line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
+            for line in c0_scale_reads
+        )
+
+        import re
+        last_use = {}
+        c1_rank = -1
+        for line in asm[c1_begin:c1_end]:
+            if "v_mfma_scale_" not in line:
+                continue
+            c1_rank += 1
+            head = line.split("op_sel", 1)[0]
+            registers = re.findall(r"\bv\d+\b", head)
+            assert len(registers) >= 2
+            last_use[registers[-2]] = c1_rank
+            last_use[registers[-1]] = c1_rank
+        total_mfmas = c1_rank + 1
+
+        # Partition 0's first shadows are usable by data reads.  A live
+        # scale source may not occupy them and leave the interval empty.
+        p0_end = next(
+            (
+                offset for offset, line in enumerate(asm[c0_begin:c0_end])
+                if "partition=1 " in line
+            ),
+            c0_end - c0_begin)
+        early_reads = 0
+        seen_mfma = 0
+        for line in asm[c0_begin:c0_begin + p0_end]:
+            if "v_mfma_scale_" in line:
+                seen_mfma += 1
+                if seen_mfma == 3:
+                    break
+            elif seen_mfma and "ds_read" in line:
+                early_reads += 1
+        assert early_reads >= 1
+
+        target_mfma = -1
+        for line in asm[c0_begin:c0_end]:
+            if "v_mfma_scale_" in line:
+                target_mfma += 1
+                continue
+            if scale_comment(line) is None or "ds_read_b32 " not in line:
+                continue
+            destination = line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
+            # Runtime wraps C1 -> three loop-control instructions -> the C0
+            # entry wait -> this C0 MFMA shadow.  A direct LDS write must not
+            # reach a scale VGPR until nine issue positions after its last use.
+            runtime_gap = (
+                total_mfmas - 1 - last_use[destination]
+                + 3
+                + 1
+                + target_mfma + 1
+            )
+            assert runtime_gap >= 9
+            first_use = next(
+                rank for rank, mfma in enumerate(
+                    candidate for candidate in asm[c0_begin:c0_end]
+                    if "v_mfma_scale_" in candidate)
+                if (
+                    f", {destination}," in mfma
+                    or f", {destination} op_sel:" in mfma
+                )
+            )
+            assert target_mfma < first_use
+
+        c0_lines = asm[c0_begin:c0_end]
+        swap_at = {
+            tensor: next(
+                i for i, line in enumerate(c0_lines)
+                if f"swap MX{tensor} LR" in line)
+            for tensor in ("SA", "SB")
+        }
+        for index, line in enumerate(c0_lines):
+            tensor = scale_comment(line)
+            if tensor is None or "ds_read_b32 " not in line:
+                continue
+            assert index < swap_at[tensor]
+
+        refreshes = []
+        mfma_rank = -1
+        for line in asm[c1_begin:c1_end]:
+            if "v_mfma_scale_" in line:
+                mfma_rank += 1
+            elif "refresh next C0 entry scale" in line:
+                refreshes.append((mfma_rank, line))
+        assert len(refreshes) == seed_sa + seed_sb
+        assert {
+            line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
+            for _, line in refreshes
+        } == seed_registers
+        for target, line in refreshes:
+            last_use = int(line.rsplit("last-use=M", 1)[1])
+            # The write issues after the target MFMA.
+            assert target - last_use + 1 >= 9
+
+    @pytest.mark.parametrize(
         "mt_m,mt_n,expected_counts",
         [
             (256, 256, [5, 5, 5, 1]),
@@ -4154,16 +4306,16 @@ class TestGetNumVgpr:
 # ══════════════════════════════════════════════════════════════
 
 class TestDualPeriodMXFP8ScheduleFingerprint:
-    """Pin Experiment 36's complete MT256x256 C0/C1 instruction order.
+    """Pin the productized MT256x256 C0/C1 instruction order.
 
-    Searchable baseline text is retained at:
+    The untouched Experiment 36 baseline is retained at:
     /home/muzasyed/Journey/Workspace/MXFP8VsFP8/du128-pgr2-scheduling/
     exp36-productization-2026-10-29/baseline/mainloop-c{0,1}.s
     """
 
     _EXPECTED = {
-        0: (180, "ca4f07114f874f89cc6fd8802f837240fc8be0278f377ba574cab1e35e07ab56"),
-        1: (150, "93518cec9c744055c8c49aae5f23e8a9cf5f71216d5c0ea1b5f514f52e99da91"),
+        0: (168, "b3534bd9693af28f442492378e05385f8216788223ee0525203c566d06af40d3"),
+        1: (154, "2433edc0040ba8ec407cc14adde6b50b074fa0a2a3c59b8291c681690133c507"),
     }
 
     @staticmethod
@@ -4274,7 +4426,7 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
             assert loads_since_mfma == 0, (
                 f"P{partition_index}: buffer load follows final MFMA")
 
-    def test_mt256x256_c0_c1_match_clean_baseline(self):
+    def test_mt256x256_c0_c1_match_scale_shadow_schedule(self):
         import hashlib
 
         assembly = _emit_du128_mxfp8_mainloops()
@@ -4690,7 +4842,7 @@ class TestInstructionSchedulerWrapPrefetch:
             modules,
             partitionPrefetch=True,
             limitDtlBundlesPerMfma=True).flatitems())
-        assert placement_policies[-1] == (3, False)
+        assert placement_policies[-1] == (5, False)
         mfma_positions = [
             i for i, inst in enumerate(items)
             if isinstance(inst, MXMFMAInstruction)
@@ -4762,7 +4914,7 @@ class TestInstructionSchedulerWrapPrefetch:
         assert sum(count > 0 for count in reads_per_interval) >= 8
         assert max(reads_per_interval) <= 2
         assert max(global_reads_per_interval) <= 1
-        assert max(instructions_per_interval) <= 3
+        assert max(instructions_per_interval) <= 5
         assert next(
             i for i, inst in reversed(list(enumerate(items)))
             if isinstance(inst, DSLoadB128)
@@ -5610,7 +5762,7 @@ class TestInstructionSchedulerWrapPrefetch:
                 dst=vgpr(8, 4), src=vgpr(1),
                 ds=DSModifiers(offset=index * 16),
                 comment=f"ds{index}")
-            for index in range(2)
+            for index in range(4)
         ]
         modules = [
             EmittedModule(
@@ -5624,8 +5776,8 @@ class TestInstructionSchedulerWrapPrefetch:
                 moduleId=2, instructions=[SBarrier(comment="barrier")],
                 before=1, source=SimpleNamespace(kind="sync")),
             EmittedModule(
-                moduleId=3, instructions=reads,
-                instructionMetadata=[(0, 1), (1, 1)],
+                moduleId=3,                 instructions=reads,
+                instructionMetadata=[(0, 1), (1, 1), (2, 1), (2, 1)],
                 before=2,
                 source=SimpleNamespace(
                     kind="lr", partition=1, targetPartition=2,

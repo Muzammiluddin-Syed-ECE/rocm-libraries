@@ -259,25 +259,64 @@ def test_vgpr_within_two_wave_slot_budget(dual_src):
         "architectural VGPR %d exceeds the two-wave-slot budget (128)" % vgpr)
 
 
-def test_no_scale_local_read_in_preloop(dual_src):
-    """The pre-loop prefetches data operands but not scales.
-
-    Scale local reads are epoch-granular: the mainloop, NLL, NGLL and tail
-    paths each re-read the whole group set at their head, so a pre-loop copy
-    would be overwritten before any MFMA consumes it.  Data local reads are
-    partition-granular and must still be there, feeding partition 0's MFMAs.
-    """
+def test_preloop_seeds_entry_scales_before_short_loop_dispatch(dual_src):
+    """Every C0 entry path must start with initialized P0 scale operands."""
     preloop = []
     for ln in dual_src.splitlines():
         if ln.strip() == "label_LoopBeginL:":
             break
         preloop.append(ln)
 
-    scale_lr = [l for l in preloop if "ds_read" in l and "scaleMXS" in l]
-    assert not scale_lr, "pre-loop re-reads scales the mainloop reloads: %s" % scale_lr
+    scale_lr = [
+        line for line in preloop
+        if "preloop seed for C0 entry scale" in line
+    ]
+    assert len(scale_lr) == 3
+    dispatch = next(
+        index for index, line in enumerate(preloop)
+        if "skip to NLL" in line)
+    assert max(preloop.index(line) for line in scale_lr) < dispatch
 
     data_lr = [
         l for l in preloop
         if re.search(r"^\s*ds_read_\w+\b.*// [AB](?: MT=)?", l)
     ]
     assert data_lr, "pre-loop lost its data operand prefetch"
+
+
+def test_ngll_c0_loads_next_epoch_before_nll(dual_src):
+    """The C0 exit still owes NLL the next scale epoch."""
+    lines = dual_src.splitlines()
+    seeds = [
+        line for line in lines
+        if "preloop seed for C0 entry scale" in line
+        and lines.index(line) < next(
+            index for index, candidate in enumerate(lines)
+            if candidate.strip() == "label_LoopBeginL:")
+    ]
+    ngll_end = next(
+        index for index, line in enumerate(lines)
+        if "NGLL_C0 end" in line)
+    nll_label = next(
+        index for index, line in enumerate(lines)
+        if line.strip() == "label_SkipToNLL:")
+    handoff = [
+        line for line in lines[:ngll_end]
+        if "load next scale epoch for NLL after NGLL" in line
+    ]
+    assert handoff
+    assert min(
+        index for index, line in enumerate(lines)
+        if line in handoff) > next(
+            index for index, line in enumerate(lines)
+            if "NGLL_C0 start" in line)
+    assert ngll_end < nll_label
+    seed_regs = {
+        line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
+        for line in seeds
+    }
+    handoff_regs = {
+        line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
+        for line in handoff
+    }
+    assert handoff_regs == seed_regs
