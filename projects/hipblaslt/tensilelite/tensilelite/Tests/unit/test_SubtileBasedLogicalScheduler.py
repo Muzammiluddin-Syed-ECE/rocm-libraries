@@ -4314,8 +4314,8 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
     """
 
     _EXPECTED = {
-        0: (168, "b3534bd9693af28f442492378e05385f8216788223ee0525203c566d06af40d3"),
-        1: (154, "2433edc0040ba8ec407cc14adde6b50b074fa0a2a3c59b8291c681690133c507"),
+        0: (168, "9dc678a8e4d1a1ee0214128ffc4dee2ca7b84d62522e6f978289790c6e5a432a"),
+        1: (154, "038b0e48d741980ab1ae695957887489d74f19ed0f92e853b4ba7f138d9ecb6d"),
     }
 
     @staticmethod
@@ -4865,9 +4865,9 @@ class TestInstructionSchedulerWrapPrefetch:
             for inst in items[:mfma_positions[0]]
         )
 
-        # Finish the earliest-consumer LDS cohort before writing the future
-        # LDS epoch.  Then issue exactly one m0/load bundle per MFMA interval;
-        # remaining LDS reads follow.
+        # Local reads keep deadline order. Each direct-to-LDS bundle then
+        # takes the latest shadow that is still free, with m0 in the first
+        # follower slot and the load in the second.
         assert next(
             inst.comment for inst in items[mfma_positions[0] + 1:]
             if isinstance(inst, DSLoadB128)
@@ -4882,13 +4882,23 @@ class TestInstructionSchedulerWrapPrefetch:
                 ("m0-", "gr-", "ds"))
         ]
         assert clustered == [
-            *expected_reads[:4],
+            *expected_reads,
             "m0-0", "gr-0",
             "m0-1", "gr-1",
             "m0-2", "gr-2",
             "m0-3", "gr-3",
-            *expected_reads[4:],
         ]
+        for index in range(4):
+            setup = next(
+                pos for pos, inst in enumerate(items)
+                if getattr(inst, "comment", "") == f"m0-{index}")
+            load = next(
+                pos for pos, inst in enumerate(items)
+                if getattr(inst, "comment", "") == f"gr-{index}")
+            previous_mfma = max(
+                pos for pos in mfma_positions if pos < setup)
+            assert setup == previous_mfma + 1
+            assert load == setup + 1
         assert [
             inst.comment for inst in items
             if isinstance(inst, BufferLoadB128)
