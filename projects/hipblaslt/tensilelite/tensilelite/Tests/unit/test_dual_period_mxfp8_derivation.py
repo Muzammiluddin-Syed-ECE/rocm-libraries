@@ -170,7 +170,7 @@ _MI_PGR1 = [16, 16, 128, 1, 1, 8, 8, 2, 2]
 # Dual-period path: PGR2 + DU128 MXFP8 is ACCEPTED with the right scale period.
 # ---------------------------------------------------------------------------
 def test_dual_period_accepts_pgr2_du128(_gp_gfx950, gfx950_iim, assembler, capsys):
-    sol, out = _derive(gfx950_iim, assembler, capsys, _MI_8WAVE, 128, 2, 0)
+    sol, out = _derive(gfx950_iim, assembler, capsys, _MI_8WAVE, 128, 2, 1)
     assert sol.get("Valid") is True, f"expected accept, rejected with: {out!r}"
     assert sol.get("_DualPeriodMXFP8") is True
     assert sol["DepthU"] == 128
@@ -182,17 +182,17 @@ def test_dual_period_accepts_pgr2_du128(_gp_gfx950, gfx950_iim, assembler, capsy
     assert isSubtileMultiDU(sol) is False
 
 
-def test_dual_period_rejects_plr1(_gp_gfx950, gfx950_iim, assembler, capsys):
-    sol, out = _derive(gfx950_iim, assembler, capsys, _MI_8WAVE, 128, 2, 1)
+def test_dual_period_rejects_plr0(_gp_gfx950, gfx950_iim, assembler, capsys):
+    sol, out = _derive(gfx950_iim, assembler, capsys, _MI_8WAVE, 128, 2, 0)
     assert sol.get("Valid") is False
-    assert "dual-period MXFP8 requires PrefetchLocalRead=0" in out
+    assert "dual-period MXFP8 requires PrefetchLocalRead=1" in out
     assert sol.get("_DualPeriodMXFP8") is False
 
 
 def test_dual_period_rejects_single_partition_geometry(
         _gp_gfx950, gfx950_iim, assembler, capsys):
     sol, out = _derive(
-        gfx950_iim, assembler, capsys, _MI_SINGLE_PARTITION, 128, 2, 0)
+        gfx950_iim, assembler, capsys, _MI_SINGLE_PARTITION, 128, 2, 1)
     assert sol.get("Valid") is False
     assert "dual-period MXFP8 requires at least two normalized partitions" in out
     assert sol.get("_DualPeriodMXFP8") is False

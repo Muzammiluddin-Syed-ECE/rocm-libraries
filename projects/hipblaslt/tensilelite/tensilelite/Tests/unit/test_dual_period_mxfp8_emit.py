@@ -68,7 +68,7 @@ def _emit_dual_period_kernel():
           "Batched": True, "StridedBatched": True, "MXBlockA": 32, "MXBlockB": 32}
     params = {"ProblemType": pt, "ISA": isa, "MatrixInstruction": mi,
         "WorkGroup": [16, 16, 1], "WavefrontSize": 64, "DepthU": 128,
-        "KernelLanguage": "Assembly", "PrefetchGlobalRead": 2, "PrefetchLocalRead": 0,
+        "KernelLanguage": "Assembly", "PrefetchGlobalRead": 2, "PrefetchLocalRead": 1,
         "ScheduleIterAlg": 3, "StaggerU": 0, "GlobalSplitU": 1, "InnerUnroll": 1,
         "LdsPadA": -1, "LdsPadB": -1, "LdsBlockSizePerPadA": -1, "LdsBlockSizePerPadB": -1,
         "1LDSBuffer": 0, "VectorWidthA": -1, "VectorWidthB": -1, "StoreVectorWidth": -1,

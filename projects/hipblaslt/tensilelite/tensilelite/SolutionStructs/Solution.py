@@ -4329,9 +4329,9 @@ class Solution(collections.abc.Mapping):
       # truly dual-period.  The provisional gate above also covers DU256 while
       # selecting geometry, but DU256 has ScaleReuse=1 and must retain its
       # existing PLR/partition eligibility.
-      if dualPeriodMXFP8 and state["PrefetchLocalRead"] != 0:
+      if dualPeriodMXFP8 and state["PrefetchLocalRead"] != 1:
         reject(state, printRejectionReason,
-               "dual-period MXFP8 requires PrefetchLocalRead=0")
+               "dual-period MXFP8 requires PrefetchLocalRead=1")
         state["_DualPeriodMXFP8"] = False
         return
 
