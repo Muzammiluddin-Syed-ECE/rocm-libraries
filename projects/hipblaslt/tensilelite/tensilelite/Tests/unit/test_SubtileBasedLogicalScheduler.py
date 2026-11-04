@@ -2457,12 +2457,12 @@ class TestUniformPgrEpoch:
         ]
 
     @staticmethod
-    def _production_fixture(mt_m=256, mt_n=256):
+    def _production_fixture(mt_m=256, mt_n=256, miWaveGroup=None):
         import importlib
 
         kernel_module = importlib.import_module(
             "tensilelite.Components.Subtile.Kernel")
-        kernel = create_kernel_mxfp8(mt_m, mt_n)
+        kernel = create_kernel_mxfp8(mt_m, mt_n, miWaveGroup=miWaveGroup)
         kernel["PrefetchGlobalRead"] = 2
         kernel["PrefetchLocalRead"] = 0
         fixture = make_writer_and_tileinfos(kernel, fp4=True)
@@ -2701,6 +2701,107 @@ class TestUniformPgrEpoch:
             last_use = int(line.rsplit("last-use=M", 1)[1])
             # The write issues after the target MFMA.
             assert target - last_use + 1 >= 9
+
+    @pytest.mark.parametrize(
+        "mt_m,mt_n,mi_wave_group",
+        [
+            (192, 192, None),
+            (96, 256, [1, 4]),
+        ])
+    def test_short_final_partition_spills_scale_refresh_into_c0(
+            self, mt_m, mt_n, mi_wave_group):
+        """A short final partition cannot hold every C0-entry refresh.
+
+        Refreshes that still have eight MFMA shadows stay in the C1
+        tail.  The rest issue in the next C0, before that VGPR is read
+        and before the scale-pointer swap.
+        """
+        kernel, fixture, cfg = self._production_fixture(
+            mt_m, mt_n, miWaveGroup=mi_wave_group)
+        asm = _emit_mainloops(kernel, fixture, cfg).splitlines()
+        c0_begin = next(
+            i for i, line in enumerate(asm) if "MAINLOOP_C0 start" in line)
+        c0_end = next(
+            i for i, line in enumerate(asm[c0_begin:], c0_begin)
+            if "MAINLOOP_C0 end" in line)
+        c1_begin = next(
+            i for i, line in enumerate(asm) if "MAINLOOP_C1 start" in line)
+        c1_end = next(
+            i for i, line in enumerate(asm[c1_begin:], c1_begin)
+            if "MAINLOOP_C1 end" in line)
+        c1_mfmas = sum(
+            1 for line in asm[c1_begin:c1_end] if "v_mfma_scale_" in line)
+        preloop_end = next(
+            i for i, line in enumerate(asm[:c0_begin])
+            if "PRELOOP end" in line)
+        seed_registers = {
+            line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
+            for line in asm[:preloop_end]
+            if "preloop seed for C0 entry scale" in line
+        }
+        refreshes = [
+            (index, line) for index, line in enumerate(asm)
+            if "refresh next C0 entry scale" in line
+            and "ds_read_b32 " in line
+        ]
+        assert {
+            line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
+            for _, line in refreshes
+        } == seed_registers
+        spilled = [line for _, line in refreshes if "prior C1 shadow" not in line]
+        assert spilled
+        for index, line in refreshes:
+            destination = line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
+            last_use = int(line.rsplit("last-use=M", 1)[1])
+            later = c1_mfmas - 1 - last_use
+            if "prior C1 shadow" in line:
+                assert c1_begin <= index < c1_end
+                target = sum(
+                    1 for text in asm[c1_begin:index]
+                    if "v_mfma_scale_" in text) - 1
+                assert target - last_use + 1 >= 9
+                continue
+            assert c0_begin <= index < c0_end
+            first_use = next(
+                rank for rank, text in enumerate(
+                    candidate for candidate in asm[c0_begin:c0_end]
+                    if "v_mfma_scale_" in candidate)
+                if f", {destination}," in text
+                or f", {destination} op_sel:" in text)
+            use_at = next(
+                i for i, text in enumerate(asm[c0_begin:c0_end], c0_begin)
+                if "v_mfma_scale_" in text and (
+                    f", {destination}," in text
+                    or f", {destination} op_sel:" in text))
+            assert index < use_at
+            tensor = "SA" if " SA canonical=" in line else "SB"
+            swap_at = next(
+                i for i, text in enumerate(asm[c0_begin:c0_end], c0_begin)
+                if f"swap MX{tensor} LR" in text)
+            assert index < swap_at
+            if "next C0 prologue" in line:
+                assert later + 3 + 1 >= 9
+                wait_at = next(
+                    i for i, text in enumerate(asm[index + 1:c0_end], index + 1)
+                    if "Wait for all immediate LR" in text)
+                assert wait_at < use_at
+                continue
+            if "next C0 before mfma 0" in line:
+                assert later + 3 + 1 + 1 >= 9
+                assert not any(
+                    "v_mfma_scale_" in text for text in asm[c0_begin:index])
+                assert any(
+                    "Wait spilled C0 entry scale refresh" in text
+                    for text in asm[index + 1:use_at])
+                continue
+            target = sum(
+                1 for text in asm[c0_begin:index]
+                if "v_mfma_scale_" in text) - 1
+            assert target < first_use
+            assert later + 3 + 1 + target + 1 >= 9
+            assert any(
+                "Wait spilled C0 entry scale refresh" in text
+                for text in asm[index + 1:use_at])
 
     @pytest.mark.parametrize(
         "mt_m,mt_n,expected_counts",

@@ -1004,6 +1004,7 @@ class LogicalScheduler:
         # after register allocation/population because scale-source VGPRs are
         # only known in the emitted instruction stream.
         self._scaleShadowPlan = None
+        self._mainloopC0Schedule = None
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -5086,6 +5087,7 @@ class LogicalScheduler:
             advancePartitionInterleave,
             appendC1ScaleShadowReads,
             dropEntryScaleReads,
+            spillC0ScaleRefreshes,
             eliminateRedundantLgkmDrains,
             instructionSchedule,
             relaxWaitGrForOutstandingStores,
@@ -5316,11 +5318,17 @@ class LogicalScheduler:
                 * (final['B'][1] - final['B'][0])
                 * self.config.numSubIterK
             )
-            assert appendC1ScaleShadowReads(
+            placed = appendC1ScaleShadowReads(
                 module,
                 self._scaleShadowPlan["entry"],
-                finalPartitionMfmas), \
+                finalPartitionMfmas)
+            assert placed is not None, \
                 "scale shadowing could not place C1 tail refreshes"
+            leftovers, c1Mfmas = placed
+            if leftovers:
+                assert spillC0ScaleRefreshes(
+                    self._mainloopC0Schedule, leftovers, c1Mfmas), \
+                    "scale shadowing could not place C1 tail refreshes"
         if self._scaleShadowPlan and label == "NGLL_C0":
             # C0 leaves the current scale epoch in the entry VGPRs and has
             # already swapped the LDS read pointer.  NGLL_C0 still consumes
@@ -5365,6 +5373,8 @@ class LogicalScheduler:
         # that sync); the wait is appended at the end to hide its cross-CU latency.
         from .ClusterBarrier import insertClusterBarrier
         module = insertClusterBarrier(module, writer, kernel)
+        if label == "MAINLOOP_C0":
+            self._mainloopC0Schedule = module
         return module
 
     def _emit_pgr2_tail_lw_align(self, kernel):

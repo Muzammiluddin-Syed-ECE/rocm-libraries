@@ -207,12 +207,17 @@ def appendC1ScaleShadowReads(
 
     Prefer an empty final-partition suffix.  A scale ds_read then counts
     toward the same two-read cap as a data read, and uses three only when
-    a two-read schedule cannot fit.  It also occupies one of the five
-    follower slots.  Every direct write issues at least ``warGap``
-    positions after that scale's final C1 consumer.
+    a two-read schedule cannot fit.  An empty shadow may hold as many
+    scale reads as it has follower slots.  Every direct write issues at
+    least ``warGap`` positions after that scale's final C1 consumer.
+
+    Returns ``None`` when the final partition has no barrier to hang the
+    reads on.  Otherwise returns ``(unplaced, c1Mfmas)``.  Unplaced
+    entries are past the last C1 shadow or do not fit in it; the caller
+    spills those into the next C0.
     """
     if not plan:
-        return False
+        return None
 
     prefix = []
     mfmas = []
@@ -227,14 +232,14 @@ def appendC1ScaleShadowReads(
             followers[-1].append(inst)
 
     if len(mfmas) < finalPartitionMfmas or finalPartitionMfmas <= 0:
-        return False
+        return None
     finalStart = len(mfmas) - finalPartitionMfmas
     barrierShadows = [
         index for index in range(finalStart, len(followers))
         if any(isinstance(inst, SBarrier) for inst in followers[index])
     ]
     if not barrierShadows:
-        return False
+        return None
     afterBarrier = barrierShadows[-1]
 
     def canAppend(index, requireEmpty, reserved, maxLocalReads):
@@ -296,24 +301,264 @@ def appendC1ScaleShadowReads(
         placements = makePlacement(
             finalStart, requireEmpty=False,
             maxLocalReads=_MXFP8_DATA_DS_READ_OVERFLOW)
-    if placements is None:
-        return False
+    def commit(selected):
+        for target, entry in selected:
+            read = copy.deepcopy(entry["readTemplate"])
+            read.comment = (
+                f"{getattr(read, 'comment', '')}; "
+                "refresh next C0 entry scale in prior C1 shadow; "
+                f"{entry['tensor']} canonical=v{entry['canonicalVgpr']} "
+                f"last-use=M{entry['lastC1Mfma']}"
+            )
+            followers[target].append(read)
+        items = list(prefix)
+        for mfma, group in zip(mfmas, followers):
+            items.append(mfma)
+            items.extend(group)
+        schedule.setItems(items)
 
-    for target, entry in placements:
+    if placements is not None:
+        commit(placements)
+        return [], len(mfmas)
+
+    # The strict caps could not take every refresh.  Keep the ones that
+    # still land in C1.  An empty shadow is scale-only, so it can use
+    # every follower slot; a shadow that already has data reads stays
+    # on the overflow cap.
+    placements = []
+    leftovers = []
+    reserved = [0] * len(followers)
+    searchFrom = max(finalStart, afterBarrier)
+
+    def readCap(index):
+        if _physicalInstructionCount(followers[index]) == 0:
+            return _MXFP8_FOLLOWER_SLOTS
+        return _MXFP8_DATA_DS_READ_OVERFLOW
+
+    for entry in orderedPlan:
+        earliest = max(
+            searchFrom,
+            entry["lastC1Mfma"] + warGap - 1)
+        target = next(
+            (
+                index for index in range(earliest, len(followers))
+                if canAppend(index, False, reserved, readCap(index))
+            ),
+            None)
+        if target is None:
+            leftovers.append(entry)
+            continue
+        placements.append((target, entry))
+        reserved[target] += 1
+        searchFrom = target
+    commit(placements)
+    return leftovers, len(mfmas)
+
+
+def spillC0ScaleRefreshes(schedule, entries, c1Mfmas):
+    """Place C1-tail overflows in the next C0, before their first use.
+
+    A prologue write sits before the C0 entry wait, so that wait retires
+    it.  Its issue distance is the remaining C1 MFMAs, the three
+    loop-control instructions, and the write.  A write that is one
+    short of that gap can sit after the entry wait and before mfma 0;
+    the wait then counts, and the read gets its own drain.  A later C0
+    shadow uses the same distance as a C1 shadow once the loop edge is
+    included, and
+    it has to stay before the first consumer and before the scale-pointer
+    swap.  A shadow write that the entry wait does not cover gets an
+    lgkmcnt drain immediately before its consumer.
+    """
+    if not entries:
+        return True
+    items = list(schedule.flatitems())
+    mfmaPos = [
+        index for index, inst in enumerate(items)
+        if isinstance(inst, (MFMAInstruction, MXMFMAInstruction))
+    ]
+    if not mfmaPos:
+        return False
+    def drainsLocalReads(inst):
+        # ds_read retires on the LDS counter.  The C0 entry wait is a
+        # dscnt drain; older paths spell the same drain as kmcnt.
+        return isinstance(inst, SWaitCnt) and (
+            getattr(inst, "waitAll", False)
+            or getattr(inst, "dscnt", -1) == 0
+            or getattr(inst, "kmcnt", -1) == 0
+        )
+
+    def instText(inst):
+        return " ".join(
+            part for part in (
+                getattr(inst, "comment", "") or "",
+                getattr(inst, "text", "") or "",
+                getattr(inst, "name", "") or "",
+            )
+            if part)
+
+    prefix = items[:mfmaPos[0]]
+    waitAt = next(
+        (
+            index for index in range(len(prefix) - 1, -1, -1)
+            if drainsLocalReads(prefix[index])
+        ),
+        None)
+    if waitAt is None:
+        return False
+    shadows = []
+    for rank, pos in enumerate(mfmaPos):
+        end = mfmaPos[rank + 1] if rank + 1 < len(mfmaPos) else len(items)
+        shadows.append(items[pos + 1:end])
+
+    def swapFlat(tensor):
+        needle = f"swap MX{tensor} LR"
+        index = next(
+            (
+                found for found, inst in enumerate(items)
+                if needle in instText(inst)
+            ),
+            None)
+        if index is None:
+            return None
+        # The banner can be scheduled just after the xor it describes.
+        # The xor is the pointer change.
+        cursor = index - 1
+        while cursor >= 0 and type(items[cursor]).__name__ == "TextBlock":
+            cursor -= 1
+        if cursor >= 0 and type(items[cursor]).__name__ == "VXorB32":
+            return cursor
+        return index
+
+    def region(flatIndex):
+        if flatIndex < mfmaPos[0]:
+            return ("prefix", flatIndex)
+        for rank, pos in enumerate(mfmaPos):
+            end = mfmaPos[rank + 1] if rank + 1 < len(mfmaPos) else len(items)
+            if flatIndex == pos:
+                return ("mfma", rank)
+            if pos < flatIndex < end:
+                return ("shadow", rank)
+        return None
+
+    def beforeSwap(tensor, where):
+        flat = swapFlat(tensor)
+        if flat is None:
+            return True
+        loc = region(flat)
+        if where[0] == "prologue":
+            return loc[0] != "prefix" or loc[1] > waitAt
+        if where[0] == "postwait":
+            # The read is inserted at the end of the prefix, after the
+            # entry wait.  A swap still in the prefix has already
+            # retired, or sits in that same suffix.
+            return loc[0] != "prefix"
+        rank = where[1]
+        if loc[0] == "prefix":
+            return False
+        return rank < loc[1]
+
+    def later(entry):
+        return c1Mfmas - 1 - entry["lastC1Mfma"]
+
+    def makeRead(entry, where):
         read = copy.deepcopy(entry["readTemplate"])
         read.comment = (
             f"{getattr(read, 'comment', '')}; "
-            "refresh next C0 entry scale in prior C1 shadow; "
+            f"refresh next C0 entry scale in {where}; "
             f"{entry['tensor']} canonical=v{entry['canonicalVgpr']} "
             f"last-use=M{entry['lastC1Mfma']}"
         )
-        followers[target].append(read)
+        return read
 
-    items = list(prefix)
-    for mfma, group in zip(mfmas, followers):
-        items.append(mfma)
-        items.extend(group)
-    schedule.setItems(items)
+    prologue = []
+    postwait = []
+    shadowAdds = [[] for _ in shadows]
+    for entry in sorted(
+            entries,
+            key=lambda item: (item["firstC0Mfma"], item["lastC1Mfma"])):
+        if later(entry) + 3 + 1 >= 9 and beforeSwap(
+                entry["tensor"], ("prologue",)):
+            prologue.append(makeRead(entry, "next C0 prologue"))
+            continue
+        # One short of the prologue gap.  The entry wait sits before
+        # this write, so it counts, and the write is still before mfma 0.
+        if (entry["firstC0Mfma"] == 0
+                and later(entry) + _SOURCE_WAR_LOOP_EDGE + 1 >= 9
+                and beforeSwap(entry["tensor"], ("postwait",))):
+            postwait.append(makeRead(entry, "next C0 before mfma 0"))
+            continue
+        placed = False
+        minimum = max(
+            0, 9 - 1 - _SOURCE_WAR_LOOP_EDGE - later(entry))
+        for target in range(minimum, entry["firstC0Mfma"]):
+            if target >= len(shadows):
+                break
+            if not beforeSwap(entry["tensor"], ("shadow", target)):
+                break
+            occupied = (
+                _physicalInstructionCount(shadows[target])
+                + len(shadowAdds[target]))
+            if occupied >= _MXFP8_FOLLOWER_SLOTS:
+                continue
+            shadowAdds[target].append(
+                makeRead(entry, f"C0 shadow M{target}"))
+            placed = True
+            break
+        if not placed:
+            return False
+
+    if prologue:
+        prefix = prefix[:waitAt] + prologue + prefix[waitAt:]
+    if postwait:
+        prefix = prefix + postwait
+    rebuilt = list(prefix)
+    for rank, pos in enumerate(mfmaPos):
+        rebuilt.append(items[pos])
+        rebuilt.extend(shadows[rank])
+        rebuilt.extend(shadowAdds[rank])
+
+    def canonical(inst):
+        comment = getattr(inst, "comment", "") or ""
+        marker = "canonical=v"
+        if marker not in comment or "refresh next C0 entry scale in " not in comment:
+            return None
+        if "prior C1 shadow" in comment:
+            return None
+        text = comment.split(marker, 1)[1].split(" ", 1)[0]
+        return int(text) if text.isdigit() else None
+
+    def usesRegister(inst, vgpr):
+        if not isinstance(inst, MXMFMAInstruction):
+            return False
+        return any(
+            _registerIndex(register) == vgpr
+            for register in (inst.mxsa, inst.mxsb))
+
+    waited = []
+    for index, inst in enumerate(rebuilt):
+        vgpr = canonical(inst)
+        if vgpr is None:
+            continue
+        consumer = next(
+            (
+                later for later in range(index + 1, len(rebuilt))
+                if usesRegister(rebuilt[later], vgpr)
+            ),
+            None)
+        if consumer is None:
+            return False
+        if any(
+                drainsLocalReads(rebuilt[between])
+                for between in range(index + 1, consumer)):
+            continue
+        waited.append(consumer)
+    for consumer in sorted(set(waited), reverse=True):
+        rebuilt.insert(
+            consumer,
+            SWaitCnt(
+                dscnt=0,
+                comment="Wait spilled C0 entry scale refresh"))
+    schedule.setItems(rebuilt)
     return True
 
 
