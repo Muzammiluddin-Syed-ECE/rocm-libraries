@@ -440,6 +440,29 @@ def make_writer_and_tileinfos(kernel, fp4=False):
     return writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo
 
 
+def _assert_dtl_load_keeps_its_m0(lines):
+    """Each direct-to-LDS load consumes the m0 written for it.
+
+    A second m0 before that load means the earlier setup was overwritten.
+    A second load before the next m0 means both stores share one LDS line.
+    """
+    awaiting_load = False
+    for line in lines:
+        stripped = line.strip()
+        is_m0 = (
+            stripped.startswith("s_add_u32 m0,")
+            or stripped.startswith("s_mov_b32 m0,")
+        )
+        is_dtl = "buffer_load_" in stripped and " lds" in stripped
+        if is_m0:
+            assert not awaiting_load, line
+            awaiting_load = True
+        elif is_dtl:
+            assert awaiting_load, line
+            awaiting_load = False
+    assert not awaiting_load
+
+
 def _emit_mainloops(kernel, fixture, cfg):
     """Emit both concrete main-loop copies from a scheduler fixture."""
     writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = fixture
@@ -2750,6 +2773,14 @@ class TestUniformPgrEpoch:
         } == seed_registers
         spilled = [line for _, line in refreshes if "prior C1 shadow" not in line]
         assert spilled
+        for copy in (0, 1):
+            begin = next(
+                i for i, line in enumerate(asm)
+                if f"MAINLOOP_C{copy} start" in line)
+            end = next(
+                i for i, line in enumerate(asm[begin:], begin)
+                if f"MAINLOOP_C{copy} end" in line)
+            _assert_dtl_load_keeps_its_m0(asm[begin:end])
         for index, line in refreshes:
             destination = line.split("ds_read_b32 ", 1)[1].split(",", 1)[0]
             last_use = int(line.rsplit("last-use=M", 1)[1])
@@ -4415,8 +4446,8 @@ class TestDualPeriodMXFP8ScheduleFingerprint:
     """
 
     _EXPECTED = {
-        0: (168, "9dc678a8e4d1a1ee0214128ffc4dee2ca7b84d62522e6f978289790c6e5a432a"),
-        1: (154, "038b0e48d741980ab1ae695957887489d74f19ed0f92e853b4ba7f138d9ecb6d"),
+        0: (168, "668ca3ef0a6caae299bf60f398d4b42cfb55f2b220ae930845c6d1df7e01a508"),
+        1: (154, "6b32e6236e55118771c2f6afb6d1e92c1a200e9b232fa19b0075ea2c5027af48"),
     }
 
     @staticmethod
@@ -5712,6 +5743,131 @@ class TestInstructionSchedulerWrapPrefetch:
             assert not any(
                 isinstance(inst, MXMFMAInstruction)
                 for inst in items[setup_position + 1:load_position])
+
+    def test_right_align_places_m0_and_vmem_from_the_back(self):
+        import shutil
+        from rocisa import rocIsa
+        from rocisa.container import MUBUFModifiers, mgpr, sgpr, vgpr
+        from rocisa.instruction import BufferLoadB128, SAddU32, SBarrier
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _SlotPlacer,
+            _rightAlignM0AndVmem,
+        )
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        dtl = MUBUFModifiers(offen=True, lds=True)
+        extra = SAddU32(
+            dst=mgpr(0), src0=sgpr(20), src1=2048, comment="m0-extra")
+        setups = [
+            SAddU32(
+                dst=mgpr(0), src0=sgpr(20), src1=offset,
+                comment=f"m0-{index}")
+            for index, offset in enumerate((4096, 6144))
+        ]
+        loads = [
+            BufferLoadB128(
+                dst=None, vaddr=vgpr(0), saddr=sgpr(24, 4),
+                soffset=0, mubuf=dtl, comment=f"gr-{index}")
+            for index in range(2)
+        ]
+        barrier = SBarrier(comment="stop")
+        placer = _SlotPlacer(
+            4, 1, [[0]],
+            slotsPerInterval=5,
+            maxPerSlot=1,
+            maxInstructionsPerInterval=5)
+        # Forward order, packed at the front. The barrier stays put and
+        # closes the last interval.
+        placer._placed[0] = [(0, extra)]
+        placer._placed[1] = [(0, setups[0])]
+        placer._placed[2] = [(0, loads[0])]
+        placer._placed[3] = [(0, setups[1])]
+        placer._placed[4] = [(0, loads[1])]
+        placer._placed[18] = [(0, barrier)]
+
+        _rightAlignM0AndVmem(placer)
+
+        located = {
+            item[1].comment: pos
+            for pos, slot in enumerate(placer._placed)
+            for item in slot
+        }
+        assert [located[name] for name in (
+            "m0-extra", "m0-0", "gr-0", "m0-1", "gr-1", "stop"
+        )] == [9, 10, 11, 15, 16, 18]
+        assert located["m0-0"] % 5 == 0
+        assert located["gr-0"] == located["m0-0"] + 1
+        assert located["m0-1"] % 5 == 0
+        assert located["gr-1"] == located["m0-1"] + 1
+
+    def test_right_align_keeps_gr_address_updates_with_their_loads(self):
+        import shutil
+        from rocisa import rocIsa
+        from rocisa.container import MUBUFModifiers, mgpr, sgpr, vgpr
+        from rocisa.instruction import (
+            BufferLoadB128, SAddCU32, SAddU32, SBarrier, SXorB32)
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _SlotPlacer,
+            _rightAlignM0AndVmem,
+        )
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        dtl = MUBUFModifiers(offen=True, lds=True)
+        setups = [
+            SAddU32(
+                dst=mgpr(0), src0=sgpr("LocalWriteBaseAddrA"), src1=offset,
+                comment=f"m0-{index}")
+            for index, offset in enumerate((0, 2048))
+        ]
+        loads = [
+            BufferLoadB128(
+                dst=None, vaddr=vgpr(0), saddr=sgpr("SrdA", 4),
+                soffset=0, mubuf=dtl, comment=f"gr-{index}")
+            for index in range(2)
+        ]
+        address = [
+            SAddU32(
+                dst=sgpr("SrdB"), src0=sgpr("SrdB"), src1=128,
+                comment="srd"),
+            SAddCU32(
+                dst=sgpr("SrdB+1"), src0=sgpr("SrdB+1"), src1=0,
+                comment="carry"),
+            SXorB32(
+                dst=sgpr("LocalWriteBaseAddrB"),
+                src0=sgpr("LocalWriteBaseAddrB"), src1=sgpr("SwapB"),
+                comment="swap"),
+        ]
+        barrier = SBarrier(comment="stop")
+        placer = _SlotPlacer(
+            4, 1, [[0]],
+            slotsPerInterval=5,
+            maxPerSlot=1,
+            maxInstructionsPerInterval=5)
+        placed = [
+            setups[0], loads[0], *address, setups[1], loads[1],
+        ]
+        for slot, inst in enumerate(placed):
+            placer._placed[slot] = [(0, inst)]
+        placer._placed[18] = [(0, barrier)]
+
+        _rightAlignM0AndVmem(placer)
+
+        located = {
+            item[1].comment: pos
+            for pos, slot in enumerate(placer._placed)
+            for item in slot
+        }
+        assert [located[name] for name in (
+            "m0-0", "gr-0", "srd", "carry", "swap", "m0-1", "gr-1", "stop"
+        )] == [10, 11, 12, 13, 14, 15, 16, 18]
 
     def test_dtl_density_falls_back_when_geometry_has_too_few_intervals(self):
         import shutil
