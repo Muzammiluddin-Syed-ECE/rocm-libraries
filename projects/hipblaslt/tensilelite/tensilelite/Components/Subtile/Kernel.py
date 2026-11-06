@@ -1488,6 +1488,15 @@ def mainLoop(writer, kernel):
       forcedPartition = (MFMASchedulerConfig._even_split_size(M, mnM),
                          MFMASchedulerConfig._even_split_size(N, mnN))
 
+  # A wave group stacked along one axis splits each atom on that axis over
+  # several cooperative buffer loads.  Uniform epoch cohorts count those loads.
+  grLoadsPerAtom = {}
+  if schedulerPartitionPrefetch:
+    for tc, ti, gran, tiles in (('A', tiA, grAGran, M), ('B', tiB, grBGran, N)):
+      atoms = ceilDivide(tiles, max(1, int(gran.mn)))
+      if atoms and ti.numGRTotal and ti.numGRTotal % atoms == 0:
+        grLoadsPerAtom[tc] = ti.numGRTotal // atoms
+
   vgprBudget = writer.states.regCaps["MaxVgpr"]
   vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
   singlePartition = ((pgr == 0) or (schedulerPlr == 0)) \
@@ -1558,6 +1567,7 @@ def mainLoop(writer, kernel):
           prefetchNextPartition=schedulerPartitionPrefetch,
           uniformPgrEpoch=(schedulerPartitionPrefetch and schedulerPgr == 2),
           uniformEpochVmemCohortSize=5,
+          grLoadsPerAtom=grLoadsPerAtom,
           partitionOrder=schedulerPartitionOrder,
           grPlacement=grPlacement,
           pgl=kernel.get("PrefetchGL2", 0),

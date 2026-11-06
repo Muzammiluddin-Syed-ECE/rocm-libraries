@@ -286,10 +286,15 @@ class SchedulerConfig:
     # scale cadence.  The preloop correspondingly seeds a complete n+1 A/B
     # epoch so the first steady-state wrap has a producer.
     uniformPgrEpoch: bool = False
-    # Maximum number of atomic A/B VMEM requests in each non-frontier uniform
-    # epoch cohort, and in the partition-zero overwrite cohort.  A non-frontier
-    # chunk is also limited to the smallest non-frontier partition's MFMA count.
+    # Buffer loads that close a non-frontier uniform epoch cohort and the
+    # partition-zero overwrite cohort.  Atoms are not split, so a cohort ends
+    # on the first whole atom that reaches this many loads.  A non-frontier
+    # cohort also holds no more loads than the smallest non-frontier
+    # partition has MFMAs.
     uniformEpochVmemCohortSize: int = 5
+    # Buffer loads one GR atom issues, per tensor.  A tensor missing here
+    # issues one load per atom.
+    grLoadsPerAtom: Dict[str, int] = field(default_factory=dict)
     # Physical traversal of the 2-D partition grid.  "m-major" preserves the
     # legacy order (M varies fastest).  "n-major" visits the 2x2 grid as
     # c00,c01,c10,c11 (N varies fastest).
@@ -559,6 +564,26 @@ class SchedulerConfig:
         if self.partitionOrder == "n-major":
             return pi // self.numPartitionsN, pi % self.numPartitionsN
         return pi % self.numPartitionsM, pi // self.numPartitionsM
+
+    def uniform_epoch_cohorts(self, tensors, cap=None) -> List[int]:
+        """Return the uniform-epoch cohort of each atom, given each atom's tensor.
+
+        A cohort closes on the first atom that brings it to
+        uniformEpochVmemCohortSize loads, or before an atom that would take
+        it past cap loads.  A cohort always holds at least one atom.
+        """
+        cohorts = []
+        cohort = 0
+        loads = 0
+        for tensor in tensors:
+            weight = max(1, int(self.grLoadsPerAtom.get(tensor, 1)))
+            if loads and (loads >= self.uniformEpochVmemCohortSize
+                          or (cap is not None and loads + weight > cap)):
+                cohort += 1
+                loads = 0
+            cohorts.append(cohort)
+            loads += weight
+        return cohorts
 
     @staticmethod
     def get_partition_candidates(tileInfoA, tileInfoB) -> list:
@@ -1181,17 +1206,17 @@ class LogicalScheduler:
         if len(partitions) < 2:
             return
 
-        first_atoms = []
-        cohortSize = cfg.uniformEpochVmemCohortSize
+        epoch_atoms = []
         for tensor, gran, num_tiles in (
                 ('A', cfg.grA, cfg.numMFMATilesM),
                 ('B', cfg.grB, cfg.numMFMATilesN)):
             for tile in range(0, num_tiles, gran.mn):
-                first_atoms.append((tensor, tile, tile + gran.mn))
-                if len(first_atoms) == cohortSize:
-                    break
-            if len(first_atoms) == cohortSize:
-                break
+                epoch_atoms.append((tensor, tile, tile + gran.mn))
+        # Uncapped, so this is never smaller than the cohort _distribute_grs
+        # puts in partition zero.
+        cohorts = cfg.uniform_epoch_cohorts([atom[0] for atom in epoch_atoms])
+        first_atoms = [
+            atom for atom, cohort in zip(epoch_atoms, cohorts) if cohort == 0]
 
         selected = {}
         for tensor, tile_start, tile_end in first_atoms:
@@ -2144,21 +2169,22 @@ class LogicalScheduler:
         total_weight = weight_prefix[-1]
         slot_boundaries = [p * nAtoms for p in weight_prefix[1:]]
 
+        uniform_cohorts = None
+        if cfg.uniformPgrEpoch and cfg.grPlacement != GRPlacementStrategy.BUNCHED:
+            # Each non-frontier cohort is sized in loads and capped by the
+            # smallest non-frontier partition.  The frontier receives the
+            # remainder immediately before its epoch wait.
+            cap = (min(mfma_per_partition[s // numK] for s in dist_slots[:-1])
+                   if len(dist_slots) > 1 else None)
+            uniform_cohorts = cfg.uniform_epoch_cohorts(
+                [atom[0] for atom in atoms], cap=cap)
+
         for i, (tensor, mt_val, ts, te, ks, ke, last) in enumerate(atoms):
             if cfg.grPlacement == GRPlacementStrategy.BUNCHED:
                 # TDM: pin every GR atom to partition 0, subIterK 0.
                 rel = 0
-            elif cfg.uniformPgrEpoch:
-                # Bound each non-frontier cohort by the configured size, and
-                # further by the smallest non-frontier partition.  The frontier
-                # receives the remainder immediately before its epoch wait.
-                nonfrontier_chunk = max(
-                    1,
-                    min(cfg.uniformEpochVmemCohortSize, min(
-                        mfma_per_partition[s // numK]
-                        for s in dist_slots[:-1]
-                    ))) if len(dist_slots) > 1 else nAtoms
-                rel = min(i // nonfrontier_chunk, len(dist_slots) - 1)
+            elif uniform_cohorts is not None:
+                rel = min(uniform_cohorts[i], len(dist_slots) - 1)
             else:
                 rel = min(bisect_left(slot_boundaries, i * total_weight + 1),
                           len(dist_slots) - 1) if nAtoms else 0
