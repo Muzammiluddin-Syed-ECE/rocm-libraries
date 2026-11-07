@@ -1567,6 +1567,7 @@ def mainLoop(writer, kernel):
           prefetchNextPartition=schedulerPartitionPrefetch,
           uniformPgrEpoch=(schedulerPartitionPrefetch and schedulerPgr == 2),
           uniformEpochVmemCohortSize=5,
+          halfDisjointLds=schedulerPartitionPrefetch,
           grLoadsPerAtom=grLoadsPerAtom,
           partitionOrder=schedulerPartitionOrder,
           grPlacement=grPlacement,
