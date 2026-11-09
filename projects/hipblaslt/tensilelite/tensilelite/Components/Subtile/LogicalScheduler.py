@@ -5283,6 +5283,7 @@ class LogicalScheduler:
             guardExitOverwriteReread,
             insertPrefetchedScaleCopies,
             instructionSchedule,
+            keepValuBehindLeader,
             lateScaleReadsPrecedeSecondHalf,
             placeLateScalePrefetchSpills,
             restoreCanonicalScaleReads,
@@ -5567,6 +5568,8 @@ class LogicalScheduler:
                 and self.config.uniformPgrEpoch
                 and self.config.dualPeriodScale):
             dropDominatedLgkmWaits(module)
+        if self.halfDisjoint and label.startswith("MAINLOOP"):
+            keepValuBehindLeader(module)
         return module
 
     def _emit_pgr2_tail_lw_align(self, kernel):
