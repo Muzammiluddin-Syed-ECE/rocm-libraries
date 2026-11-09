@@ -5283,6 +5283,7 @@ class LogicalScheduler:
             guardExitOverwriteReread,
             insertPrefetchedScaleCopies,
             instructionSchedule,
+            issueSaluFirst,
             keepValuBehindLeader,
             lateScaleReadsPrecedeSecondHalf,
             placeLateScalePrefetchSpills,
@@ -5569,6 +5570,7 @@ class LogicalScheduler:
                 and self.config.dualPeriodScale):
             dropDominatedLgkmWaits(module)
         if self.halfDisjoint and label.startswith("MAINLOOP"):
+            issueSaluFirst(module)
             keepValuBehindLeader(module)
         return module
 
