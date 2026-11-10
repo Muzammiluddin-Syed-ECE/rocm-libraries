@@ -76,6 +76,22 @@ def plsinDataTypes(kernel) -> bool:
         and pt["DestDataType"].isBFloat16()
 
 
+def storeDataWarWaitStates(kernel) -> int:
+    """``s_nop`` operand for the >8-byte buffer-store write-data (vdata) WAR hazard.
+
+    A VALU instruction that overwrites the write-data VGPRs of a preceding ``buffer_store``
+    wider than 8 bytes (e.g. ``buffer_store_dwordx4``) needs 2 wait states on GFX940-family
+    parts (gfx942, gfx950) and 1 on older parts, per LLVM
+    ``GCNHazardRecognizer::checkVALUHazardsHelper`` (``VALUWaitStates = hasGFX940Insts() ? 2 : 1``).
+    ``s_nop N`` delays ``N+1`` cycles, so this returns the operand: 1 (``s_nop 1`` -> 2 wait
+    states) on gfx940+, else 0 (``s_nop 0`` -> 1 wait state). Tolerant of partially-built state.
+    """
+    try:
+        return 1 if tuple(kernel["ISA"][:2]) in ((9, 4), (9, 5)) else 0
+    except (KeyError, TypeError, IndexError):
+        return 0
+
+
 def isMxf4SubtilePath(kernel) -> bool:
     """Scope gate for the MXF4 subtile optimizations: TN, subtile, MXF4->bf16.
 

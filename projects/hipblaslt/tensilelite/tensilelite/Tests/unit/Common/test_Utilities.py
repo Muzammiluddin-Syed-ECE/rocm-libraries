@@ -55,6 +55,7 @@ from tensilelite.Common.Utilities import (
     setVerbosity,
     state,
     state_key_ordering,
+    storeDataWarWaitStates,
     swizzleGeometry,
     versionIsCompatible,
     wmmaV3InputVgprLayout,
@@ -584,3 +585,28 @@ class TestSwizzleGeometry:
         assert geom["packK"] == 1
         assert geom["loadsPerLane"] == 2
         assert geom["loadsPerLane"] * geom["laneSize"] * DataType("H").numBytes() == 32
+
+
+@pytest.mark.parametrize(
+    "isa, expected",
+    [
+        ((9, 4, 0), 1),   # gfx940  -- GFX940 family -> 2 wait states (s_nop 1)
+        ((9, 4, 2), 1),   # gfx942  (MI300X)
+        ((9, 5, 0), 1),   # gfx950  (MI355X)
+        ((9, 0, 8), 0),   # gfx908  -- pre-GFX940 -> 1 wait state (s_nop 0)
+        ((9, 0, 10), 0),  # gfx90a  (MI200)
+        ((11, 0, 0), 0),  # gfx1100 (RDNA3)
+        ((12, 0, 0), 0),  # gfx1200
+    ],
+)
+def test_store_data_war_wait_states_is_two_on_gfx940_family(isa, expected):
+    # >8B buffer-store vdata WAR: 2 wait states (s_nop 1) on GFX940-family parts (gfx942,
+    # gfx950), 1 (s_nop 0) on older, matching LLVM checkVALUHazardsHelper hasGFX940Insts()?2:1.
+    assert storeDataWarWaitStates({"ISA": isa}) == expected
+
+
+def test_store_data_war_wait_states_tolerates_partial_state():
+    # Called from naming/derivation on partially-built state; must not raise, defaults to 0.
+    assert storeDataWarWaitStates({}) == 0
+    assert storeDataWarWaitStates({"ISA": None}) == 0
+    assert storeDataWarWaitStates({"ISA": []}) == 0

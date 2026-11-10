@@ -45,6 +45,7 @@ from rocisa.functions import scalarUInt32DivideAndRemainder, vectorStaticMultipl
 
 from ..Common import DataDirection, SemanticVersion, isSubtileMultiDU, \
     isMxf4SubtilePath
+from ..Common.Utilities import storeDataWarWaitStates
 from ..Common.DataType import DataType
 from ..Component import GlobalWriteComponents
 from ..Component import Component
@@ -1719,7 +1720,7 @@ class GlobalWriteBatchWriter:
         self.storesIssued += numNewStores
 
     if self.parentWriter.states.serializedStore:
-      module.add(SNop(0, "1 wait state required when next inst writes vgprs held by previous dwordx4 store inst"))
+      module.add(SNop(storeDataWarWaitStates(self.kernel), "store-data WAR: 2 wait states on gfx940+ (1 otherwise) when the next inst overwrites the >8B dwordx4 store's vdata"))
 
     if self.kernel["_GlobalAccumulation"] == "MultipleBufferSingleKernel":
       module.addCommentAlign("GW end") #GSUSYNC

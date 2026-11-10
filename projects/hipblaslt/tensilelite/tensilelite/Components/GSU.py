@@ -33,6 +33,7 @@ from rocisa.instruction import SAddCU32, SAddU32, SAndB32, SLoadB32, SStoreB32, 
 from rocisa.functions import scalarStaticMultiply64, scalarUInt32DivideAndRemainder, vectorStaticMultiply
 
 from ..Common import ceilDivide, log2, print2, INDEX_CHARS
+from ..Common.Utilities import storeDataWarWaitStates
 from ..Common.MxScaleLayout import mxFreeTile, mulScaleRows
 from ..Component import Component
 from ..AsmStoreState import StoreState, VectorDataTypes
@@ -745,7 +746,7 @@ class GSUOn(GSU):
 
         if kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel':
             if writer.states.serializedStore:
-                module.add(SNop(0, "1 wait state required when next inst writes vgprs held by previous dwordx4 store inst"))
+                module.add(SNop(storeDataWarWaitStates(kernel), "store-data WAR: 2 wait states on gfx940+ (1 otherwise) when the next inst overwrites the >8B dwordx4 store's vdata"))
 
         return module
 

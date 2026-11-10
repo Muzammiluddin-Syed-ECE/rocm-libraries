@@ -30,7 +30,7 @@ from rocisa.functions import scalarStaticDivideAndRemainder, sMagicDiv2, vectorS
 from .Subtile.SubtileLREmit import localReadResetOffsetsSubtile
 
 from ..Common import IsaVersion, print2, ceilDivide, log2, DataDirection
-from ..Common.Utilities import isMxf4SubtilePath, isSubtileSwizzledTensor
+from ..Common.Utilities import isMxf4SubtilePath, isSubtileSwizzledTensor, storeDataWarWaitStates
 from ..Component import Component
 from .TileProcessingStrategy import TileProcessingStrategy, TileWork
 from .WorkAssignment import QueuePartition, StaticPartition, \
@@ -2513,7 +2513,7 @@ class StreamK(TileProcessingStrategy):
         ss.checkInTempVgprC()
 
         if writer.states.serializedStore:
-            module.add(SNop(0, "1 wait state required when next inst writes vgprs held by previous dwordx4 store inst"))
+            module.add(SNop(storeDataWarWaitStates(kernel), "store-data WAR: 2 wait states on gfx940+ (1 otherwise) when the next inst overwrites the >8B dwordx4 store's vdata"))
 
         # Update the store cnt to preLoopVmcntDict for Case2/3
         # (No need to update for Case0:'Undefined' or Case4:'OrdNLL_B1_Store')
@@ -3462,7 +3462,7 @@ class StreamK(TileProcessingStrategy):
         ss.checkInTempVgprC()
 
         if writer.states.serializedStore:
-            module.add(SNop(0, "1 wait state required when next inst writes vgprs held by previous dwordx4 store inst"))
+            module.add(SNop(storeDataWarWaitStates(kernel), "store-data WAR: 2 wait states on gfx940+ (1 otherwise) when the next inst overwrites the >8B dwordx4 store's vdata"))
 
         # Update the store cnt to preLoopVmcntDict for Case2/3
         # (No need to update for Case0:'Undefined' or Case4:'OrdNLL_B1_Store')
