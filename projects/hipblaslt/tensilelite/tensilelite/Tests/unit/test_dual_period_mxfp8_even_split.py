@@ -87,3 +87,38 @@ def test_even_split_size_is_in_range(mn):
         assert 1 <= s <= dim, f"dim {dim}, mn {mn}: size {s} out of range"
         assert s % mn == 0 or s == dim, \
             f"dim {dim}, mn {mn}: size {s} is not an mn multiple"
+
+
+@pytest.mark.parametrize("miwt,order", [
+    # Every partition >= 4 tiles on both axes.
+    ((10, 8), "m-major"),
+    ((8, 10), "m-major"),
+    ((8, 8), "m-major"),
+    ((10, 10), "m-major"),
+    ((14, 8), "m-major"),
+    # A partition is 2 tiles wide.
+    ((10, 6), "n-major"),
+    ((6, 4), "n-major"),
+    ((10, 4), "n-major"),
+    ((14, 4), "n-major"),
+    ((6, 8), "n-major"),
+    ((6, 10), "n-major"),
+    ((4, 4), "n-major"),
+    # Two partitions: the order does not change the halves.
+    ((16, 2), "n-major"),
+])
+def test_half_disjoint_partition_order(miwt, order):
+    """m-major exactly when no partition is under 4 tiles on either axis."""
+    assert SchedulerConfig._half_disjoint_partition_order(
+        _sizes(miwt[0]), _sizes(miwt[1])) == order
+
+
+def test_half_disjoint_mmajor_follows_the_tile_gate():
+    """Over every reachable MIWaveTile, m-major is the tile gate and nothing else."""
+    for m in DIMS:
+        for n in DIMS:
+            sm, sn = _sizes(m), _sizes(n)
+            gate = (len(sm) * len(sn) >= 2
+                    and min(sm + sn) >= SchedulerConfig.HALF_DISJOINT_MMAJOR_MIN_TILES)
+            got = SchedulerConfig._half_disjoint_partition_order(sm, sn)
+            assert got == ("m-major" if gate else "n-major"), f"{m}x{n}: {sm} x {sn} -> {got}"

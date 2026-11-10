@@ -1462,7 +1462,8 @@ def mainLoop(writer, kernel):
   # Partition-directed PLR for the MT256x256 DU128 dual-period MXFP8 subtile
   # kernel.  Each compute partition local-reads the operands needed by the NEXT
   # partition (rather than the next K slot), with the A/B operand VGPRs
-  # double-buffered and an n-major (c00,c01,c10,c11) partition traversal.
+  # double-buffered.  The partition traversal is
+  # SchedulerConfig._half_disjoint_partition_order.
   #
   # This is selected purely from the solution parameters: the dual-period MXFP8
   # path (gfx950, MXFP8, PGR2, HostPreSwizzle scales, DepthU=128 -> ScaleReuse>=2)
@@ -1473,7 +1474,6 @@ def mainLoop(writer, kernel):
   schedulerPartitionOrder = "m-major"
   forcedPartition = None
   if schedulerPartitionPrefetch:
-      schedulerPartitionOrder = "n-major"
       schedulerDoubleBuffer = ('A', 'B')
       # Split the wave's MFMA-tile grid in half along each dim -> a 2x2 partition
       # grid (8x4 -> 4x2 for the 8-wave MI, 8x8 -> 4x4 for the 4-wave MI).
@@ -1487,6 +1487,14 @@ def mainLoop(writer, kernel):
       mnN = max(1, int(lrSBGran.mn) if lrSBGran else 1)
       forcedPartition = (MFMASchedulerConfig._even_split_size(M, mnM),
                          MFMASchedulerConfig._even_split_size(N, mnN))
+      sizesM = MFMASchedulerConfig._normalize_partition_sizes(
+          forcedPartition[0], M, 'M',
+          max(1, int(lrAGran.mn), mnM))
+      sizesN = MFMASchedulerConfig._normalize_partition_sizes(
+          forcedPartition[1], N, 'N',
+          max(1, int(lrBGran.mn), mnN))
+      schedulerPartitionOrder = \
+          MFMASchedulerConfig._half_disjoint_partition_order(sizesM, sizesN)
 
   # A wave group stacked along one axis splits each atom on that axis over
   # several cooperative buffer loads.  Uniform epoch cohorts count those loads.

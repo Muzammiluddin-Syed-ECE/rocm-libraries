@@ -369,6 +369,25 @@ class SchedulerConfig:
         half = -(-total // 2)  # ceil(total / 2)
         return max(1, min(total, ((half + mn - 1) // mn) * mn))
 
+    # m-major needs this many MFMA tiles per partition on each axis.  With a
+    # 2-tile-wide partition a half streams every A tile against 2 B tiles (or
+    # the reverse), which bunches that operand's loads and their SALU.
+    HALF_DISJOINT_MMAJOR_MIN_TILES = 4
+
+    @staticmethod
+    def _half_disjoint_partition_order(sizesM: List[int], sizesN: List[int]) -> str:
+        """Partition traversal of a half-disjoint body: "m-major" or "n-major".
+
+        The halves are the first and last P/2 partitions in traversal order.
+        m-major is used whenever every partition is at least
+        HALF_DISJOINT_MMAJOR_MIN_TILES tiles on both axes; otherwise n-major.
+        """
+        numP = len(sizesM) * len(sizesN)
+        minTiles = SchedulerConfig.HALF_DISJOINT_MMAJOR_MIN_TILES
+        if numP < 2 or min(sizesM + sizesN) < minTiles:
+            return "n-major"
+        return "m-major"
+
     @staticmethod
     def _normalize_partition_sizes(spec: Union[int, List[int]], total: int, dim: str,
                                    mn: int = 1, remainder_last: bool = False) -> List[int]:
