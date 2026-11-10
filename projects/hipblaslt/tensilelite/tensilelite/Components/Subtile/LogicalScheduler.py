@@ -5100,6 +5100,48 @@ class LogicalScheduler:
 
         flat = list(storeModule.flatitems())
         position = {id(item): idx for idx, item in enumerate(flat)}
+        # Store-module clobber guard (position-aware). A terminal MFMA relocated into a gap runs
+        # AFTER every store instruction before that gap. The coalesce takes its cvt/pack/scratch
+        # registers from dead-operand holes (the operand lend) that the last-K MFMAs still read as
+        # A/B/scale, so a store write before the gap can clobber a moved MFMA's source -- and
+        # _plsinProducersWithClobberedSources only scans the LOOP, not the store module. Forbid any
+        # (producer, gap) whose source registers intersect the store writes before the gap. This is
+        # a no-op for the un-coalesced woven store (its tiny cvt footprint does not alias operands).
+        def _storeWriteKeys(item):
+            out = set()
+            for attrs in (self._PLSIN_UNIT_WRITES, self._PLSIN_MFMA_WRITES):
+                for c in self._plsinOperands(item, attrs):
+                    k = self._plsinRegisterKeys(c)
+                    if k:
+                        out.update(k)
+            return out
+        _writesBeforeCache = {}
+        def _writesBefore(anchorPos):
+            cached = _writesBeforeCache.get(anchorPos)
+            if cached is None:
+                acc = set()
+                for item in flat[:anchorPos + 1]:
+                    acc |= _storeWriteKeys(item)
+                _writesBeforeCache[anchorPos] = cached = acc
+            return cached
+        _producerSrcCache = {}
+        def _producerSources(producer):
+            if id(producer) not in _producerSrcCache:
+                s = set()
+                ok = True
+                for c in self._plsinOperands(producer, self._PLSIN_MFMA_SOURCES):
+                    k = self._plsinRegisterKeys(c)
+                    if not k:
+                        ok = False
+                        break
+                    s |= k
+                _producerSrcCache[id(producer)] = s if ok else None
+            return _producerSrcCache[id(producer)]
+        def _gapSafeForProducer(anchorPos, producer):
+            src = _producerSources(producer)
+            if src is None:
+                return False   # unreadable source -> cannot prove the move safe
+            return not (src & _writesBefore(anchorPos))
         # DPP coalesce convert-gap quota: siphon at most cvtQuotaPerGapCap terminal MFMAs into
         # a role="cvt" gap (enough to shadow the 8 converts at 2 per v_mfma_scale issue shadow,
         # ceil(8/2)=4); leave the rest to the role="store" gap B so store-latency hiding is not
@@ -5152,11 +5194,13 @@ class LogicalScheduler:
             cvtGaps = [(a, g) for (a, g, role) in candidates if role == "cvt"]
             storeGaps = [(a, g) for (a, g, role) in candidates if role != "cvt"]
 
-            def _lastQualifyingGap(gapList, readPos):
+            def _lastQualifyingGap(gapList, readPos, producer):
                 chosen = None
                 for anchorPos, gap in gapList:
                     if anchorPos >= readPos:
                         continue
+                    if not _gapSafeForProducer(anchorPos, producer):
+                        continue   # store writes before this gap clobber the MFMA's sources
                     # Instructions, not cycles: a conservative stand-in, since
                     # each issues in at least one cycle, so N of them span at
                     # least N cycles.
@@ -5188,6 +5232,8 @@ class LogicalScheduler:
                             continue
                         if cvtCountByGap.get(id(gap), 0) >= cvtQuotaPerGap:
                             continue
+                        if not _gapSafeForProducer(anchorPos, producer):
+                            continue   # store writes before this gap clobber the MFMA's sources
                         instsBetween = sum(1 for item in flat[anchorPos + 1:readPos]
                                            if isinstance(item, Instruction))
                         if instsBetween >= requiredCycles:
@@ -5196,7 +5242,7 @@ class LogicalScheduler:
                         cvtCountByGap[id(chosen)] = cvtCountByGap.get(id(chosen), 0) + 1
                         cvtTotal += 1
                 if chosen is None:
-                    chosen = _lastQualifyingGap(storeGaps, readPos)
+                    chosen = _lastQualifyingGap(storeGaps, readPos, producer)
                 if chosen is not None:
                     capturePlan[id(producer)] = chosen
             plans.append(capturePlan)

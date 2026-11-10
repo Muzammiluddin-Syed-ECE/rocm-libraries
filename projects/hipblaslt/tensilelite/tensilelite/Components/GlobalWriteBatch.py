@@ -4757,28 +4757,25 @@ class GlobalWriteBatchWriter:
     # allocated only when the kernel has the VGPR headroom (coalesceWeaveFits); when it is absent
     # (near-cap kernel, or non-weave kernel) we fall back to the monolithic ValuC-reuse store --
     # correct, just un-woven -- so the fold's write-amp win is kept everywhere.
-    dedStoreData = self.cvtVgprStruct.vgprCoalesceStoreData
-    dedPack2     = self.cvtVgprStruct.vgprCoalescePack2
     foldCvtInterleave = (permlane16 and weavePairB is not None
-                         and self._weaveMfmaGroups() is not None
-                         and dedStoreData >= 0 and dedPack2 >= 0)
+                         and self._weaveMfmaGroups() is not None)
 
     COALESCE_VALUC_WINDOW = 4
-    # On the weave path BOTH batchB's packed data (vCoalescePack) and the blended store src
-    # (vCoalesceStoreData) use DEDICATED quads, because the convert-interleave lets the planner move
-    # terminal MFMAs into their live window (Phase1 pack -> convert-gap -> Phase2 blend/store) and
-    # that corrupts the ValuC reuse (proven: --verify fails with either reused).  Off the weave path
-    # both reuse batchA's dead ValuC slots (sumIdx0 / sumIdx1) at zero VGPR cost.
-    if not foldCvtInterleave:
-      dedStoreData = -1
-      dedPack2 = -1
-    # The disjoint-window reuse invariant only applies when the pack/store actually reuse ValuC.
-    assert (dedPack2 >= 0 and dedStoreData >= 0) or (sumIdx0 % 2 == 0 and sumIdx1 % 2 == 0
-           and abs(sumIdx1 - sumIdx0) >= COALESCE_VALUC_WINDOW), \
+    # batchB's packed data and the blended store src reuse batchA's dead ValuC slots
+    # (vCoalescePack=sumIdx0, vCoalesceStoreData=sumIdx1) on BOTH paths -- zero VGPR cost.  The
+    # convert-interleave weave is made safe not by dedicating these (proven not to help -- the
+    # corruption was the planner relocating terminal MFMAs whose A/B/scale operands the store
+    # clobbers, NOT this reuse) but by the store-module clobber guard in
+    # LogicalScheduler._planCapturedTerminalMfmas, which refuses to move an MFMA into a gap whose
+    # preceding store writes hit its sources.  Reusing ValuC (accumulator region) rather than a
+    # dead-operand hole also keeps the store's write footprint off the operand regs, so MORE
+    # terminal MFMAs stay movable.
+    assert sumIdx0 % 2 == 0 and sumIdx1 % 2 == 0 \
+           and abs(sumIdx1 - sumIdx0) >= COALESCE_VALUC_WINDOW, \
       f"ValuC reuse needs 2-aligned, disjoint {COALESCE_VALUC_WINDOW}-reg batchA windows " \
       f"(sumIdx0={sumIdx0}, sumIdx1={sumIdx1})"
-    vCoalescePack       = dedPack2 if dedPack2 >= 0 else sumIdx0       # dedicated on weave, else reuse
-    vCoalesceStoreData  = dedStoreData if dedStoreData >= 0 else sumIdx1  # dedicated on weave, else reuse
+    vCoalescePack       = sumIdx0   # batchA sba0's 4 dead ValuC slots  -> batchB packed data
+    vCoalesceStoreData  = sumIdx1   # batchA sba1's 4 dead ValuC slots  -> blended store src
     if foldCvtInterleave:
       phase1Mod = Module("16bitSubtileCoalescePhase1")
       phase2Mod = Module("16bitSubtileCoalescePhase2")
