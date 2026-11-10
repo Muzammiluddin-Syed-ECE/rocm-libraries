@@ -5355,6 +5355,14 @@ class LogicalScheduler:
                 for em_list in partition_emitted
                 for em in em_list
                 if em.opType == "mfma")
+        # appendC1ScaleShadowReads refreshes the C0 entry scales in the C1
+        # tail, the second half of a half-disjoint body. Its cells keep the
+        # gaps those reads take free of loads.
+        numP = self.config.numPartitions
+        shadow_tail = range(numP // 2 if self.halfDisjoint else numP - 1, numP)
+        shadow_entries = None
+        if self._scaleShadowPlan and label == "MAINLOOP_C1":
+            shadow_entries = list(self._scaleShadowPlan["entry"])
         for pi, partition_emitted in enumerate(emitted_3d):
             # Partition 0 has no inbound drain, so it used to write straight into
             # the loop module and could not be woven into. Its own stage is the one
@@ -5376,13 +5384,6 @@ class LogicalScheduler:
                         for em in em_list
                         if em.opType == "mfma")
                     vmem_boundary = None
-                    # appendC1ScaleShadowReads refreshes the C0 entry scales
-                    # in the empty tail of the last C1 cell.
-                    tail_scale_reads = 0
-                    if (self._scaleShadowPlan and label == "MAINLOOP_C1"
-                            and pi == len(emitted_3d) - 1
-                            and k == len(partition_emitted) - 1):
-                        tail_scale_reads = len(self._scaleShadowPlan["entry"])
                     if copy_mfmas:
                         vmem_boundary = (
                             (pi + 1) * copy_mfmas // len(emitted_3d)
@@ -5400,7 +5401,8 @@ class LogicalScheduler:
                             or self.config.numPartitionsN == 1),
                         vmemBoundary=vmem_boundary,
                         halfDisjoint=self.halfDisjoint,
-                        tailScaleReads=tail_scale_reads)
+                        scaleShadows=(
+                            shadow_entries if pi in shadow_tail else None))
                     body_mfma_base += current_mfmas
                     partModule.add(scheduled)
                 else:
@@ -5474,10 +5476,8 @@ class LogicalScheduler:
                 module.add(selfCover)
         if self._scaleShadowPlan and label == "MAINLOOP_C1":
             # A half-disjoint body's last barrier opens its second half.
-            numP = self.config.numPartitions
-            tail = range(numP // 2 if self.halfDisjoint else numP - 1, numP)
             finalPartitionMfmas = 0
-            for pi in tail:
+            for pi in shadow_tail:
                 final = self._partition_tile_range(pi)
                 finalPartitionMfmas += (
                     (final['A'][1] - final['A'][0])
