@@ -4751,12 +4751,25 @@ class GlobalWriteBatchWriter:
 
     permlane16 = getattr(self, "_permlane16Active", False)
 
-    # The coalesce is emitted monolithically: phase1 (the 8 converts) and phase2 (cross-lane
-    # assembly + the two coalesced stores) are aliases of `module`.  A convert-interleave that
-    # spreads the converts into a scheduling gap is possible future work; it is deliberately NOT
-    # scaffolded here, because emitting into separate phase modules without wiring them back into
-    # `module` would silently drop the body (and void the barrier assert at the end).
-    phase1Mod = phase2Mod = module
+    # Convert-interleave weave: on the permlane16 weave path, emit Phase1(the 8 converts) ->
+    # convert-gap -> Phase2(cross-lane assembly + the two coalesced stores).  The planner
+    # (_planCapturedTerminalMfmas) siphons a bounded quota of THIS store's own terminal MFMAs
+    # into the role="cvt" gap and _interleaveStoreConvertIntoGapMfmas then spreads the 8
+    # converts into those MFMA issue shadows -- the store/MFMA overlap the un-coalesced woven
+    # store gets.  The ValuC-slot reuse below (vCoalescePack=sumIdx0, vCoalesceStoreData=sumIdx1)
+    # is PRESERVED on both paths: the quota only MOVES this store's own producers (never foreign
+    # lookahead MFMAs) into the gap and removes them from their origin, so no instruction is
+    # duplicated and the batchA-before-batchB ORDERING INVARIANT below is kept by
+    # _splitCvtValu (it preserves convert emission order).  Off the weave path (ds_bpermute,
+    # guarded fallback, no weave group) phase1Mod == phase2Mod == module -- byte-identical to
+    # the monolithic form (an empty convert-gap flattens to the monolithic order).
+    foldCvtInterleave = (permlane16 and weavePairB is not None
+                         and self._weaveMfmaGroups() is not None)
+    if foldCvtInterleave:
+      phase1Mod = Module("16bitSubtileCoalescePhase1")
+      phase2Mod = Module("16bitSubtileCoalescePhase2")
+    else:
+      phase1Mod = phase2Mod = module
 
     def vc(sumIdx, vi):
       idx = sumIdx + vi - prefixOffset
@@ -4898,6 +4911,27 @@ class GlobalWriteBatchWriter:
     _captureCoalesceGap(weavePairB, "B", phase2Mod)
     phase2Mod.addComment1("DPP coalesce store 2: odd n-columns (quad_perm [1,1,3,3])")
     emitCoalescedStore(evenPerm=[1,1,3,3], oddPerm=[1,1,3,3], tag=f"odd-cols tt0={tt0}")
+
+    if foldCvtInterleave:
+      # Assemble Phase1(converts) -> convert-gap -> Phase2(assembly + coalesced stores) under
+      # the outer module.  The convert-gap is a top-level "PlsinGap_" module (matched by
+      # _interleaveStoreConvertIntoGapMfmas); gap B stays nested inside Phase2 with the
+      # "PlsinCoalesceGap_" prefix (NOT matched by the convert interleaver).  Register the
+      # convert-gap in the capture's "gaps" list with role="cvt" and anchor it at the last
+      # convert so the planner measures anchor->consumer cycles; it is left EMPTY here --
+      # _planCapturedTerminalMfmas moves the bounded quota of terminal MFMAs into it.
+      module.add(phase1Mod)
+      capture = self._weaveCapturePair(weavePairB)
+      if capture is not None:
+        p1flat = list(phase1Mod.flatitems())
+        cvtGap = Module(f"PlsinGap_foldcvt_pair{weavePairB}")
+        capture.setdefault("gaps", []).append(
+          {"gap": cvtGap, "gapAnchor": p1flat[-1] if p1flat else None, "role": "cvt"})
+        module.add(cvtGap)
+      module.add(phase2Mod)
+      for sub in (phase1Mod, phase2Mod):
+        assert not any(isinstance(i, SBarrier) for i in sub.flatitems()), \
+          "DPP coalesce phase must be barrier-free (no s_barrier in the MFMA-interleaved store)"
 
     assert not any(isinstance(i, SBarrier) for i in module.flatitems()), \
       "DPP coalesce must be barrier-free (no s_barrier in the MFMA-interleaved store)"
