@@ -19313,9 +19313,15 @@ class KernelWriterAssembly(KernelWriter):
         # only under isSubtileCoalesce); subtileWeaveMfmaGroups / permlane16 are not yet resolved
         # here, so gate on the master weave switch -- a few non-permlane16 weave kernels may waste
         # 4 regs, but the emitter never finds the quad unallocated (asserted there).
+        # Graceful degradation: the dedicated quad costs +4 arch VGPRs. Allocate it ONLY when the
+        # pool has room (same headroom form as coalesceFits); otherwise leave it -1 and the emitter
+        # falls back to the monolithic (correct, un-woven) ValuC-reuse path for this kernel. This
+        # keeps near-cap kernels (where +4 would push the logical vgpr count past 256 and fail the
+        # build) correct-but-un-woven, while kernels with headroom (e.g. MT256x256 MIWT8 @ 249) weave.
         coalesceWeaveActive = bool(isSubtileCoalesce and self.states.subtileFusedWeave)
+        coalesceWeaveFits = coalesceWeaveActive and (self.vgprPool.size() + 4) <= maxVgpr
         coalesceStoreDataVgpr = self.vgprPool.checkOutAligned(4, 2, tag="subtileCoalesceStoreData") \
-                                if coalesceWeaveActive else -1
+                                if coalesceWeaveFits else -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
