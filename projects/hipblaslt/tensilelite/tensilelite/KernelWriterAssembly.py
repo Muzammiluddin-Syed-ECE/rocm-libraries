@@ -18524,6 +18524,11 @@ class KernelWriterAssembly(KernelWriter):
     # corrupts the reused slot; a dedicated quad makes the move safe (like the un-coalesced woven
     # store).  -1 off the weave path -> the ValuC reuse is kept (zero VGPR cost).
     vgprCoalesceStoreData: int = -1
+    # Weave-path ONLY: a dedicated 4-reg quad for batchB's packed data, replacing the dead-ValuC
+    # reuse (vCoalescePack=sumIdx0).  batchB's packed data is written in Phase1 and read by the
+    # blend in Phase2, so its live window spans the convert-gap where the planner moves terminal
+    # MFMAs -- the ValuC reuse is corrupted there, same as the store-data quad.  -1 off-weave.
+    vgprCoalescePack2: int = -1
 
   class FP8CVTVgprStruct(NamedTuple):
     vgprFp8NanInf: int = -1
@@ -19318,10 +19323,18 @@ class KernelWriterAssembly(KernelWriter):
         # falls back to the monolithic (correct, un-woven) ValuC-reuse path for this kernel. This
         # keeps near-cap kernels (where +4 would push the logical vgpr count past 256 and fail the
         # build) correct-but-un-woven, while kernels with headroom (e.g. MT256x256 MIWT8 @ 249) weave.
+        # Two dedicated 4-reg quads on the weave path: batchB packed data (vPack2) and the blended
+        # store data (vStoreData).  Both reuse dead ValuC off-weave; on the weave path the planner
+        # moves terminal MFMAs into their live window and corrupts the reuse, so they must be
+        # dedicated.  They land in dead-operand holes below the pool high-water (the operand lend),
+        # so the measured high-water typically does not grow; still gate on the +8 headroom and
+        # degrade to the monolithic reuse store when it does not fit (correct, just un-woven).
         coalesceWeaveActive = bool(isSubtileCoalesce and self.states.subtileFusedWeave)
-        coalesceWeaveFits = coalesceWeaveActive and (self.vgprPool.size() + 4) <= maxVgpr
+        coalesceWeaveFits = coalesceWeaveActive and (self.vgprPool.size() + 8) <= maxVgpr
         coalesceStoreDataVgpr = self.vgprPool.checkOutAligned(4, 2, tag="subtileCoalesceStoreData") \
                                 if coalesceWeaveFits else -1
+        coalescePack2Vgpr = self.vgprPool.checkOutAligned(4, 2, tag="subtileCoalescePack2") \
+                            if coalesceWeaveFits else -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
@@ -19332,7 +19345,8 @@ class KernelWriterAssembly(KernelWriter):
                                                coalesceAllocated=isSubtileCoalesce, \
                                                vgprVoff=(cvtVgpr+coalesceVoff) if isSubtileCoalesce else -1, \
                                                vgprBlendTmp=(cvtVgpr+coalesceBlend) if isSubtileCoalesce else -1, \
-                                               vgprCoalesceStoreData=coalesceStoreDataVgpr)
+                                               vgprCoalesceStoreData=coalesceStoreDataVgpr, \
+                                               vgprCoalescePack2=coalescePack2Vgpr)
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
@@ -19633,6 +19647,8 @@ class KernelWriterAssembly(KernelWriter):
           self.vgprPool.checkIn(pairRing)
         if coalesceStoreDataVgpr >= 0:
           self.vgprPool.checkIn(coalesceStoreDataVgpr)
+        if coalescePack2Vgpr >= 0:
+          self.vgprPool.checkIn(coalescePack2Vgpr)
       # The hoisted values die with the cvtVgpr block.
       self.states.subtileHoistedLaneGroupDelta = False
       self.states.subtileHoistedPermAddr = False

@@ -4758,22 +4758,26 @@ class GlobalWriteBatchWriter:
     # (near-cap kernel, or non-weave kernel) we fall back to the monolithic ValuC-reuse store --
     # correct, just un-woven -- so the fold's write-amp win is kept everywhere.
     dedStoreData = self.cvtVgprStruct.vgprCoalesceStoreData
+    dedPack2     = self.cvtVgprStruct.vgprCoalescePack2
     foldCvtInterleave = (permlane16 and weavePairB is not None
                          and self._weaveMfmaGroups() is not None
-                         and dedStoreData >= 0)
+                         and dedStoreData >= 0 and dedPack2 >= 0)
 
     COALESCE_VALUC_WINDOW = 4
-    # batchB packed data always reuses batchA sba0's dead ValuC slots (vCoalescePack=sumIdx0).
-    # The blended store src uses the DEDICATED quad on the weave path (foldCvtInterleave) and
-    # reuses batchA sba1's dead slots (sumIdx1) everywhere else.
+    # On the weave path BOTH batchB's packed data (vCoalescePack) and the blended store src
+    # (vCoalesceStoreData) use DEDICATED quads, because the convert-interleave lets the planner move
+    # terminal MFMAs into their live window (Phase1 pack -> convert-gap -> Phase2 blend/store) and
+    # that corrupts the ValuC reuse (proven: --verify fails with either reused).  Off the weave path
+    # both reuse batchA's dead ValuC slots (sumIdx0 / sumIdx1) at zero VGPR cost.
     if not foldCvtInterleave:
       dedStoreData = -1
-    # The disjoint-window reuse invariant only applies when the store src actually reuses sumIdx1.
-    assert sumIdx0 % 2 == 0 and (dedStoreData >= 0
-           or (sumIdx1 % 2 == 0 and abs(sumIdx1 - sumIdx0) >= COALESCE_VALUC_WINDOW)), \
+      dedPack2 = -1
+    # The disjoint-window reuse invariant only applies when the pack/store actually reuse ValuC.
+    assert (dedPack2 >= 0 and dedStoreData >= 0) or (sumIdx0 % 2 == 0 and sumIdx1 % 2 == 0
+           and abs(sumIdx1 - sumIdx0) >= COALESCE_VALUC_WINDOW), \
       f"ValuC reuse needs 2-aligned, disjoint {COALESCE_VALUC_WINDOW}-reg batchA windows " \
       f"(sumIdx0={sumIdx0}, sumIdx1={sumIdx1})"
-    vCoalescePack       = sumIdx0   # batchA sba0's 4 dead ValuC slots  -> batchB packed data
+    vCoalescePack       = dedPack2 if dedPack2 >= 0 else sumIdx0       # dedicated on weave, else reuse
     vCoalesceStoreData  = dedStoreData if dedStoreData >= 0 else sumIdx1  # dedicated on weave, else reuse
     if foldCvtInterleave:
       phase1Mod = Module("16bitSubtileCoalescePhase1")
