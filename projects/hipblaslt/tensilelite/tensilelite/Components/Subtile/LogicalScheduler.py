@@ -5131,10 +5131,10 @@ class LogicalScheduler:
                 ok = True
                 for c in self._plsinOperands(producer, self._PLSIN_MFMA_SOURCES):
                     k = self._plsinRegisterKeys(c)
-                    if not k:
+                    if k is None:          # unreadable operand -> cannot prove the move safe
                         ok = False
                         break
-                    s |= k
+                    s.update(k)            # k is a tuple of register keys (or () for immediates)
                 _producerSrcCache[id(producer)] = s if ok else None
             return _producerSrcCache[id(producer)]
         def _gapSafeForProducer(anchorPos, producer):
