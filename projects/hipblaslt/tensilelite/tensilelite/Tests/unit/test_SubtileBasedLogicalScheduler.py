@@ -5635,6 +5635,69 @@ class TestPartitionZeroIssueOrder:
         assert located["mid-b"] == width + 4
         assert located["stop"] == 2 * width
 
+    def test_named_sgpr_spans_overlap_by_name(self):
+        from rocisa.container import sgpr
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _registerSpan, _spansOverlap)
+
+        srd = _registerSpan(sgpr("SrdA", 4))
+        assert _spansOverlap(srd, _registerSpan(sgpr("SrdA", 4)))
+        assert _spansOverlap(
+            _registerSpan(sgpr("LocalWriteBaseAddrA")),
+            _registerSpan(sgpr("LocalWriteBaseAddrA")))
+        assert _spansOverlap(srd, _registerSpan(sgpr("SrdA+1")))
+        assert _spansOverlap(_registerSpan(sgpr("SrdA+1")), srd)
+        assert not _spansOverlap(srd, _registerSpan(sgpr("SrdB", 4)))
+        assert not _spansOverlap(
+            _registerSpan(sgpr("LocalWriteBaseAddrA")),
+            _registerSpan(sgpr("LocalWriteBaseAddrB")))
+
+    @pytest.mark.parametrize("reader", ["m0", "load"])
+    def test_right_align_keeps_a_bundle_ahead_of_a_named_sgpr_write(
+            self, reader):
+        import shutil
+        from rocisa import rocIsa
+        from rocisa.container import mgpr, sgpr, vgpr
+        from rocisa.instruction import BufferLoadB128, SAddU32, SMovB32
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _SchedulingRules, _SlotPlacer, _rightAlignM0AndVmem)
+
+        ri = rocIsa.getInstance()
+        asm = shutil.which("amdclang++") or "/usr/bin/amdclang++"
+        ri.init((9, 5, 0), asm)
+        ri.setKernel((9, 5, 0), 64)
+
+        width = 5
+        rules = _SchedulingRules(totalSlots=4 * width)
+        placer = _SlotPlacer(
+            intervals=4, numModules=1, pathOrders=[],
+            validators=[
+                rules.oneDtlLoadPerInterval,
+                rules.noDsReadOrValuInFirstSlot,
+            ],
+            slotsPerInterval=width, maxPerSlot=1,
+            maxInstructionsPerInterval=width)
+        placer.place(0, (0, SAddU32(
+            dst=mgpr(0),
+            src0=sgpr("OffsetA" if reader == "m0" else "LocalWriteBaseAddrA"),
+            src1=0, comment="m0")))
+        placer.place(1, (0, BufferLoadB128(
+            dst=vgpr(4, 4), vaddr=vgpr(1), saddr=sgpr("SrdA", 4),
+            soffset=sgpr("OffsetA") if reader == "load" else 0,
+            comment="gr")))
+        placer.place(2 * width + 2, (0, SMovB32(
+            dst=sgpr("OffsetA"), src=0, comment="write")))
+
+        _rightAlignM0AndVmem(placer)
+
+        located = {
+            item[1].comment: pos
+            for pos, slot in enumerate(placer._placed)
+            for item in slot
+        }
+        assert (located["m0"], located["gr"]) == (2 * width, 2 * width + 1)
+        assert located["write"] == 2 * width + 2
+
 
 class TestLateScalePrefetch:
     """Staging VGPRs for scales that partition zero does not consume."""

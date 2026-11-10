@@ -1910,7 +1910,8 @@ def _registerSpan(register):
     """Return (kind, start, count) for one register operand.
 
     A negative regIdx is a named scalar such as sgprSrdA. Those names do
-    not share an integer range, so identity is the name.
+    not share an integer range, so identity is the name's text, with any
+    lane offset kept as "+N".
     """
     if register is None or isinstance(register, (int, float)):
         return None
@@ -1922,7 +1923,11 @@ def _registerSpan(register):
     index = getattr(register, "regIdx", None)
     if isinstance(index, int) and index >= 0:
         return (kind, index, count)
-    name = getattr(register, "regName", None)
+    name = getattr(register, "holderName", None)
+    if not (isinstance(name, str) and name):
+        # regName is a RegName, not a str; str() is its name plus "+N".
+        name = getattr(register, "regName", None)
+        name = str(name) if name is not None else ""
     if not name:
         return None
     return (kind, name, count)
