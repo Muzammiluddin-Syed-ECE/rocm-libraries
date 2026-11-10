@@ -19304,13 +19304,16 @@ class KernelWriterAssembly(KernelWriter):
         # off numElementsPerBatch, which has a hard floor at MIWaveTile[0] (see _pairPackQuad).
         pairRing = self.vgprPool.checkOutAligned(4 * (pairQuads - 1), 2, tag="subtilePairPackRing") \
                    if pairQuads > 1 else -1
-        # Weave-path dedicated store-data quad: when the coalesce is on a block-scheduled
-        # permlane16 (weave) kernel, the convert-interleave lets the planner move terminal MFMAs
-        # into the store region, which corrupts the ValuC-reused blended store src.  Give it a
-        # dedicated 4-reg 2-aligned quad on exactly those kernels; the emitter uses it only on the
-        # foldCvtInterleave path and keeps the ValuC reuse everywhere else (zero cost off-weave).
-        coalesceWeaveActive = bool(isSubtileCoalesce and kernel.get("UseSubtileImpl")
-                                   and plsinBlockSchedTile(kernel) and permForRing)
+        # Weave-path dedicated store-data quad: when the coalesce runs under the fused weave, the
+        # convert-interleave lets the planner move terminal MFMAs into the store region, which
+        # corrupts the ValuC-reused blended store src.  Give it a dedicated 4-reg 2-aligned quad on
+        # exactly those kernels; the emitter uses it only on the foldCvtInterleave path and keeps
+        # the ValuC reuse everywhere else (zero cost off-weave).  This gate MUST be a superset of
+        # the emitter's foldCvtInterleave (which requires _weaveMode => subtileFusedWeave and runs
+        # only under isSubtileCoalesce); subtileWeaveMfmaGroups / permlane16 are not yet resolved
+        # here, so gate on the master weave switch -- a few non-permlane16 weave kernels may waste
+        # 4 regs, but the emitter never finds the quad unallocated (asserted there).
+        coalesceWeaveActive = bool(isSubtileCoalesce and self.states.subtileFusedWeave)
         coalesceStoreDataVgpr = self.vgprPool.checkOutAligned(4, 2, tag="subtileCoalesceStoreData") \
                                 if coalesceWeaveActive else -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
