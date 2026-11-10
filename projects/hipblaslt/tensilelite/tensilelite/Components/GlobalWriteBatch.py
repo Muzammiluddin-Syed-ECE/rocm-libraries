@@ -4741,14 +4741,6 @@ class GlobalWriteBatchWriter:
     # mutually DISJOINT -- the real hazard is overlap, not parity.  e.g. sumIdx1==sumIdx0+2
     # passes a parity check but makes the windows alias at regs sumIdx0+2..+3, corrupting the
     # store silently.  Require >= one full window apart.
-    COALESCE_VALUC_WINDOW = 4
-    assert sumIdx0 % 2 == 0 and sumIdx1 % 2 == 0 \
-           and abs(sumIdx1 - sumIdx0) >= COALESCE_VALUC_WINDOW, \
-      f"ValuC reuse needs 2-aligned, disjoint {COALESCE_VALUC_WINDOW}-reg batchA windows " \
-      f"(sumIdx0={sumIdx0}, sumIdx1={sumIdx1})"
-    vCoalescePack       = sumIdx0   # batchA sba0's 4 dead ValuC slots  -> batchB packed data
-    vCoalesceStoreData          = sumIdx1   # batchA sba1's 4 dead ValuC slots  -> blended store src
-
     permlane16 = getattr(self, "_permlane16Active", False)
 
     # Convert-interleave weave: on the permlane16 weave path, emit Phase1(the 8 converts) ->
@@ -4756,15 +4748,32 @@ class GlobalWriteBatchWriter:
     # (_planCapturedTerminalMfmas) siphons a bounded quota of THIS store's own terminal MFMAs
     # into the role="cvt" gap and _interleaveStoreConvertIntoGapMfmas then spreads the 8
     # converts into those MFMA issue shadows -- the store/MFMA overlap the un-coalesced woven
-    # store gets.  The ValuC-slot reuse below (vCoalescePack=sumIdx0, vCoalesceStoreData=sumIdx1)
-    # is PRESERVED on both paths: the quota only MOVES this store's own producers (never foreign
-    # lookahead MFMAs) into the gap and removes them from their origin, so no instruction is
-    # duplicated and the batchA-before-batchB ORDERING INVARIANT below is kept by
-    # _splitCvtValu (it preserves convert emission order).  Off the weave path (ds_bpermute,
-    # guarded fallback, no weave group) phase1Mod == phase2Mod == module -- byte-identical to
-    # the monolithic form (an empty convert-gap flattens to the monolithic order).
+    # store gets.  Off the weave path (ds_bpermute, guarded fallback, no weave group) phase1Mod
+    # == phase2Mod == module -- byte-identical to the monolithic form (an empty convert-gap
+    # flattens to the monolithic order).  This gate is computed here because it selects the
+    # blended store-data register below.
     foldCvtInterleave = (permlane16 and weavePairB is not None
                          and self._weaveMfmaGroups() is not None)
+
+    COALESCE_VALUC_WINDOW = 4
+    # batchB packed data always reuses batchA sba0's dead ValuC slots (vCoalescePack=sumIdx0).
+    # The blended store src reuses batchA sba1's dead slots (vCoalesceStoreData=sumIdx1) ONLY off
+    # the weave path.  ON the weave path it MUST be a DEDICATED quad: the convert-interleave lets
+    # the planner move terminal MFMAs into the store region, which corrupts the ValuC-reused store
+    # src (proven: --verify norm_error 0.0448 with reuse+weave vs 0 with a dedicated quad).  The
+    # dedicated quad is allocated (vgprCoalesceStoreData) exactly on weave-active kernels, so it is
+    # >= 0 whenever foldCvtInterleave holds; fail loud if the allocation and the gate ever diverge.
+    dedStoreData = self.cvtVgprStruct.vgprCoalesceStoreData if foldCvtInterleave else -1
+    assert not foldCvtInterleave or dedStoreData >= 0, \
+      "DPP coalesce weave path requires a dedicated store-data quad (vgprCoalesceStoreData); " \
+      "allocation gate (coalesceWeaveActive) and emitter gate (foldCvtInterleave) diverged"
+    # The disjoint-window reuse invariant only applies when the store src actually reuses sumIdx1.
+    assert sumIdx0 % 2 == 0 and (dedStoreData >= 0
+           or (sumIdx1 % 2 == 0 and abs(sumIdx1 - sumIdx0) >= COALESCE_VALUC_WINDOW)), \
+      f"ValuC reuse needs 2-aligned, disjoint {COALESCE_VALUC_WINDOW}-reg batchA windows " \
+      f"(sumIdx0={sumIdx0}, sumIdx1={sumIdx1})"
+    vCoalescePack       = sumIdx0   # batchA sba0's 4 dead ValuC slots  -> batchB packed data
+    vCoalesceStoreData  = dedStoreData if dedStoreData >= 0 else sumIdx1  # dedicated on weave, else reuse
     if foldCvtInterleave:
       phase1Mod = Module("16bitSubtileCoalescePhase1")
       phase2Mod = Module("16bitSubtileCoalescePhase2")

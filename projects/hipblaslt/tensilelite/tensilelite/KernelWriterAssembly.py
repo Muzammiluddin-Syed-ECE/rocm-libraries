@@ -18518,6 +18518,12 @@ class KernelWriterAssembly(KernelWriter):
     coalesceAllocated: bool = False   # coalesce cvt-block reserved? (gates the coalesce in GlobalWriteBatch)
     vgprVoff: int = -1            # per-store blended voffset (base vs base+64B by odd-lane mask)
     vgprBlendTmp: int = -1        # scratch for the quad_perm data/addr blend
+    # Weave-path ONLY: a dedicated 4-reg quad for the blended store data, replacing the dead-ValuC
+    # reuse (vCoalesceStoreData=sumIdx1).  The reuse is safe monolithically but NOT once the planner
+    # moves terminal MFMAs into the coalesce's store region (convert-interleave weave), which
+    # corrupts the reused slot; a dedicated quad makes the move safe (like the un-coalesced woven
+    # store).  -1 off the weave path -> the ValuC reuse is kept (zero VGPR cost).
+    vgprCoalesceStoreData: int = -1
 
   class FP8CVTVgprStruct(NamedTuple):
     vgprFp8NanInf: int = -1
@@ -19298,6 +19304,15 @@ class KernelWriterAssembly(KernelWriter):
         # off numElementsPerBatch, which has a hard floor at MIWaveTile[0] (see _pairPackQuad).
         pairRing = self.vgprPool.checkOutAligned(4 * (pairQuads - 1), 2, tag="subtilePairPackRing") \
                    if pairQuads > 1 else -1
+        # Weave-path dedicated store-data quad: when the coalesce is on a block-scheduled
+        # permlane16 (weave) kernel, the convert-interleave lets the planner move terminal MFMAs
+        # into the store region, which corrupts the ValuC-reused blended store src.  Give it a
+        # dedicated 4-reg 2-aligned quad on exactly those kernels; the emitter uses it only on the
+        # foldCvtInterleave path and keeps the ValuC reuse everywhere else (zero cost off-weave).
+        coalesceWeaveActive = bool(isSubtileCoalesce and kernel.get("UseSubtileImpl")
+                                   and plsinBlockSchedTile(kernel) and permForRing)
+        coalesceStoreDataVgpr = self.vgprPool.checkOutAligned(4, 2, tag="subtileCoalesceStoreData") \
+                                if coalesceWeaveActive else -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
@@ -19307,7 +19322,8 @@ class KernelWriterAssembly(KernelWriter):
                                                numPairPackQuads=pairQuads, \
                                                coalesceAllocated=isSubtileCoalesce, \
                                                vgprVoff=(cvtVgpr+coalesceVoff) if isSubtileCoalesce else -1, \
-                                               vgprBlendTmp=(cvtVgpr+coalesceBlend) if isSubtileCoalesce else -1)
+                                               vgprBlendTmp=(cvtVgpr+coalesceBlend) if isSubtileCoalesce else -1, \
+                                               vgprCoalesceStoreData=coalesceStoreDataVgpr)
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
