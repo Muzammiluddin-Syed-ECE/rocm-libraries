@@ -1883,6 +1883,12 @@ class GlobalWriteBatchWriter:
     ########################################
     # edge has v_cndmask so loads or stores may not issue, hard to track vmcnt:
     interleaveStoreVmcnt = self.parentWriter.states.interleaveStoreVmcnt and not self.edge
+    # DPP coalesce odd-lane mask hoist: the 0xAAAAAAAA mask (tmpS23) is a loop-invariant constant
+    # reused by every v_cndmask blend across this batch's coalesced stores, and tmpS23 is stable for
+    # the batch. The first UNCONDITIONAL (full-tile) coalesce sets it; the rest reuse it. Reset the
+    # once-per-batch flag here; the guarded edge arm still sets it itself (it may be the only arm
+    # that runs at runtime, so it cannot rely on a hoisted set behind another runtime guard).
+    self._coalesceOddMaskSet = False
 
     for elementIdx in range(len(self.batchElements)):
       for vi in range(self.gwvw):
@@ -4852,10 +4858,19 @@ class GlobalWriteBatchWriter:
     assert halfLine > 0, \
       f"DPP coalesce expects batchB above batchA within the cache line (halfLine={halfLine}B)"
 
-    # Odd-lane mask (0xAAAA...) for every v_cndmask blend -- set once, never overwritten.
+    # Odd-lane mask (0xAAAA...) for every v_cndmask blend.  Hoisted: it is a loop-invariant constant
+    # and tmpS23 is stable across the batch, so only the FIRST unconditional (full-tile, weavePairB
+    # set) coalesce emits the two s_mov; later full-tile coalesces reuse it (verified: nothing writes
+    # tmpS23 between coalesces).  The guarded edge arm (weavePairB is None) always emits its own set:
+    # it sits behind a runtime SubtileMGuard branch, so it cannot depend on a hoisted set that a
+    # different runtime path produced.
     oddMask = self.tmpS23
-    phase2Mod.add(SMovB32(dst=sgpr(oddMask),   src=hex(0xAAAAAAAA), comment="odd-lane mask lo32"))
-    phase2Mod.add(SMovB32(dst=sgpr(oddMask+1), src=hex(0xAAAAAAAA), comment="odd-lane mask hi32"))
+    _hoistMask = weavePairB is not None
+    if not (_hoistMask and getattr(self, "_coalesceOddMaskSet", False)):
+      phase2Mod.add(SMovB32(dst=sgpr(oddMask),   src=hex(0xAAAAAAAA), comment="odd-lane mask lo32"))
+      phase2Mod.add(SMovB32(dst=sgpr(oddMask+1), src=hex(0xAAAAAAAA), comment="odd-lane mask hi32"))
+      if _hoistMask:
+        self._coalesceOddMaskSet = True
 
     def emitCoalescedStore(evenPerm, oddPerm, tag):
       # Data blend (cndmask): even <- evenPerm(batchA), odd <- oddPerm(batchB).
