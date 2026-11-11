@@ -4852,39 +4852,35 @@ class GlobalWriteBatchWriter:
     assert halfLine > 0, \
       f"DPP coalesce expects batchB above batchA within the cache line (halfLine={halfLine}B)"
 
-    # Odd-lane mask (0xAAAA...) for every v_cndmask blend.  Hoisted across the whole store epilogue:
-    # it is a loop-invariant constant and tmpS23 is stable for all batches (verified: nothing writes
-    # tmpS23 between any two coalesces, end to end).  Only the FIRST unconditional (full-tile,
-    # weavePairB set) coalesce -- across every batch -- emits the two s_mov; the rest reuse it.  The
-    # flag lives on parentWriter.states (GlobalWriteBatch is re-instantiated per batch) and is reset
-    # once per store epilogue in globalWriteElements.  The guarded edge arm (weavePairB is None)
-    # always emits its own set: it sits behind a runtime SubtileMGuard branch, so it cannot depend on
-    # a hoisted set produced by a different runtime path.
-    oddMask = self.tmpS23
-    _hoistMask = weavePairB is not None
-    if not (_hoistMask and getattr(self.parentWriter.states, "subtileCoalesceOddMaskSet", False)):
-      phase2Mod.add(SMovB32(dst=sgpr(oddMask),   src=hex(0xAAAAAAAA), comment="odd-lane mask lo32"))
-      phase2Mod.add(SMovB32(dst=sgpr(oddMask+1), src=hex(0xAAAAAAAA), comment="odd-lane mask hi32"))
-      if _hoistMask:
-        self.parentWriter.states.subtileCoalesceOddMaskSet = True
+    # Even-lane select mask in VCC (0x55555555) for the DPP v_cndmask blends.  DPP is only encodable
+    # on the e32/VCC form of v_cndmask (VOP3/e64 with an SGPR mask cannot carry DPP), so the fold's
+    # blend mask lives in VCC, and DPP applies to src0 only -- hence src0=batchB (DPP-shuffled),
+    # src1=batchA, and an EVEN select (VCC ? src1=batchA : src0=batchB) to put even<-batchA,
+    # odd<-batchB.  Set per coalesce: this coalesce's blend region (data + voffset + both stores,
+    # gap B between them) uses only non-VCC VALU, so VCC survives from here through the last blend;
+    # the surrounding epilogue may write VCC, so do NOT hoist across coalesces.
+    phase2Mod.add(SMovB32(dst=VCC(), src=hex(0x55555555), comment="even-lane select mask lo (VCC) for DPP cndmask"))
+    if self.laneSGPRC >= 2:
+      phase2Mod.add(SMovB32(dst=VCC(setHi=True), src=hex(0x55555555), comment="even-lane select mask hi (VCC)"))
 
     def emitCoalescedStore(evenPerm, oddPerm, tag):
       # Data blend (cndmask): even <- evenPerm(batchA), odd <- oddPerm(batchB).
       phase2Mod.addComment1(f"{tag} data blend: even<-batchA odd<-batchB (cndmask, full-exec DPP)")
       for k in range(4):
         if evenPerm is None:
-          phase2Mod.add(VMovB32(dst=vgpr(vCoalesceStoreData+k), src=vgpr(vPack+k),
-                             comment=f"{tag} d{k}: vCoalesceStoreData<-batchA"))
+          src1 = vgpr(vPack+k)   # batchA read directly as cndmask src1 (even lanes, no DPP)
         else:
+          # batchA needs its own DPP (cndmask's src1 cannot carry DPP); land it in the store-data reg.
           phase2Mod.add(VMovB32(dst=vgpr(vCoalesceStoreData+k), src=vgpr(vPack+k),
                              dpp=DPPModifiers(quad_perm=evenPerm),
-                             comment=f"{tag} d{k}: vCoalesceStoreData<-batchA perm {evenPerm}"))
-        phase2Mod.add(VMovB32(dst=vgpr(vBlend), src=vgpr(vCoalescePack+k),
-                           dpp=DPPModifiers(quad_perm=oddPerm),
-                           comment=f"{tag} d{k}: vBlend<-batchB perm {oddPerm} (full exec)"))
-        phase2Mod.add(VCndMaskB32(dst=vgpr(vCoalesceStoreData+k), src0=vgpr(vCoalesceStoreData+k), src1=vgpr(vBlend),
-                               src2=sgpr(oddMask, self.laneSGPRC),
-                               comment=f"{tag} d{k}: odd lanes <- batchB"))
+                             comment=f"{tag} d{k}: batchA perm {evenPerm} (cndmask src1)"))
+          src1 = vgpr(vCoalesceStoreData+k)
+        # Folded blend: one DPP v_cndmask replaces the separate DPP mov + plain cndmask.  VCC
+        # even-select -> even<-src1(batchA), odd<-src0(batchB DPP-shuffled).  Full exec (the blend
+        # select is the VCC mask, not exec), so the cross-lane DPP read stays valid.
+        phase2Mod.add(VCndMaskB32(dst=vgpr(vCoalesceStoreData+k), src0=vgpr(vCoalescePack+k), src1=src1,
+                               src2=VCC(), dpp=DPPModifiers(quad_perm=oddPerm),
+                               comment=f"{tag} d{k}: even<-batchA odd<-batchB perm {oddPerm} (DPP cndmask)"))
       # Voffset blend (cndmask): odd <- oddPerm(addr)+halfLine; even <- base addr
       # (store 1) or evenPerm(addr) via vBlend (store 2).  All DPP reads full exec.
       phase2Mod.addComment1(f"{tag} voffset blend (cndmask)")
@@ -4900,8 +4896,10 @@ class GlobalWriteBatchWriter:
                            dpp=DPPModifiers(quad_perm=evenPerm),
                            comment=f"{tag} vBlend <- addr perm {evenPerm} (full exec)"))
         evenVoffSrc = vBlend
-      phase2Mod.add(VCndMaskB32(dst=vgpr(vVoff), src0=vgpr(evenVoffSrc), src1=vgpr(vVoff),
-                             src2=sgpr(oddMask, self.laneSGPRC),
+      # VCC even-select (same mask as the data blend): even<-src1(evenVoffSrc), odd<-src0(vVoff,
+      # already oddPerm(addr)+halfLine).  src/dst swapped vs the old SGPR-mask form accordingly.
+      phase2Mod.add(VCndMaskB32(dst=vgpr(vVoff), src0=vgpr(vVoff), src1=vgpr(evenVoffSrc),
+                             src2=VCC(),
                              comment=f"{tag} even<-base/perm addr, odd<-perm+half"))
       _soff, _soffTmp = self._subtileStoreSoffset(phase2Mod, addrCalc)
       phase2Mod.add(BufferStoreB128(src=vgpr(vCoalesceStoreData, 4), vaddr=vgpr(vVoff), saddr=sgpr("SrdD", 4), soffset=_soff,
