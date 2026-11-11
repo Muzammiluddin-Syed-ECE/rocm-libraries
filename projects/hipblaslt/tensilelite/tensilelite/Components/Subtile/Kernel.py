@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import math
+import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
@@ -1471,9 +1472,12 @@ def mainLoop(writer, kernel):
   schedulerDoubleBuffer = ()
   schedulerPartitionPrefetch = bool(kernel.get("_DualPeriodMXFP8"))
   schedulerPartitionOrder = "m-major"
+  schedulerMfmaOrder = "src0outer"
   forcedPartition = None
   if schedulerPartitionPrefetch:
       schedulerPartitionOrder = "n-major"
+      if os.environ.get("TENSILE_MXFP8_MFMA_ORDER", "") == "src1outer":
+          schedulerMfmaOrder = "src1outer"
       schedulerDoubleBuffer = ('A', 'B')
       # Split the wave's MFMA-tile grid in half along each dim -> a 2x2 partition
       # grid (8x4 -> 4x2 for the 8-wave MI, 8x8 -> 4x4 for the 4-wave MI).
@@ -1570,6 +1574,7 @@ def mainLoop(writer, kernel):
           halfDisjointLds=schedulerPartitionPrefetch,
           grLoadsPerAtom=grLoadsPerAtom,
           partitionOrder=schedulerPartitionOrder,
+          mfmaOrder=schedulerMfmaOrder,
           grPlacement=grPlacement,
           pgl=kernel.get("PrefetchGL2", 0),
           scaleReuse=(kernel.get("_ScaleReuseA", 1)

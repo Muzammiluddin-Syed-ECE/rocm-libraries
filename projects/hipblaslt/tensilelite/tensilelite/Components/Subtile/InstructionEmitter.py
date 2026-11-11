@@ -76,6 +76,35 @@ def _zigzag_order(rows, cols):
                 result.append((r, c))
     return result
 
+
+def mfma_pairs(config, a_tiles, b_tiles, has_wmma_source_cache):
+    """Return the (A tile, B tile) issue order of one partition's MFMAs.
+
+    The emitter and the local-read first-consumer rank both walk this list;
+    a rank computed against a different order would rank reads for the
+    wrong consumers without failing.
+
+    - gfx1250 WMMA source cache: zigzag along the longer axis, so every
+      consecutive pair shares an operand.
+    - mfmaOrder "src1outer" (dual-period MXFP8 half-disjoint only): the
+      instruction's src1 tile (B, since the subtile path has no SourceSwap)
+      stays for a run of the partition's src0 tiles.
+    - Otherwise A outer, B inner.
+    """
+    a_tiles = list(a_tiles)
+    b_tiles = list(b_tiles)
+    if has_wmma_source_cache and len(a_tiles) > 1 and len(b_tiles) > 1:
+        if len(a_tiles) >= len(b_tiles):
+            return [(a_tiles[c], b_tiles[r])
+                    for r, c in _zigzag_order(len(b_tiles), len(a_tiles))]
+        return [(a_tiles[r], b_tiles[c])
+                for r, c in _zigzag_order(len(a_tiles), len(b_tiles))]
+    if (getattr(config, "mfmaOrder", "src0outer") == "src1outer"
+            and getattr(config, "halfDisjointLds", False)):
+        return [(a, b) for b in b_tiles for a in a_tiles]
+    return [(a, b) for a in a_tiles for b in b_tiles]
+
+
 class InstructionEmitter:
     """Emits GPU instructions for each opType in the LogicalScheduler output.
 
@@ -194,19 +223,7 @@ class InstructionEmitter:
             a_tiles = list(range(cfg._prefixM[pm], cfg._prefixM[pm + 1]))
             b_tiles = list(range(cfg._prefixN[pn], cfg._prefixN[pn + 1]))
 
-            if has_wmma_source_cache and len(a_tiles) > 1 and len(b_tiles) > 1:
-                if len(a_tiles) >= len(b_tiles):
-                    ab_pairs = [
-                        (a_tiles[c], b_tiles[r])
-                        for r, c in _zigzag_order(len(b_tiles), len(a_tiles))
-                    ]
-                else:
-                    ab_pairs = [
-                        (a_tiles[r], b_tiles[c])
-                        for r, c in _zigzag_order(len(a_tiles), len(b_tiles))
-                    ]
-            else:
-                ab_pairs = [(a, b) for a in a_tiles for b in b_tiles]
+            ab_pairs = mfma_pairs(cfg, a_tiles, b_tiles, has_wmma_source_cache)
 
             if epoch == target_epoch:
                 tile_end = tile_id + gran.mn
@@ -243,17 +260,7 @@ class InstructionEmitter:
         bTiles = placement.tileB.tileId_list
 
         hasWmmaSourceCache = self.writer.states.asmCaps.get("HasWMMA_V3", False)
-        if hasWmmaSourceCache and len(aTiles) > 1 and len(bTiles) > 1:
-            # Zigzag ordering: traverse the AxB tile grid in snake order so
-            # every consecutive WMMA pair shares exactly one operand (A or B),
-            # guaranteeing a VGPR source-cache hit at every step.
-            # Always sweep along the longer tile dimension for maximum reuse.
-            if len(aTiles) >= len(bTiles):
-                abPairs = [(aTiles[c], bTiles[r]) for r, c in _zigzag_order(len(bTiles), len(aTiles))]
-            else:
-                abPairs = [(aTiles[r], bTiles[c]) for r, c in _zigzag_order(len(aTiles), len(bTiles))]
-        else:
-            abPairs = [(a, b) for a in aTiles for b in bTiles]
+        abPairs = mfma_pairs(self.config, aTiles, bTiles, hasWmmaSourceCache)
 
         for a, b in abPairs:
             groupA = (a // self.config.lrA.mn) * self.config.lrA.mn

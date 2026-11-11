@@ -305,6 +305,10 @@ class SchedulerConfig:
     # legacy order (M varies fastest).  "n-major" visits the 2x2 grid as
     # c00,c01,c10,c11 (N varies fastest).
     partitionOrder: str = "m-major"
+    # MFMA order inside a partition (InstructionEmitter.mfma_pairs).
+    #   "src0outer": A outer, B inner (legacy).
+    #   "src1outer": B outer, A inner; applies only with halfDisjointLds.
+    mfmaOrder: str = "src0outer"
     grPlacement: GRPlacementStrategy = GRPlacementStrategy.SPREAD
     pgl: int = 0              # Prefetch GL2 (0=off, 1 or 2 tiles ahead)
     # Dual-period MXFP8: how many data (DepthU) iterations share one 256-K scale
@@ -474,6 +478,8 @@ class SchedulerConfig:
         self._prefixN = self._build_prefix(self._partitionSizesN)
         assert self.partitionOrder in ("m-major", "n-major"), \
             f"partitionOrder must be m-major or n-major, got {self.partitionOrder}"
+        assert self.mfmaOrder in ("src0outer", "src1outer"), \
+            f"mfmaOrder must be src0outer or src1outer, got {self.mfmaOrder}"
 
         # plr=-1 auto-derives from pgr (legacy: 0 when pgr==0, else 1).
         if self.plr == -1:

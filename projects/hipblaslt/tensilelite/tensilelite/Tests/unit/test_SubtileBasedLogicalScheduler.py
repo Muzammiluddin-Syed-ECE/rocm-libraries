@@ -5214,6 +5214,77 @@ class TestFirstConsumerRank:
         # Partition 1 is 4x2. A2 is first consumed after A0/A1 (four MFMAs).
         assert emitter._first_consumer_rank(placement, 2) == 4
 
+    @staticmethod
+    def _cfg_8x10_src1outer(**overrides):
+        kwargs = dict(
+            numMFMATilesM=8, numMFMATilesN=10, numSubIterK=1,
+            lrA=ReadGranularity(1, 1), lrB=ReadGranularity(1, 1),
+            grA=ReadGranularity(1, 1), grB=ReadGranularity(1, 1),
+            lrSA=ReadGranularity(2, 1), lrSB=ReadGranularity(2, 1),
+            grSA=ReadGranularity(8, 2), grSB=ReadGranularity(10, 2),
+            partitionSizeM=4, partitionSizeN=6,
+            pgr=2, plr=0, doubleBufferTensors=("A", "B"),
+            prefetchNextPartition=True, partitionOrder="n-major",
+            scaleReuse=2, halfDisjointLds=True, mfmaOrder="src1outer",
+        )
+        kwargs.update(overrides)
+        return SchedulerConfig(**kwargs)
+
+    @pytest.mark.parametrize(
+        "partition,mt_iteration,tensor,tile_id,expected",
+        [
+            # Partition 1 (A0-3 x B6-9) after partition 0: B7 waits for
+            # B6 x A0..A3, A1 is the second MFMA.
+            (0, 0, "B", 7, 4),
+            (0, 0, "A", 1, 1),
+            # Partition 2 (A4-7 x B0-5) after partition 1: B5 is the last
+            # column, A6 the third MFMA of the first column.
+            (1, 0, "B", 5, 20),
+            (1, 0, "A", 6, 2),
+        ],
+    )
+    def test_src1outer_rank_steps_src1_over_src0(
+            self, partition, mt_iteration, tensor, tile_id, expected):
+        cfg = self._cfg_8x10_src1outer()
+        emitter = _rank_emitter(cfg)
+        placement = _rank_placement(
+            cfg, tensor, tile_id, partition, mt_iteration)
+        assert emitter._first_consumer_rank(placement, tile_id) == expected
+
+    def test_src1outer_needs_the_half_disjoint_path(self):
+        from tensilelite.Components.Subtile.InstructionEmitter import mfma_pairs
+        cfg = self._cfg_8x10_src1outer(halfDisjointLds=False)
+        assert mfma_pairs(cfg, [0, 1], [2, 3], False) == [
+            (0, 2), (0, 3), (1, 2), (1, 3)]
+        cfg = self._cfg_8x10_src1outer()
+        assert mfma_pairs(cfg, [0, 1], [2, 3], False) == [
+            (0, 2), (1, 2), (0, 3), (1, 3)]
+        # The gfx1250 source-cache zigzag keeps precedence.
+        assert mfma_pairs(cfg, [0, 1], [2, 3], True) == [
+            (0, 2), (1, 2), (1, 3), (0, 3)]
+
+    def test_rank_and_emit_share_the_order(self):
+        """Every partition's rank sequence is the emitted pair order."""
+        from tensilelite.Components.Subtile.InstructionEmitter import mfma_pairs
+        for order in ("src0outer", "src1outer"):
+            cfg = self._cfg_8x10_src1outer(mfmaOrder=order)
+            emitter = _rank_emitter(cfg)
+            for producer in range(cfg.numPartitions):
+                pi = (producer + 1) % cfg.numPartitions
+                pm, pn = cfg.partition_coords(pi)
+                a_tiles = range(cfg._prefixM[pm], cfg._prefixM[pm + 1])
+                b_tiles = range(cfg._prefixN[pn], cfg._prefixN[pn + 1])
+                pairs = mfma_pairs(cfg, a_tiles, b_tiles, False)
+                epoch = 1 if pi == 0 else 0
+                for tensor, tiles, side in (("A", a_tiles, 0), ("B", b_tiles, 1)):
+                    for tile in tiles:
+                        placement = _rank_placement(
+                            cfg, tensor, tile, producer, epoch)
+                        first = next(i for i, p in enumerate(pairs)
+                                     if p[side] == tile)
+                        assert emitter._first_consumer_rank(
+                            placement, tile) == first, (order, producer, tensor, tile)
+
     def test_rank_is_absent_without_partition_prefetch(self):
         cfg = SchedulerConfig(
             numMFMATilesM=4, numMFMATilesN=4, numSubIterK=1,
