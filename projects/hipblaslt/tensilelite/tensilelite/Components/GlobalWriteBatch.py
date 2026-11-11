@@ -4883,13 +4883,23 @@ class GlobalWriteBatchWriter:
       phase2Mod.add(SMovB32(dst=sgpr(evenMaskS), src=hex(0x55555555), comment="even-lane select mask lo32 (per coalesce)"))
       if self.laneSGPRC >= 2:
         phase2Mod.add(SMovB32(dst=sgpr(evenMaskS+1), src=hex(0x55555555), comment="even-lane select mask hi32 (per coalesce)"))
+    # Optional second dedicated mask holding 0xAAAA (odd-lane select), staged once next to the even
+    # mask. When present (weave kernels with SGPR headroom) store 2 runs the batchA-identity blend:
+    # batchA's odd-column data already sits in the odd lanes, so odd-select reads it on the identity
+    # src1 path -- NO per-dword v_mov_dpp for batchA.  Perf is a wash (those movs overlap the
+    # store drain), but the generated store is cleaner/symmetric with store 1.  -1 -> store 2 keeps
+    # the even-select form that DPP-shuffles batchA on src1 (see the store-2 call site).
+    _oddMaskSgpr = getattr(self.cvtVgprStruct, "coalesceOddMaskSgpr", -1)
 
-    def emitCoalescedStore(evenPerm, oddPerm, tag):
-      # Reload the even-lane select mask into VCC for THIS store's blends (VCC is volatile; see above).
-      phase2Mod.add(self.getEdgeMovInstType()(VCC(), sgpr(evenMaskS, self.laneSGPRC),
-                       f"{tag} even-lane select mask -> VCC (per store; VCC is volatile)"))
-      # Data blend (cndmask): even <- evenPerm(batchA), odd <- oddPerm(batchB).
-      phase2Mod.addComment1(f"{tag} data blend: even<-batchA odd<-batchB (cndmask, full-exec DPP)")
+    def emitCoalescedStore(evenPerm, oddPerm, tag, maskReg=None):
+      # Reload the blend-select mask into VCC for THIS store's blends (VCC is volatile; see above).
+      # maskReg picks even-select (batchA->even) or odd-select (batchA->odd, store-2 flip); the two
+      # masks differ only in value, so the blend/voffset instruction sequence is identical.
+      _mr = evenMaskS if maskReg is None else maskReg
+      phase2Mod.add(self.getEdgeMovInstType()(VCC(), sgpr(_mr, self.laneSGPRC),
+                       f"{tag} blend-select mask -> VCC (per store; VCC is volatile)"))
+      # Data blend (cndmask): even-select -> even<-batchA odd<-batchB; odd-select flips the polarity.
+      phase2Mod.addComment1(f"{tag} data blend (cndmask, full-exec DPP)")
       for k in range(4):
         if evenPerm is None:
           src1 = vgpr(vPack+k)   # batchA read directly as cndmask src1 (even lanes, no DPP)
@@ -4950,11 +4960,18 @@ class GlobalWriteBatchWriter:
         {"gap": gap, "gapAnchor": flat[-1] if flat else None, "role": role})
       targetMod.add(gap)
 
-    phase2Mod.addComment1("DPP coalesce store 1: even n-columns (quad_perm [0,0,2,2])")
+    phase2Mod.addComment1("DPP coalesce store 1: even n-columns (even-select, quad_perm [0,0,2,2])")
     emitCoalescedStore(evenPerm=None,      oddPerm=[0,0,2,2], tag=f"even-cols tt0={tt0}")
     _captureCoalesceGap(weavePairB, "B", phase2Mod)
-    phase2Mod.addComment1("DPP coalesce store 2: odd n-columns (quad_perm [1,1,3,3])")
-    emitCoalescedStore(evenPerm=[1,1,3,3], oddPerm=[1,1,3,3], tag=f"odd-cols tt0={tt0}")
+    if _oddMaskSgpr >= 0:
+      # Clean path: odd-select mask keeps batchA on the identity src1 path (its odd-column data is
+      # already in the odd lanes), so store 2 drops its per-dword batchA v_mov_dpp and mirrors store 1.
+      phase2Mod.addComment1("DPP coalesce store 2: odd n-columns (odd-select 0xAAAA, batchA identity, quad_perm [1,1,3,3])")
+      emitCoalescedStore(evenPerm=None,    oddPerm=[1,1,3,3], tag=f"odd-cols tt0={tt0}", maskReg=_oddMaskSgpr)
+    else:
+      # No second mask (pool too tight): even-select form that DPP-shuffles batchA on src1.
+      phase2Mod.addComment1("DPP coalesce store 2: odd n-columns (even-select, quad_perm [1,1,3,3])")
+      emitCoalescedStore(evenPerm=[1,1,3,3], oddPerm=[1,1,3,3], tag=f"odd-cols tt0={tt0}")
 
     if foldCvtInterleave:
       # Assemble Phase1(converts) -> convert-gap -> Phase2(assembly + coalesced stores) under

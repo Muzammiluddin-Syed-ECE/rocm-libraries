@@ -17787,6 +17787,12 @@ class KernelWriterAssembly(KernelWriter):
       module.add(SMovB32(dst=sgpr(_maskSgpr), src=hex(0x55555555), comment="even-lane select mask lo32"))
       if self.states.laneSGPRCount >= 2:
         module.add(SMovB32(dst=sgpr(_maskSgpr+1), src=hex(0x55555555), comment="even-lane select mask hi32"))
+    _oddMaskSgpr = getattr(cvtVgprStruct, "coalesceOddMaskSgpr", -1)
+    if _oddMaskSgpr >= 0:
+      module.addComment1("hoisted odd-lane DPP blend mask (0xAAAA...AAAA, store-2 batchA-identity, once per store)")
+      module.add(SMovB32(dst=sgpr(_oddMaskSgpr), src=hex(0xAAAAAAAA), comment="odd-lane select mask lo32"))
+      if self.states.laneSGPRCount >= 2:
+        module.add(SMovB32(dst=sgpr(_oddMaskSgpr+1), src=hex(0xAAAAAAAA), comment="odd-lane select mask hi32"))
     if getattr(cvtVgprStruct, "vgprLaneGroupDelta", -1) < 0:
       return module
     from .Components.GlobalWriteBatch import plsinStorePermlane16Active
@@ -18546,6 +18552,11 @@ class KernelWriterAssembly(KernelWriter):
     # Allocated only when isSubtileCoalesce AND the SGPR pool has room (checkOutAligned with
     # preventOverflow); -1 -> GlobalWriteBatch falls back to re-staging tmpS23 per coalesce.
     coalesceMaskSgpr: int = -1
+    # Optional second mask holding 0xAAAA (odd-lane select), staged once next to coalesceMaskSgpr.
+    # Lets store 2 (odd n-columns) run the batchA-identity blend -> cleaner/symmetric generated store
+    # (drops store 2's per-dword batchA v_mov_dpp; perf-neutral, those movs overlap the store drain).
+    # Reserved only on weave kernels (which have the SGPR headroom); -1 -> store 2 keeps even-select.
+    coalesceOddMaskSgpr: int = -1
 
   class FP8CVTVgprStruct(NamedTuple):
     vgprFp8NanInf: int = -1
@@ -19359,12 +19370,25 @@ class KernelWriterAssembly(KernelWriter):
         # per coalesce (correct, just a few extra scalar movs). A dedicated reg is never recycled as
         # scratch, so one stage survives to every per-store VCC reload.
         coalesceMaskSgpr = -1
+        coalesceOddMaskSgpr = -1
         if isSubtileCoalesce:
           try:
             coalesceMaskSgpr = self.sgprPool.checkOutAligned(self.states.laneSGPRCount, 2,
                                  tag="subtileCoalesceMask", preventOverflow=True)
           except Exception:
             coalesceMaskSgpr = -1
+          # Second pair for the 0xAAAA odd-select mask (store-2 batchA-identity blend -> cleaner,
+          # symmetric generated store; perf-neutral). preventOverflow only checks the pool HERE, not
+          # the kernel's later peak (a downstream longBranch temp), so a successful checkout can still
+          # push a near-cap kernel to 103>102 and FATAL. The near-cap fold kernels are the non-weave
+          # (PLSIN0) ones; gate the second pair on the weave path, which has the headroom. Non-weave
+          # and tight kernels skip it and keep the even-select store-2 form (correct, just less tidy).
+          if coalesceMaskSgpr >= 0 and getattr(self.states, "subtileFusedWeave", False):
+            try:
+              coalesceOddMaskSgpr = self.sgprPool.checkOutAligned(self.states.laneSGPRCount, 2,
+                                      tag="subtileCoalesceOddMask", preventOverflow=True)
+            except Exception:
+              coalesceOddMaskSgpr = -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
@@ -19377,7 +19401,8 @@ class KernelWriterAssembly(KernelWriter):
                                                vgprBlendTmp=(cvtVgpr+coalesceBlend) if isSubtileCoalesce else -1, \
                                                vgprCoalesceStoreData=coalesceStoreDataVgpr, \
                                                vgprCoalescePack2=coalescePack2Vgpr, \
-                                               coalesceMaskSgpr=coalesceMaskSgpr)
+                                               coalesceMaskSgpr=coalesceMaskSgpr, \
+                                               coalesceOddMaskSgpr=coalesceOddMaskSgpr)
         if isSubtileCoalesce and os.environ.get("TENSILE_DRYRUN_REGS"):
           import sys as _sys
           _lent = list(self.states.subtileFusedLendVgprs or [])
@@ -19698,6 +19723,8 @@ class KernelWriterAssembly(KernelWriter):
           self.vgprPool.checkIn(coalescePack2Vgpr)
         if coalesceMaskSgpr >= 0:
           self.sgprPool.checkIn(coalesceMaskSgpr)
+        if coalesceOddMaskSgpr >= 0:
+          self.sgprPool.checkIn(coalesceOddMaskSgpr)
       # The hoisted values die with the cvtVgpr block.
       self.states.subtileHoistedLaneGroupDelta = False
       self.states.subtileHoistedPermAddr = False
