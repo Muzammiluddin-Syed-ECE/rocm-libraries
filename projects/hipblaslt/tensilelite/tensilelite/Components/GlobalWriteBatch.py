@@ -20,6 +20,7 @@
 # CTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ################################################################################
 
+import os
 from ..ExecutionPolicy import isPersistent
 from rocisa.code import Label, Module, RegSet, TextBlock
 from rocisa.container import SMEMModifiers, VOP3PModifiers, MUBUFModifiers, GLOBALModifiers, \
@@ -4662,6 +4663,19 @@ class GlobalWriteBatchWriter:
     Returns (isCoalesceFirstPair, isCoalesceSecondPair).  The batchA source indices for the second pair are the
     fixed stride elementIdx-3 (sba=0) / elementIdx-2 (sba=1); the caller reads those directly.
     """
+    # Weave-baseline / fold-when-affordable: the MFMA weave is the baseline on EVERY store; DPP
+    # folding is layered on only from coalesce-group `foldStartGroup` onward.  The earlier groups
+    # (the "unfolded prefix") return no-coalesce here, so their pairs fall to the woven paired-store
+    # path (_emit16bitSubtilePairedStoreWoven) -- weave-only, no fold data, hence no last-K operand
+    # clobber of the moved terminal MFMAs.  As the prefix stores issue, their terminal MFMAs retire
+    # and free the operands the folded suffix then reuses.  A coalesce group spans tt0 in [4g,4g+3]
+    # (pairIdx 2g,2g+1), so group = tt0//4.  Env-tunable to find the minimal prefix that fits 256;
+    # default 0 = fold every group (base behavior, byte-identical).  Correctness-neutral: whole
+    # groups switch together (never a half-coalesced group that would drop the deferred first-pair
+    # store), and the weave-only path is develop's proven paired store.
+    _foldStartGroup = int(os.environ.get("TENSILE_FOLD_START_GROUP", "0"))
+    if _foldStartGroup > 0 and (tt0 // 4) < _foldStartGroup:
+      return False, False
     def _samePair(i0, i1, ttlo):
       return (i0 >= 0 and i1 < len(self.batchElements)
               and self.batchElements[i0][1] == ttlo
