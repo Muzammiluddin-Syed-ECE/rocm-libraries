@@ -15,8 +15,8 @@ from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstru
     LocalReadInstruction, LocalWriteInstruction, GlobalReadInstruction, GlobalWriteInstruction, \
     CommonInstruction, SMemLoadInstruction, VXorB32
 from .RingPlacement import (
-    RING_READ_LEAD_MFMAS, RingHalf, RingInfeasible, RingRead, ringLoadTargets,
-    ringReadTargets)
+    RING_READ_LEAD_MFMAS, RingHalf, RingInfeasible, RingRead, ringLoadsClearOfReads,
+    ringLoadTargets, ringReadTargets)
 
 
 class _SlotPlacer:
@@ -4445,6 +4445,7 @@ def _scheduleHalfDisjointHalf(
             loadCount=len(bundles), reads=reads, readBlocked=blocked,
             reserved={g: n for g, n in enumerate(shadowReads) if n})
         ringReadTargets(half, loadTargets)
+        loadTargets = ringLoadsClearOfReads(loadGapList, loadTargets, reads)
         targets = {}
         for c in range(len(cells)):
             # EDF may swap two reads of one chain; their windows nest, so the

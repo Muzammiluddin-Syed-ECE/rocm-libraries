@@ -15,6 +15,8 @@ direct-to-LDS load and every ds_read its half; this module picks the gap of each
   that drains its cell). Reads take a uniform grid of their own, kept off the load
   gaps, at most RING_READS_PER_GAP to a gap, earliest deadline first.
 - One ds_read always goes in the barrier gap.
+- Reads that can only fit on load targets keep them; the loads then spread over the
+  load gaps left free.
 
 Reads of one chain keep their order. A read that fits no gap in its window raises
 RingInfeasible, naming it, instead of being forced.
@@ -68,6 +70,19 @@ def ringLoadTargets(loadGaps: Sequence[int], count: int) -> List[int]:
         raise RingInfeasible(f"{count} loads over {len(loadGaps)} load gaps")
     n = len(loadGaps)
     return [loadGaps[(2 * k + 1) * n // (2 * count)] for k in range(count)]
+
+
+def ringLoadsClearOfReads(loadGaps: Sequence[int], loadTargets: Sequence[int],
+                          reads: Sequence[RingRead]) -> List[int]:
+    """loadTargets, or, when reads had to take some of them, count loads spread
+    the same way over the load gaps no read holds (if enough are left)."""
+    taken = {read.target for read in reads}
+    if not taken & set(loadTargets):
+        return list(loadTargets)
+    free = [g for g in loadGaps if g not in taken]
+    if len(free) < len(loadTargets):
+        return list(loadTargets)
+    return ringLoadTargets(free, len(loadTargets))
 
 
 def _chainOrdered(reads: List[RingRead]):

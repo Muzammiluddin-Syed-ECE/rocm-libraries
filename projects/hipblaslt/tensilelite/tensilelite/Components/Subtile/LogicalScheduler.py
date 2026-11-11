@@ -206,8 +206,10 @@ class MFMATileRange:
 
 BALANCE_MIN_LEAD_MFMAS = 6
 BALANCE_MIN_HALF_MFMAS = 28
-# Partition sizes (M, N) the ring placement applies to (SchedulerConfig.ringPlacement).
-RING_GEOMETRIES = frozenset({((4, 4), (6, 4))})
+# The ring placement (SchedulerConfig.ringPlacement) gives every load its own gap and
+# keeps its reads off the load gaps, at most two to a gap and RING_READ_LEAD_MFMAS
+# ahead of their consumers; a half needs this many MFMA gaps per A/B load for that.
+RING_MIN_GAPS_PER_LOAD = 4
 
 
 def planHalfDisjointBalance(firstHalfMfmas, secondHalfMfmas, wrapTiles, ownTiles,
@@ -338,7 +340,7 @@ class SchedulerConfig:
     # the uniform epoch cohorts.
     halfDisjointLds: bool = False
     # TENSILE_MXFP8_RING=1: place the half-disjoint main loop's loads and reads by
-    # the ring targets (RingPlacement), on the geometries in RING_GEOMETRIES only.
+    # the ring targets (RingPlacement), where LogicalScheduler.ringSkipReason allows.
     ringPlacement: bool = False
     # Buffer loads one GR atom issues, per tensor.  A tensor missing here
     # issues one load per atom.
@@ -1049,9 +1051,9 @@ class LogicalScheduler:
     def ringSkipReason(self) -> Optional[str]:
         """Why the ring placement does not apply, or None when it does.
 
-        Only geometries the offline ring model places with even per-half load and
-        read counts, no infeasible item and a barrier-gap read in both bodies are
-        taken: today the 8x10 tile grid split 4/4 x 6/4 (MT256x320, sol 102).
+        The body must split into two halves of two partitions each (a 2x2 grid)
+        with equal MFMA counts of at least BALANCE_MIN_HALF_MFMAS and equal A/B
+        load counts, and give every load at least RING_MIN_GAPS_PER_LOAD MFMAs.
         """
         cfg = self.config
         if not cfg.ringPlacement:
@@ -1062,9 +1064,22 @@ class LogicalScheduler:
             return "m-major"
         if not (cfg.uniformPgrEpoch and cfg.dualPeriodScale):
             return "not dual-period"
-        geometry = (tuple(cfg.partitionSizesM), tuple(cfg.partitionSizesN))
-        if geometry not in RING_GEOMETRIES:
-            return f"geometry {geometry}"
+        if cfg.numPartitionsM != 2 or cfg.numPartitionsN != 2:
+            return "not 2x2 partitions"
+        half = cfg.numPartitions // 2
+        mfmas = [0, 0]
+        for pi in range(cfg.numPartitions):
+            m, n = cfg.partition_coords(pi)
+            mfmas[pi // half] += cfg.partitionSizesM[m] * cfg.partitionSizesN[n]
+        loads = [0, 0]
+        for (tensor, _start), h in self._halfLoadHalf.items():
+            loads[h] += max(1, int(cfg.grLoadsPerAtom.get(tensor, 1)))
+        if mfmas[0] != mfmas[1] or mfmas[0] < BALANCE_MIN_HALF_MFMAS:
+            return f"half MFMAs {mfmas[0]}/{mfmas[1]}"
+        if loads[0] != loads[1]:
+            return f"half loads {loads[0]}/{loads[1]}"
+        if mfmas[0] < RING_MIN_GAPS_PER_LOAD * loads[0]:
+            return f"{loads[0]} loads in {mfmas[0]} MFMAs"
         return None
 
     # ── Place LRs ─────────────────────────────────────────

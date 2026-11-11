@@ -7835,6 +7835,24 @@ class TestRingPlacement:
         assert ringLoadTargets(list(range(1, 37)), 9) == [3, 7, 11, 15, 19, 23, 27, 31, 35]
         assert ringLoadTargets([1, 2, 3], 0) == []
 
+    def test_loads_respread_around_reads_on_their_gaps(self):
+        from tensilelite.Components.Subtile.RingPlacement import (
+            RingHalf, RingRead, ringLoadTargets, ringLoadsClearOfReads, ringReadTargets)
+        # Sol 98's C0H1 shape: 20 reads due by gap 10 fill gaps 0-10, so the
+        # reads take the early load targets and the loads move past them.
+        loadGaps = list(range(0, 31))
+        loads = ringLoadTargets(loadGaps, 8)
+        half = RingHalf(gaps=32, barrierGap=0, loadGaps=loadGaps, loadCount=8,
+                        reads=[RingRead(0, 10, 0, f"B{i}") for i in range(20)])
+        reads = ringReadTargets(half, loads)
+        assert {read.target for read in reads} & set(loads)
+        moved = ringLoadsClearOfReads(loadGaps, loads, reads)
+        assert len(moved) == 8 and not {read.target for read in reads} & set(moved)
+        assert min(b - a for a, b in zip(moved, moved[1:])) >= 2
+        # Reads clear of the loads leave them alone.
+        clear = [RingRead(0, 30, 0, "r", target=g) for g in sorted(set(loadGaps) - set(loads))]
+        assert ringLoadsClearOfReads(loadGaps, loads, clear) == loads
+
     def test_reads_of_one_chain_keep_their_order(self):
         from tensilelite.Components.Subtile.RingPlacement import RingHalf, RingRead
         half = RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0, reads=[
@@ -7952,11 +7970,12 @@ class TestRingHalfSchedule:
 
 
 class TestRingGate:
-    """The ring placement applies to sol 102's geometry only."""
+    """The ring placement applies to 2x2 partition grids with even, long enough halves."""
 
     @staticmethod
-    def _sched(ring=True, **kw):
-        s = LogicalScheduler(TestHalfDisjointLds._cfg(8, 10, grB=1, grSA=8, size_n=6, **kw))
+    def _sched(m=8, n=10, ring=True, **kw):
+        kw.setdefault("size_n", 6 if (m, n) == (8, 10) else None)
+        s = LogicalScheduler(TestHalfDisjointLds._cfg(m, n, grB=1, grSA=8, **kw))
         s.config.ringPlacement = ring
         s.build(stop_after=Pass.LR)
         return s
@@ -7965,13 +7984,19 @@ class TestRingGate:
         assert self._sched().ringSkipReason() is None
         assert self._sched().ringPlacement
 
+    def test_sol97_geometry_applies(self):
+        # 8x8 tiles, 4/4 x 4/4: 32 MFMAs and 8 loads per half.
+        assert self._sched(8, 8).ringSkipReason() is None
+
     def test_flag_off_or_other_geometry_skips(self):
         assert self._sched(ring=False).ringSkipReason() == "off"
         assert self._sched(half_disjoint=False).ringSkipReason() == "not half-disjoint"
-        s = LogicalScheduler(TestHalfDisjointLds._cfg(8, 8, grB=1, grSA=8))
-        s.config.ringPlacement = True
-        s.build(stop_after=Pass.LR)
-        assert s.ringSkipReason().startswith("geometry")
+        # 10x8 n-major splits M 6/4: 48/32 MFMAs.
+        assert self._sched(10, 8, size_m=6).ringSkipReason() == "half MFMAs 48/32"
+        # 4x4 tiles: 8 MFMAs per half.
+        assert self._sched(4, 4).ringSkipReason() == "half MFMAs 8/8"
+        # 4x16 tiles, 2/2 x 8/8: 10 loads in a 32-MFMA half.
+        assert self._sched(4, 16).ringSkipReason() == "10 loads in 32 MFMAs"
 
 
 class TestInsertRingConsumerWaits:
