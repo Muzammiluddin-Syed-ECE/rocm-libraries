@@ -4761,21 +4761,24 @@ class GlobalWriteBatchWriter:
                          and self._weaveMfmaGroups() is not None)
 
     COALESCE_VALUC_WINDOW = 4
-    # batchB's packed data and the blended store src reuse batchA's dead ValuC slots
-    # (vCoalescePack=sumIdx0, vCoalesceStoreData=sumIdx1) on BOTH paths -- zero VGPR cost.  The
-    # convert-interleave weave is made safe not by dedicating these (proven not to help -- the
-    # corruption was the planner relocating terminal MFMAs whose A/B/scale operands the store
-    # clobbers, NOT this reuse) but by the store-module clobber guard in
-    # LogicalScheduler._planCapturedTerminalMfmas, which refuses to move an MFMA into a gap whose
-    # preceding store writes hit its sources.  Reusing ValuC (accumulator region) rather than a
-    # dead-operand hole also keeps the store's write footprint off the operand regs, so MORE
-    # terminal MFMAs stay movable.
-    assert sumIdx0 % 2 == 0 and sumIdx1 % 2 == 0 \
-           and abs(sumIdx1 - sumIdx0) >= COALESCE_VALUC_WINDOW, \
+    # K=0 confinement: on the convert-interleave weave path, batchB's packed data (vCoalescePack)
+    # and the blended store src (vCoalesceStoreData) use DEDICATED registers taken from RETIRED
+    # K=0 operand holes (reserved in KernelWriterAssembly and carried in the cvt struct), NOT the
+    # dead ValuC slots sumIdx0/sumIdx1. ValuC physically coincides with the live last-K operands,
+    # so writing the fold's data there clobbers the terminal MFMAs the planner is trying to move
+    # into the store gaps (dry-run: 88 v_cndmask writes landed on last-K). Sourcing the data from
+    # retired K=0 holes keeps those writes off the operands, so the clobber guard passes far more
+    # moves. Off the weave path (or if no K=0 tiles were reservable), keep the zero-cost ValuC
+    # reuse -- byte-identical to the monolithic store.
+    _dedPack2     = self.cvtVgprStruct.vgprCoalescePack2     if foldCvtInterleave else -1
+    _dedStoreData = self.cvtVgprStruct.vgprCoalesceStoreData if foldCvtInterleave else -1
+    # The disjoint-window reuse invariant only applies when the pack/store actually reuse ValuC.
+    assert (_dedPack2 >= 0 and _dedStoreData >= 0) or (sumIdx0 % 2 == 0 and sumIdx1 % 2 == 0
+           and abs(sumIdx1 - sumIdx0) >= COALESCE_VALUC_WINDOW), \
       f"ValuC reuse needs 2-aligned, disjoint {COALESCE_VALUC_WINDOW}-reg batchA windows " \
       f"(sumIdx0={sumIdx0}, sumIdx1={sumIdx1})"
-    vCoalescePack       = sumIdx0   # batchA sba0's 4 dead ValuC slots  -> batchB packed data
-    vCoalesceStoreData  = sumIdx1   # batchA sba1's 4 dead ValuC slots  -> blended store src
+    vCoalescePack       = _dedPack2 if _dedPack2 >= 0 else sumIdx0       # K=0 hole on weave, else reuse
+    vCoalesceStoreData  = _dedStoreData if _dedStoreData >= 0 else sumIdx1  # K=0 hole on weave, else reuse
     if foldCvtInterleave:
       phase1Mod = Module("16bitSubtileCoalescePhase1")
       phase2Mod = Module("16bitSubtileCoalescePhase2")

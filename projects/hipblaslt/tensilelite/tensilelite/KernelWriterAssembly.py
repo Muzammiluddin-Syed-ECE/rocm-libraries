@@ -16209,10 +16209,42 @@ class KernelWriterAssembly(KernelWriter):
         if getattr(_vt.regList, "is_vgpr", False):
           for _idx in _vt.regList.indices:
             _protected.add(_idx)
+    # K=0 confinement: reserve two dead K=0 operand tiles for the DPP fold's data registers
+    # (batchB pack vPack2 + blended store src vStoreData), so on the weave path the fold writes
+    # RETIRED holes, never the live last-K operands the moved terminal MFMAs read. That is what
+    # lets _planCapturedTerminalMfmas's clobber guard pass more moves. Pick 4-reg 2-aligned tiles
+    # from the HIGH end of the lend list (farthest from the last-K middle), and SKIP lending them
+    # so they stay InUse/reserved -- no other checkout can grab them, and deallocVgprTiles frees
+    # them at store end (so no pool checkIn is needed). Gate on the fold+weave firing conditions
+    # (superset of the emitter's foldCvtInterleave); elsewhere reserve nothing (zero cost).
+    self.states.subtileCoalesceDataBases = []
+    _miwt = kernel.get("MIWaveTile", [])
+    # NOTE: subtileFusedWeave is set True LATER than this lend loop, so do NOT gate on it here --
+    # gate on the structural fold conditions (= isSubtileCoalesce's preconditions). On a fold
+    # kernel that ends up NOT weaving, the emitter's foldCvtInterleave is False and simply ignores
+    # the reserved tiles (a few wasted regs, harmless; reserved from the HIGH end so the low cvt
+    # block is never starved).
+    _foldWeaveActive = bool(
+        kernel.get("DPPStoreFold") and kernel.get("UseSubtileImpl")
+        and isMxf4SubtilePath(kernel) and tuple(kernel.get("ISA", ())) == (9, 5, 0)
+        and kernel.get("MatrixInstM") == 16
+        and len(_miwt) >= 2 and _miwt[0] >= 4)
+    if _foldWeaveActive:
+      _cands = sorted(((_b, _s) for (_b, _s) in (self.states.subtileFusedLendVgprs or [])
+                       if _s >= 4 and _b % 2 == 0
+                       and not any((_b + _k) in _protected for _k in range(4))),
+                      reverse=True)  # high end first (away from last-K)
+      for _b, _s in _cands:
+        if len(self.states.subtileCoalesceDataBases) >= 2:
+          break
+        self.states.subtileCoalesceDataBases.append(_b)
+    _reservedBases = set(self.states.subtileCoalesceDataBases)
     lentVgprs = []
     for _base, _size in (self.states.subtileFusedLendVgprs or []):
       if any((_base + _k) in _protected for _k in range(_size)):
         continue
+      if _base in _reservedBases:
+        continue  # reserved for the fold's data -- keep InUse, do not lend
       try:
         self.vgprPool.addFromCheckOut(_base)
         lentVgprs.append(_base)
@@ -19329,8 +19361,18 @@ class KernelWriterAssembly(KernelWriter):
         # DISPROVEN (--verify unchanged, 0.0448 either way).  The real corruption was the planner
         # relocating terminal MFMAs whose A/B/scale operands the store clobbers -- now fixed by the
         # store-module clobber guard in _planCapturedTerminalMfmas, so no dedicated quad is needed.
+        # K=0 confinement: the fold's data registers come from the two dead K=0 operand tiles
+        # reserved (kept InUse, not lent) at the fused-store lend above. They are retired holes
+        # disjoint from the live last-K operands, so the fold's blend/pack writes do not clobber the
+        # moved terminal MFMAs. -1 when the kernel is not a fold+weave kernel (or no tiles were
+        # reservable), in which case the emitter keeps the ValuC reuse (correct, fewer moves weave).
         coalesceStoreDataVgpr = -1
         coalescePack2Vgpr = -1
+        if isSubtileCoalesce:
+          _dataBases = getattr(self.states, "subtileCoalesceDataBases", []) or []
+          if len(_dataBases) >= 2:
+            coalesceStoreDataVgpr = _dataBases[0]
+            coalescePack2Vgpr = _dataBases[1]
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
@@ -19358,6 +19400,12 @@ class KernelWriterAssembly(KernelWriter):
             f"ValuCbase={self.states.c.startVgprValu} pairRing={pairRing}\n"
             f"[DRYRUN {_mt}] lentHoles(base,size)={_lent} totalLent={len(_lentset)}\n"
             f"[DRYRUN {_mt}] cvtBlock IN lent={sorted(_inLent)} NOT-in-lent(=grabbed elsewhere)={sorted(_notLent)}\n")
+          _foldData = set()
+          for _bb in (coalesceStoreDataVgpr, coalescePack2Vgpr):
+            if _bb >= 0: _foldData.update(range(_bb, _bb + 4))
+          _sys.stderr.write(
+            f"[DRYRUN {_mt}] foldData=[storeData={coalesceStoreDataVgpr},pack2={coalescePack2Vgpr}] "
+            f"IN-K0-holes={sorted(_foldData & _lentset)} NOT-in-K0(=BAD,on last-K)={sorted(_foldData - _lentset)}\n")
           _sys.stderr.flush()
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
@@ -19657,10 +19705,9 @@ class KernelWriterAssembly(KernelWriter):
         self.vgprPool.checkIn(cvtVgpr)
         if pairRing >= 0:
           self.vgprPool.checkIn(pairRing)
-        if coalesceStoreDataVgpr >= 0:
-          self.vgprPool.checkIn(coalesceStoreDataVgpr)
-        if coalescePack2Vgpr >= 0:
-          self.vgprPool.checkIn(coalescePack2Vgpr)
+        # coalesceStoreDataVgpr / coalescePack2Vgpr are NOT checked in here: they are reserved dead
+        # K=0 operand tiles (kept InUse, never lent), freed by deallocVgprTiles with the rest of the
+        # operand tiles. Checking them in would double-free a register the pool never handed out.
       # The hoisted values die with the cvtVgpr block.
       self.states.subtileHoistedLaneGroupDelta = False
       self.states.subtileHoistedPermAddr = False
