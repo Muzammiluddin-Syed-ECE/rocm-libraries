@@ -46,12 +46,7 @@ class _SlotPlacer:
         self.maxInstructionsPerInterval = maxInstructionsPerInterval
         self.totalSlots = intervals * slotsPerInterval
         self._n = numModules
-        self._prevInPath: List[int] = [-1] * numModules
-        self._nextInPath: List[int] = [-1] * numModules
-        for order in pathOrders:
-            for a, b in zip(order, order[1:]):
-                self._prevInPath[b] = a
-                self._nextInPath[a] = b
+        self.relink(pathOrders)
         self._validators = validators or []
         self._preferences = preferences or []
         self._adjusters = adjusters or []
@@ -64,6 +59,15 @@ class _SlotPlacer:
         self._firstPos: List[Optional[int]] = [None] * numModules
         self._lastPos: List[Optional[int]] = [None] * numModules
         self.leftovers: List[Tuple[int, object]] = []
+
+    def relink(self, pathOrders: List[List[int]]):
+        """Take each path's module order from pathOrders."""
+        self._prevInPath: List[int] = [-1] * self._n
+        self._nextInPath: List[int] = [-1] * self._n
+        for order in pathOrders:
+            for a, b in zip(order, order[1:]):
+                self._prevInPath[b] = a
+                self._nextInPath[a] = b
 
     # ── Placement ──
 
@@ -2505,6 +2509,65 @@ def _orderReadsAroundLiveSourceWrites(pathInsts, earliestWriteShadow, mfmaBase):
     return prefix + unconstrained + deferred + tail
 
 
+def _hoistRingBarrierRead(readPaths, pathOrders, barrierGap, window, pinned=()):
+    """Give the ring's barrier gap a ds_read when no read path can start there.
+
+    A path's reads issue in order, so a read whose destination is still live
+    holds back every read behind it. When no path's first read may issue in
+    the barrier gap, the module of the earliest-needed read that may
+    (window(c, item) gives its own (floor, deadline)) moves to the front of
+    its path, past no instruction it shares a VGPR write with. Modules with
+    items outside the read paths (pinned) neither move nor are passed.
+    readPaths and pathOrders change in place; returns whether a module moved.
+    """
+    def writes(inst):
+        dst = _dsReadDstAddr(inst)[0] if _isDsRead(inst) else getattr(inst, "dst", None)
+        return set(_vgprIndices(dst))
+
+    def uses(inst):
+        return set(_instructionVgprs(inst)) | writes(inst)
+
+    best = None
+    for c, path in enumerate(readPaths):
+        first = next((i for i, (_, inst) in enumerate(path) if _isDsRead(inst)), None)
+        if first is None:
+            continue
+        if window(c, path[first])[0] <= barrierGap:
+            return False
+        head = path[first][0]
+        order = next((o for o in pathOrders if head in o), None)
+        for i in range(first + 1, len(path)):
+            mid, inst = path[i]
+            if not _isDsRead(inst) or mid == head or order is None or mid not in order:
+                continue
+            passed = order[order.index(head):order.index(mid)] if head in order else [mid]
+            if mid in pinned or not passed or set(passed) & set(pinned) or not set(passed) <= {
+                    m for m, _ in path}:
+                continue
+            floor, deadline = window(c, path[i])
+            if floor > barrierGap or deadline < barrierGap:
+                continue
+            moved = [j for j in range(first, len(path)) if path[j][0] == mid]
+            if not all(_isDsRead(path[j][1]) for j in moved):
+                continue
+            skipped = [other for j, (m, other) in enumerate(path[first:moved[-1]], first)
+                       if m != mid]
+            if any(writes(other) & uses(path[j][1]) or writes(path[j][1]) & uses(other)
+                   for j in moved for other in skipped):
+                continue
+            if best is None or deadline < best[0]:
+                best = (deadline, c, first, mid, order, head)
+    if best is None:
+        return False
+    _deadline, c, first, mid, order, head = best
+    items = [item for item in readPaths[c] if item[0] == mid]
+    rest = [item for item in readPaths[c] if item[0] != mid]
+    readPaths[c][:] = rest[:first] + items + rest[first:]
+    order.remove(mid)
+    order.insert(order.index(head), mid)
+    return True
+
+
 _DATA_TENSORS = ("A", "B")
 
 
@@ -4356,6 +4419,31 @@ def _scheduleHalfDisjointHalf(
         if interval not in seams and not shadowReads[interval] and not any(
             _isWaitCnt(x) or _isBarrier(x) or _isVALU(x)
             for x in intervalInsts(interval))]
+    operands = [set().union(*(_vgprIndices(getattr(m, name, None))
+                              for name in ("a", "b", "mxsa", "mxsb")))
+                for m in mfmas]
+
+    def ringWindow(c, inst, floor):
+        """A ds_read's ring window: its last-reader floor and lead deadline."""
+        dest = set(_vgprIndices(_dsReadDstAddr(inst)[0]))
+        floor = max(floor, -(-rules.deferLiveSourceWrite(placer, 0, inst) // spi))
+        deadline = ends[c] - 1 - minGapDsReadToWait
+        consumer = next((j for j in range(starts[c], len(mfmas))
+                         if dest & operands[j]), None)
+        if consumer is not None:
+            deadline = min(deadline, consumer - RING_READ_LEAD_MFMAS)
+        return floor, deadline
+
+    if ring:
+        def ownWindow(c, item):
+            floor = firstInterval if c == 0 else max(firstInterval, _crossCellReadFloors(
+                [item], mfmas, starts[c], ends[c], firstInterval)[0])
+            return ringWindow(c, item[1], floor)
+        # The half's prefix (split[0][1]) issues ahead of MFMA 0, before any read.
+        pinned = {mid for c in range(len(cells)) for part in (0, 1, 3, 4)
+                  if c or part != 1 for mid, _ in split[c][part]}
+        if _hoistRingBarrierRead(readPaths, orders, firstInterval, ownWindow, pinned):
+            placer.relink(orders)
     # Each item's earliest gap; a cell's reads are planned in groups of
     # equal floor, which keep their path order.
     floors = [[-(-cellOpen[c] // spi)] * len(readPaths[c]) for c in range(len(cells))]
@@ -4421,9 +4509,6 @@ def _scheduleHalfDisjointHalf(
         loadGapList = [g for g in range(firstInterval, tailFrom(firstInterval))
                        if memoryGap(g) and not shadowReads[g]]
         loadTargets = ringLoadTargets(loadGapList, len(bundles))
-        operands = [set().union(*(_vgprIndices(getattr(m, name, None))
-                                  for name in ("a", "b", "mxsa", "mxsb")))
-                    for m in mfmas]
         blocked = set(seams) | {
             gap for fence in seams
             for gap in range(fence - minGapDsReadToWait + 1, fence)}
@@ -4432,13 +4517,7 @@ def _scheduleHalfDisjointHalf(
             for (_mid, inst), floor in zip(readPaths[c], floors[c]):
                 if not _isDsRead(inst):
                     continue
-                dest = set(_vgprIndices(_dsReadDstAddr(inst)[0]))
-                floor = max(floor, -(-rules.deferLiveSourceWrite(placer, 0, inst) // spi))
-                deadline = ends[c] - 1 - minGapDsReadToWait
-                consumer = next((j for j in range(starts[c], len(mfmas))
-                                 if dest & operands[j]), None)
-                if consumer is not None:
-                    deadline = min(deadline, consumer - RING_READ_LEAD_MFMAS)
+                floor, deadline = ringWindow(c, inst, floor)
                 reads.append(RingRead(floor, deadline, c, (inst.comment or "ds_read").split(";")[0]))
         half = RingHalf(
             gaps=intervals, barrierGap=firstInterval, loadGaps=loadGapList,

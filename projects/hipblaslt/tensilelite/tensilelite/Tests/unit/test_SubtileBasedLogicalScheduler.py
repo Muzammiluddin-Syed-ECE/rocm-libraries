@@ -7853,6 +7853,39 @@ class TestRingPlacement:
         clear = [RingRead(0, 30, 0, "r", target=g) for g in sorted(set(loadGaps) - set(loads))]
         assert ringLoadsClearOfReads(loadGaps, loads, clear) == loads
 
+    @staticmethod
+    def _read(dst, comment):
+        from rocisa.container import DSModifiers, vgpr
+        from rocisa.instruction import DSLoadB128
+        return DSLoadB128(dst=vgpr(dst, 4), src=vgpr(2), ds=DSModifiers(offset=0),
+                          comment=comment)
+
+    def test_barrier_read_hoists_earliest_needed_module(self):
+        from tensilelite.Components.Subtile.InstructionScheduler import _hoistRingBarrierRead
+        a0, a1, b0, b1 = (self._read(d, n) for d, n in ((40, "A0"), (44, "A1"),
+                                                         (60, "B0"), (64, "B1")))
+        paths = [[(10, a0), (11, a1), (12, b0), (13, b1)]]
+        orders = [[10, 11, 12, 13]]
+        windows = {"A0": (5, 30), "A1": (5, 30), "B0": (0, 12), "B1": (0, 20)}
+        window = lambda c, item: windows[str(item[1].comment)]
+        assert _hoistRingBarrierRead(paths, orders, 0, window)
+        assert [m for m, _ in paths[0]] == [12, 10, 11, 13]
+        assert orders == [[12, 10, 11, 13]]
+        # A path whose first read may already issue in the barrier gap is left alone.
+        assert not _hoistRingBarrierRead(paths, orders, 0, window)
+
+    def test_barrier_read_hoist_respects_pins_and_vgpr_writes(self):
+        from tensilelite.Components.Subtile.InstructionScheduler import _hoistRingBarrierRead
+        a0, b0 = self._read(40, "A0"), self._read(60, "B0")
+        windows = {"A0": (5, 30), "B0": (0, 12)}
+        window = lambda c, item: windows[str(item[1].comment)]
+        paths, orders = [[(10, a0), (12, b0)]], [[10, 12]]
+        assert not _hoistRingBarrierRead(paths, orders, 0, window, pinned={10})
+        clash = self._read(40, "B0")
+        paths, orders = [[(10, a0), (12, clash)]], [[10, 12]]
+        assert not _hoistRingBarrierRead(paths, orders, 0, window)
+        assert orders == [[10, 12]]
+
     def test_reads_of_one_chain_keep_their_order(self):
         from tensilelite.Components.Subtile.RingPlacement import RingHalf, RingRead
         half = RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0, reads=[
@@ -7973,9 +8006,11 @@ class TestRingGate:
     """The ring placement applies to 2x2 partition grids with even, long enough halves."""
 
     @staticmethod
-    def _sched(m=8, n=10, ring=True, **kw):
+    def _sched(m=8, n=10, ring=True, order="n-major", **kw):
         kw.setdefault("size_n", 6 if (m, n) == (8, 10) else None)
-        s = LogicalScheduler(TestHalfDisjointLds._cfg(m, n, grB=1, grSA=8, **kw))
+        cfg = TestHalfDisjointLds._cfg(m, n, grB=1, grSA=8, **kw)
+        cfg.partitionOrder = order
+        s = LogicalScheduler(cfg)
         s.config.ringPlacement = ring
         s.build(stop_after=Pass.LR)
         return s
@@ -7987,6 +8022,13 @@ class TestRingGate:
     def test_sol97_geometry_applies(self):
         # 8x8 tiles, 4/4 x 4/4: 32 MFMAs and 8 loads per half.
         assert self._sched(8, 8).ringSkipReason() is None
+
+    def test_sol101_applies_m_major_only(self):
+        # 10x8 tiles split 6/4 x 4/4: m-major halves (split along N) are 40/40.
+        assert self._sched(10, 8, size_m=6, order="m-major").ringSkipReason() is None
+        assert self._sched(10, 8, size_m=6).ringSkipReason() == "half MFMAs 48/32"
+        # 8x10 split 4/4 x 6/4 is the mirror case.
+        assert self._sched(order="m-major").ringSkipReason() == "half MFMAs 48/32"
 
     def test_flag_off_or_other_geometry_skips(self):
         assert self._sched(ring=False).ringSkipReason() == "off"

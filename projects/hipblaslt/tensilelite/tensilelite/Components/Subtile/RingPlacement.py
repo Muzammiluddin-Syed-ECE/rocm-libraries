@@ -151,7 +151,9 @@ def ringReadTargets(half: RingHalf, loadTargets: Sequence[int]) -> List[RingRead
         candidates = [r for r in heads.values()
                       if r.floor <= half.barrierGap <= r.deadline]
         if not candidates or half.barrierGap in half.readBlocked:
-            raise RingInfeasible("no ds_read window covers the barrier gap")
+            raise RingInfeasible(
+                f"no ds_read window covers the barrier gap {half.barrierGap}: chain heads "
+                + ", ".join(f"{r.name} [{r.floor}, {r.deadline}]" for r in heads.values()))
         take(half.barrierGap, min(candidates, key=lambda r: (r.deadline, reads.index(r))),
              True)
 

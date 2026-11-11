@@ -1060,8 +1060,6 @@ class LogicalScheduler:
             return "off"
         if not self.halfDisjoint:
             return "not half-disjoint"
-        if cfg.partitionOrder != "n-major":
-            return "m-major"
         if not (cfg.uniformPgrEpoch and cfg.dualPeriodScale):
             return "not dual-period"
         if cfg.numPartitionsM != 2 or cfg.numPartitionsN != 2:

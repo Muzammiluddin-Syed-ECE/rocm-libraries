@@ -1548,7 +1548,11 @@ def mainLoop(writer, kernel):
       hasTDM = bool(kernel.get("enableTDMA")) and bool(kernel.get("enableTDMB"))
       grPlacement = (GRPlacementStrategy.BUNCHED if hasTDM
                      else GRPlacementStrategy.SPREAD)
-      cfg = MFMASchedulerConfig(
+      ringPlacement = (schedulerPartitionPrefetch
+                       and os.environ.get("TENSILE_MXFP8_RING", "0") == "1")
+
+      def schedulerConfig(partitionOrder):
+        return MFMASchedulerConfig(
           numMFMATilesM=M,
           numMFMATilesN=N,
           numSubIterK=tiA.localMMATileGrid[1],
@@ -1569,10 +1573,9 @@ def mainLoop(writer, kernel):
           uniformPgrEpoch=(schedulerPartitionPrefetch and schedulerPgr == 2),
           uniformEpochVmemCohortSize=5,
           halfDisjointLds=schedulerPartitionPrefetch,
-          ringPlacement=(schedulerPartitionPrefetch
-                         and os.environ.get("TENSILE_MXFP8_RING", "0") == "1"),
+          ringPlacement=ringPlacement,
           grLoadsPerAtom=grLoadsPerAtom,
-          partitionOrder=schedulerPartitionOrder,
+          partitionOrder=partitionOrder,
           grPlacement=grPlacement,
           pgl=kernel.get("PrefetchGL2", 0),
           scaleReuse=(kernel.get("_ScaleReuseA", 1)
@@ -1582,10 +1585,18 @@ def mainLoop(writer, kernel):
           tailOwnTiles=tailOwnTiles,
           tailPartitionSizeN=tailPartitionSizeN,
           tailPartitionSizeM=tailPartitionSizeM,
-      )
+        )
 
-      scheduler = LogicalScheduler(cfg)
+      scheduler = LogicalScheduler(schedulerConfig(schedulerPartitionOrder))
       scheduler.build()
+      # The ring needs halves of equal MFMA counts. Where the n-major halves
+      # (split along M) are uneven, the m-major ones (split along N) may not be.
+      if (ringPlacement and schedulerPartitionOrder == "n-major"
+              and scheduler.ringSkipReason() is not None):
+        mMajor = LogicalScheduler(schedulerConfig("m-major"))
+        mMajor.build()
+        if mMajor.ringSkipReason() is None:
+          scheduler = mMajor
 
       numVgpr = scheduler.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)
       if vgprUsed + numVgpr <= vgprBudget:
