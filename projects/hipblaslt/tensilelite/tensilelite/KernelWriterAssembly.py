@@ -19343,6 +19343,22 @@ class KernelWriterAssembly(KernelWriter):
                                                vgprBlendTmp=(cvtVgpr+coalesceBlend) if isSubtileCoalesce else -1, \
                                                vgprCoalesceStoreData=coalesceStoreDataVgpr, \
                                                vgprCoalescePack2=coalescePack2Vgpr)
+        if isSubtileCoalesce and os.environ.get("TENSILE_DRYRUN_REGS"):
+          import sys as _sys
+          _lent = list(self.states.subtileFusedLendVgprs or [])
+          _lentset = set()
+          for _b, _s in _lent:
+            _lentset.update(range(_b, _b + _s))
+          _cvtrange = set(range(cvtVgpr, cvtVgpr + numCvtVgprs))
+          _inLent = _cvtrange & _lentset
+          _notLent = _cvtrange - _lentset
+          _mt = f"MT{kernel.get('MacroTile0')}x{kernel.get('MacroTile1')}_MIWT{'_'.join(map(str,kernel.get('MIWaveTile',[])))}"
+          _sys.stderr.write(
+            f"[DRYRUN {_mt}] cvtBlock=[{cvtVgpr}..{cvtVgpr+numCvtVgprs}) size={numCvtVgprs} "
+            f"ValuCbase={self.states.c.startVgprValu} pairRing={pairRing}\n"
+            f"[DRYRUN {_mt}] lentHoles(base,size)={_lent} totalLent={len(_lentset)}\n"
+            f"[DRYRUN {_mt}] cvtBlock IN lent={sorted(_inLent)} NOT-in-lent(=grabbed elsewhere)={sorted(_notLent)}\n")
+          _sys.stderr.flush()
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
