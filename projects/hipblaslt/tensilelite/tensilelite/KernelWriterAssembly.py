@@ -18535,17 +18535,10 @@ class KernelWriterAssembly(KernelWriter):
     coalesceAllocated: bool = False   # coalesce cvt-block reserved? (gates the coalesce in GlobalWriteBatch)
     vgprVoff: int = -1            # per-store blended voffset (base vs base+64B by odd-lane mask)
     vgprBlendTmp: int = -1        # scratch for the quad_perm data/addr blend
-    # Weave-path ONLY: a dedicated 4-reg quad for the blended store data, replacing the dead-ValuC
-    # reuse (vCoalesceStoreData=sumIdx1).  The reuse is safe monolithically but NOT once the planner
-    # moves terminal MFMAs into the coalesce's store region (convert-interleave weave), which
-    # corrupts the reused slot; a dedicated quad makes the move safe (like the un-coalesced woven
-    # store).  -1 off the weave path -> the ValuC reuse is kept (zero VGPR cost).
-    vgprCoalesceStoreData: int = -1
-    # Weave-path ONLY: a dedicated 4-reg quad for batchB's packed data, replacing the dead-ValuC
-    # reuse (vCoalescePack=sumIdx0).  batchB's packed data is written in Phase1 and read by the
-    # blend in Phase2, so its live window spans the convert-gap where the planner moves terminal
-    # MFMAs -- the ValuC reuse is corrupted there, same as the store-data quad.  -1 off-weave.
-    vgprCoalescePack2: int = -1
+    # (The blended store data and batchB's packed data reuse dead ValuC slots -- vCoalesceStoreData=
+    # sumIdx1, vCoalescePack=sumIdx0 -- at zero VGPR cost; the terminal-MFMA clobber that threatened
+    # that reuse under the weave is handled by the store-module clobber guard in
+    # _planCapturedTerminalMfmas, so no dedicated quad is allocated here.)
     # Persistent even-lane blend mask SGPR (0x5555...5555) for the DPP v_cndmask blends. The DPP
     # blend mask must sit in VCC (volatile), so it is reloaded per store; this pair holds the
     # constant so the stage is hoisted ONCE (emitSubtileStoreLaneMath) instead of per coalesce.
@@ -19302,10 +19295,6 @@ class KernelWriterAssembly(KernelWriter):
         # Published so the operand-lend policy (_selectPlsinFusedStorePolicy) couples the lend
         # to the fold, and so GlobalWriteBatch knows the fold is live on this kernel.
         self.states.subtileCoalesceActive = isSubtileCoalesce
-        # Reset the once-per-store-epilogue odd-lane mask hoist flag (see
-        # _emit16bitSubtilePairedStoreCoalesce): the first full-tile coalesce across all batches
-        # sets tmpS23's 0xAAAAAAAA mask, the rest reuse it.
-        self.states.subtileCoalesceOddMaskSet = False
         # The DPP coalesce requires the N-column-aligned batch tiling (_coalesceBatchBounds in the
         # store-batch loop) so a batch never straddles an N-column -- but that tiling is only built
         # on the non-CompactLoopStore path (CLS emits a reduced runtime-loop body, where
@@ -19341,42 +19330,24 @@ class KernelWriterAssembly(KernelWriter):
         # off numElementsPerBatch, which has a hard floor at MIWaveTile[0] (see _pairPackQuad).
         pairRing = self.vgprPool.checkOutAligned(4 * (pairQuads - 1), 2, tag="subtilePairPackRing") \
                    if pairQuads > 1 else -1
-        # Weave-path dedicated store-data quad: when the coalesce runs under the fused weave, the
-        # convert-interleave lets the planner move terminal MFMAs into the store region, which
-        # corrupts the ValuC-reused blended store src.  Give it a dedicated 4-reg 2-aligned quad on
-        # exactly those kernels; the emitter uses it only on the foldCvtInterleave path and keeps
-        # the ValuC reuse everywhere else (zero cost off-weave).  This gate MUST be a superset of
-        # the emitter's foldCvtInterleave (which requires _weaveMode => subtileFusedWeave and runs
-        # only under isSubtileCoalesce); subtileWeaveMfmaGroups / permlane16 are not yet resolved
-        # here, so gate on the master weave switch -- a few non-permlane16 weave kernels may waste
-        # 4 regs, but the emitter never finds the quad unallocated (asserted there).
-        # Graceful degradation: the dedicated quad costs +4 arch VGPRs. Allocate it ONLY when the
-        # pool has room (same headroom form as coalesceFits); otherwise leave it -1 and the emitter
-        # falls back to the monolithic (correct, un-woven) ValuC-reuse path for this kernel. This
-        # keeps near-cap kernels (where +4 would push the logical vgpr count past 256 and fail the
-        # build) correct-but-un-woven, while kernels with headroom (e.g. MT256x256 MIWT8 @ 249) weave.
-        # The coalesce weave reuses dead ValuC for batchB's packed data and the blended store src
-        # (vCoalescePack=sumIdx0, vCoalesceStoreData=sumIdx1) at zero VGPR cost.  An earlier attempt
-        # gave these dedicated quads, hypothesising the reuse corrupted under the convert-interleave;
-        # DISPROVEN (--verify unchanged, 0.0448 either way).  The real corruption was the planner
-        # relocating terminal MFMAs whose A/B/scale operands the store clobbers -- now fixed by the
-        # store-module clobber guard in _planCapturedTerminalMfmas, so no dedicated quad is needed.
-        coalesceStoreDataVgpr = -1
-        coalescePack2Vgpr = -1
+        # The coalesce blend reuses dead ValuC slots for batchB's packed data and the blended store
+        # src (vCoalescePack=sumIdx0, vCoalesceStoreData=sumIdx1) at zero VGPR cost; the terminal-MFMA
+        # relocation that threatened that reuse under the weave is handled by the store-module clobber
+        # guard in _planCapturedTerminalMfmas, so no dedicated store-data/pack quad is allocated.
+        #
         # Persistent even-lane blend mask SGPR: hoist the 0x5555...5555 stage out of every coalesce
-        # into emitSubtileStoreLaneMath. Allocate ONLY when the pool has room (same graceful form as
-        # the dedicated store-data quad above); on the tight fold kernels (MT288x256 sits at the
-        # SGPR cap) the checkout overflows and we leave it -1, and GlobalWriteBatch re-stages tmpS23
-        # per coalesce (correct, just a few extra scalar movs). A dedicated reg is never recycled as
-        # scratch, so one stage survives to every per-store VCC reload.
+        # into emitSubtileStoreLaneMath. Allocate ONLY when the pool has room; on the tight fold
+        # kernels (MT288x256 sits at the SGPR cap) the checkout overflows and we leave it -1, and
+        # GlobalWriteBatch re-stages tmpS23 per coalesce (correct, just a few extra scalar movs). A
+        # dedicated reg is never recycled as scratch, so one stage survives to every per-store reload.
         coalesceMaskSgpr = -1
         coalesceOddMaskSgpr = -1
         if isSubtileCoalesce:
           try:
             coalesceMaskSgpr = self.sgprPool.checkOutAligned(self.states.laneSGPRCount, 2,
                                  tag="subtileCoalesceMask", preventOverflow=True)
-          except Exception:
-            coalesceMaskSgpr = -1
+          except Exception:  # pool overflow; RegisterPool's ResourceOverflowException is a mis-defined
+            coalesceMaskSgpr = -1  # function (raises TypeError), so catch broadly -- the fallback is always correct
           # Second pair for the 0xAAAA odd-select mask (store-2 batchA-identity blend -> cleaner,
           # symmetric generated store; perf-neutral). preventOverflow only checks the pool HERE, not
           # the kernel's later peak (a downstream longBranch temp), so a successful checkout can still
@@ -19399,26 +19370,8 @@ class KernelWriterAssembly(KernelWriter):
                                                coalesceAllocated=isSubtileCoalesce, \
                                                vgprVoff=(cvtVgpr+coalesceVoff) if isSubtileCoalesce else -1, \
                                                vgprBlendTmp=(cvtVgpr+coalesceBlend) if isSubtileCoalesce else -1, \
-                                               vgprCoalesceStoreData=coalesceStoreDataVgpr, \
-                                               vgprCoalescePack2=coalescePack2Vgpr, \
                                                coalesceMaskSgpr=coalesceMaskSgpr, \
                                                coalesceOddMaskSgpr=coalesceOddMaskSgpr)
-        if isSubtileCoalesce and os.environ.get("TENSILE_DRYRUN_REGS"):
-          import sys as _sys
-          _lent = list(self.states.subtileFusedLendVgprs or [])
-          _lentset = set()
-          for _b, _s in _lent:
-            _lentset.update(range(_b, _b + _s))
-          _cvtrange = set(range(cvtVgpr, cvtVgpr + numCvtVgprs))
-          _inLent = _cvtrange & _lentset
-          _notLent = _cvtrange - _lentset
-          _mt = f"MT{kernel.get('MacroTile0')}x{kernel.get('MacroTile1')}_MIWT{'_'.join(map(str,kernel.get('MIWaveTile',[])))}"
-          _sys.stderr.write(
-            f"[DRYRUN {_mt}] cvtBlock=[{cvtVgpr}..{cvtVgpr+numCvtVgprs}) size={numCvtVgprs} "
-            f"ValuCbase={self.states.c.startVgprValu} pairRing={pairRing}\n"
-            f"[DRYRUN {_mt}] lentHoles(base,size)={_lent} totalLent={len(_lentset)}\n"
-            f"[DRYRUN {_mt}] cvtBlock IN lent={sorted(_inLent)} NOT-in-lent(=grabbed elsewhere)={sorted(_notLent)}\n")
-          _sys.stderr.flush()
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
@@ -19717,10 +19670,6 @@ class KernelWriterAssembly(KernelWriter):
         self.vgprPool.checkIn(cvtVgpr)
         if pairRing >= 0:
           self.vgprPool.checkIn(pairRing)
-        if coalesceStoreDataVgpr >= 0:
-          self.vgprPool.checkIn(coalesceStoreDataVgpr)
-        if coalescePack2Vgpr >= 0:
-          self.vgprPool.checkIn(coalescePack2Vgpr)
         if coalesceMaskSgpr >= 0:
           self.sgprPool.checkIn(coalesceMaskSgpr)
         if coalesceOddMaskSgpr >= 0:

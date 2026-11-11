@@ -4637,21 +4637,6 @@ class LogicalScheduler:
                 and len(_miwt) >= 2 and _miwt[0] == 8):
             dead_ids = self._deadOperandTileIds(unroll_iter)
             has_ab_holes = bool(dead_ids.get("A") or dead_ids.get("B"))
-            import os as _os
-            if _os.environ.get("TENSILE_DRYRUN_REGS"):
-                import sys as _sys
-                _all = self._operandLendVgprs(None)
-                _dead = self._operandLendVgprs(dead_ids)
-                _allset = set(); _deadset = set()
-                for _b, _s in _all: _allset.update(range(_b, _b+_s))
-                for _b, _s in _dead: _deadset.update(range(_b, _b+_s))
-                _lastK = _allset - _deadset
-                _mt = f"MT{kernel.get('MacroTile0')}x{kernel.get('MacroTile1')}_MIWT{'_'.join(map(str,kernel.get('MIWaveTile',[])))}"
-                _sys.stderr.write(
-                    f"[DRYRUN-POL {_mt}] numSubIterK={self.config.numSubIterK} has_ab_holes={has_ab_holes}\n"
-                    f"[DRYRUN-POL {_mt}] totalOperandRegs={len(_allset)} deadK0Holes={len(_deadset)} lastK_LIVE={len(_lastK)}\n"
-                    f"[DRYRUN-POL {_mt}] lastK_LIVE regs(reserved, must-not-grab)={sorted(_lastK)[:40]}\n")
-                _sys.stderr.flush()
             if self.config.numSubIterK >= 2 and has_ab_holes:
                 return {}, self._operandLendVgprs(dead_ids)   # weave kept, partial (dead-hole) lend
             return None, self._operandLendVgprs(None)          # no holes: fall back to full lend
