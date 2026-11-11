@@ -19274,6 +19274,10 @@ class KernelWriterAssembly(KernelWriter):
         # Published so the operand-lend policy (_selectPlsinFusedStorePolicy) couples the lend
         # to the fold, and so GlobalWriteBatch knows the fold is live on this kernel.
         self.states.subtileCoalesceActive = isSubtileCoalesce
+        # Reset the once-per-store-epilogue odd-lane mask hoist flag (see
+        # _emit16bitSubtilePairedStoreCoalesce): the first full-tile coalesce across all batches
+        # sets tmpS23's 0xAAAAAAAA mask, the rest reuse it.
+        self.states.subtileCoalesceOddMaskSet = False
         # The DPP coalesce requires the N-column-aligned batch tiling (_coalesceBatchBounds in the
         # store-batch loop) so a batch never straddles an N-column -- but that tiling is only built
         # on the non-CompactLoopStore path (CLS emits a reduced runtime-loop body, where
