@@ -17776,6 +17776,17 @@ class KernelWriterAssembly(KernelWriter):
     self.states.subtileHoistedPermAddr = False
     if not isMxf4SubtilePath(kernel) or cvtVgprStruct is None:
       return module
+    # Hoist the even-lane DPP blend mask stage here (once per store): the mask SGPR is held by
+    # globalWriteElements for the whole store and no batch writes it, so one copy -- emitted into
+    # this fixed preamble module, ahead of every store arm and not subject to store-module
+    # reordering -- dominates the per-coalesce re-stage and precedes every per-store VCC reload in
+    # program order. Done before the lane-math early return so it stands independent of that path.
+    _maskSgpr = getattr(cvtVgprStruct, "coalesceMaskSgpr", -1)
+    if _maskSgpr >= 0:
+      module.addComment1("hoisted even-lane DPP blend mask (0x5555...5555, once per store)")
+      module.add(SMovB32(dst=sgpr(_maskSgpr), src=hex(0x55555555), comment="even-lane select mask lo32"))
+      if self.states.laneSGPRCount >= 2:
+        module.add(SMovB32(dst=sgpr(_maskSgpr+1), src=hex(0x55555555), comment="even-lane select mask hi32"))
     if getattr(cvtVgprStruct, "vgprLaneGroupDelta", -1) < 0:
       return module
     from .Components.GlobalWriteBatch import plsinStorePermlane16Active
@@ -18529,6 +18540,12 @@ class KernelWriterAssembly(KernelWriter):
     # blend in Phase2, so its live window spans the convert-gap where the planner moves terminal
     # MFMAs -- the ValuC reuse is corrupted there, same as the store-data quad.  -1 off-weave.
     vgprCoalescePack2: int = -1
+    # Persistent even-lane blend mask SGPR (0x5555...5555) for the DPP v_cndmask blends. The DPP
+    # blend mask must sit in VCC (volatile), so it is reloaded per store; this pair holds the
+    # constant so the stage is hoisted ONCE (emitSubtileStoreLaneMath) instead of per coalesce.
+    # Allocated only when isSubtileCoalesce AND the SGPR pool has room (checkOutAligned with
+    # preventOverflow); -1 -> GlobalWriteBatch falls back to re-staging tmpS23 per coalesce.
+    coalesceMaskSgpr: int = -1
 
   class FP8CVTVgprStruct(NamedTuple):
     vgprFp8NanInf: int = -1
@@ -19335,6 +19352,19 @@ class KernelWriterAssembly(KernelWriter):
         # store-module clobber guard in _planCapturedTerminalMfmas, so no dedicated quad is needed.
         coalesceStoreDataVgpr = -1
         coalescePack2Vgpr = -1
+        # Persistent even-lane blend mask SGPR: hoist the 0x5555...5555 stage out of every coalesce
+        # into emitSubtileStoreLaneMath. Allocate ONLY when the pool has room (same graceful form as
+        # the dedicated store-data quad above); on the tight fold kernels (MT288x256 sits at the
+        # SGPR cap) the checkout overflows and we leave it -1, and GlobalWriteBatch re-stages tmpS23
+        # per coalesce (correct, just a few extra scalar movs). A dedicated reg is never recycled as
+        # scratch, so one stage survives to every per-store VCC reload.
+        coalesceMaskSgpr = -1
+        if isSubtileCoalesce:
+          try:
+            coalesceMaskSgpr = self.sgprPool.checkOutAligned(self.states.laneSGPRCount, 2,
+                                 tag="subtileCoalesceMask", preventOverflow=True)
+          except Exception:
+            coalesceMaskSgpr = -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
@@ -19346,7 +19376,8 @@ class KernelWriterAssembly(KernelWriter):
                                                vgprVoff=(cvtVgpr+coalesceVoff) if isSubtileCoalesce else -1, \
                                                vgprBlendTmp=(cvtVgpr+coalesceBlend) if isSubtileCoalesce else -1, \
                                                vgprCoalesceStoreData=coalesceStoreDataVgpr, \
-                                               vgprCoalescePack2=coalescePack2Vgpr)
+                                               vgprCoalescePack2=coalescePack2Vgpr, \
+                                               coalesceMaskSgpr=coalesceMaskSgpr)
         if isSubtileCoalesce and os.environ.get("TENSILE_DRYRUN_REGS"):
           import sys as _sys
           _lent = list(self.states.subtileFusedLendVgprs or [])
@@ -19665,6 +19696,8 @@ class KernelWriterAssembly(KernelWriter):
           self.vgprPool.checkIn(coalesceStoreDataVgpr)
         if coalescePack2Vgpr >= 0:
           self.vgprPool.checkIn(coalescePack2Vgpr)
+        if coalesceMaskSgpr >= 0:
+          self.sgprPool.checkIn(coalesceMaskSgpr)
       # The hoisted values die with the cvtVgpr block.
       self.states.subtileHoistedLaneGroupDelta = False
       self.states.subtileHoistedPermAddr = False

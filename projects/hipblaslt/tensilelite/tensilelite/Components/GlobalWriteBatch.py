@@ -4852,18 +4852,42 @@ class GlobalWriteBatchWriter:
     assert halfLine > 0, \
       f"DPP coalesce expects batchB above batchA within the cache line (halfLine={halfLine}B)"
 
-    # Even-lane select mask in VCC (0x55555555) for the DPP v_cndmask blends.  DPP is only encodable
-    # on the e32/VCC form of v_cndmask (VOP3/e64 with an SGPR mask cannot carry DPP), so the fold's
-    # blend mask lives in VCC, and DPP applies to src0 only -- hence src0=batchB (DPP-shuffled),
-    # src1=batchA, and an EVEN select (VCC ? src1=batchA : src0=batchB) to put even<-batchA,
-    # odd<-batchB.  Set per coalesce: this coalesce's blend region (data + voffset + both stores,
-    # gap B between them) uses only non-VCC VALU, so VCC survives from here through the last blend;
-    # the surrounding epilogue may write VCC, so do NOT hoist across coalesces.
-    phase2Mod.add(SMovB32(dst=VCC(), src=hex(0x55555555), comment="even-lane select mask lo (VCC) for DPP cndmask"))
-    if self.laneSGPRC >= 2:
-      phase2Mod.add(SMovB32(dst=VCC(setHi=True), src=hex(0x55555555), comment="even-lane select mask hi (VCC)"))
+    # Even-lane select mask for the DPP v_cndmask blends.  DPP is only encodable on the e32/VCC form
+    # of v_cndmask (VOP3/e64 with an SGPR mask cannot carry DPP), so the fold's blend mask must sit
+    # in VCC, and DPP applies to src0 only -- hence src0=batchB (DPP-shuffled), src1=batchA, and an
+    # EVEN select (VCC ? src1=batchA : src0=batchB) to put even<-batchA, odd<-batchB.
+    #
+    # The even-lane blend mask (0x5555...5555) lives in a scalar pair, and VCC is reloaded from it
+    # per store (VCC is volatile -- address math and carry-adds write it between the two stores;
+    # within one emitCoalescedStore nothing writes VCC between the reload and the voffset cndmask, so
+    # one reload at the top covers both blends).  `s_mov_b32 vcc, imm` is illegal on wave64 (vcc is a
+    # 64-bit register, VCC() renders as the full "vcc"), so the scalar pair + wave-width mov
+    # (s_mov_b64 wave64 / s_mov_b32 wave32) does the reload.
+    #
+    # Preferred: a DEDICATED mask SGPR (cvtVgprStruct.coalesceMaskSgpr), staged ONCE in
+    # emitSubtileStoreLaneMath.  Being dedicated it is never recycled as scratch, and being staged in
+    # that fixed pre-store preamble it precedes every reload in program order -- so a single stage
+    # serves the whole store.
+    #
+    # Fallback (coalesceMaskSgpr < 0, i.e. the SGPR pool was too tight to reserve a pair): re-stage
+    # tmpS23 UNCONDITIONALLY per coalesce.  tmpS23 is hot store scratch (clobbered thousands of times
+    # between stores), and the subtile scheduler places each coalesce's store module by tile position
+    # not generation order -- so a single flag-guarded tmpS23 stage can land AFTER other coalesces'
+    # reloads (observed: stage at .s line 10332, reloads from 4578 -> garbage -> NaN on MT288x256).
+    # Staging inside every coalesce keeps each self-sufficient regardless of placement.
+    _maskSgpr = getattr(self.cvtVgprStruct, "coalesceMaskSgpr", -1)
+    if _maskSgpr >= 0:
+      evenMaskS = _maskSgpr   # dedicated, staged once in emitSubtileStoreLaneMath
+    else:
+      evenMaskS = self.tmpS23
+      phase2Mod.add(SMovB32(dst=sgpr(evenMaskS), src=hex(0x55555555), comment="even-lane select mask lo32 (per coalesce)"))
+      if self.laneSGPRC >= 2:
+        phase2Mod.add(SMovB32(dst=sgpr(evenMaskS+1), src=hex(0x55555555), comment="even-lane select mask hi32 (per coalesce)"))
 
     def emitCoalescedStore(evenPerm, oddPerm, tag):
+      # Reload the even-lane select mask into VCC for THIS store's blends (VCC is volatile; see above).
+      phase2Mod.add(self.getEdgeMovInstType()(VCC(), sgpr(evenMaskS, self.laneSGPRC),
+                       f"{tag} even-lane select mask -> VCC (per store; VCC is volatile)"))
       # Data blend (cndmask): even <- evenPerm(batchA), odd <- oddPerm(batchB).
       phase2Mod.addComment1(f"{tag} data blend: even<-batchA odd<-batchB (cndmask, full-exec DPP)")
       for k in range(4):
