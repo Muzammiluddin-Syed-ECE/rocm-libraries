@@ -16230,10 +16230,13 @@ class KernelWriterAssembly(KernelWriter):
         and kernel.get("MatrixInstM") == 16
         and len(_miwt) >= 2 and _miwt[0] >= 4)
     if _foldWeaveActive:
-      _cands = sorted(((_b, _s) for (_b, _s) in (self.states.subtileFusedLendVgprs or [])
-                       if _s >= 4 and _b % 2 == 0
-                       and not any((_b + _k) in _protected for _k in range(4))),
-                      reverse=True)  # high end first (away from last-K)
+      # Pick the LOWEST-index dead K=0 tiles. The movable terminal MFMAs read operands in the HIGH
+      # part of the operand file; the low K=0 holes sit below that range (the cvt block already
+      # lives there safely), so fold data placed there does not clobber the moves. (High K=0 holes
+      # are read by those MFMAs -> picking them regresses the weave to 0.)
+      _cands = sorted((_b, _s) for (_b, _s) in (self.states.subtileFusedLendVgprs or [])
+                      if _s >= 4 and _b % 2 == 0
+                      and not any((_b + _k) in _protected for _k in range(4)))  # ascending: lowest first
       for _b, _s in _cands:
         if len(self.states.subtileCoalesceDataBases) >= 2:
           break
