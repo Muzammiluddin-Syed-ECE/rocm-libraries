@@ -14,6 +14,9 @@ from rocisa.code import Module, TextBlock
 from rocisa.instruction import SWaitCnt, SBarrier, MFMAInstruction, MXMFMAInstruction, \
     LocalReadInstruction, LocalWriteInstruction, GlobalReadInstruction, GlobalWriteInstruction, \
     CommonInstruction, SMemLoadInstruction, VXorB32
+from .RingPlacement import (
+    RING_READ_LEAD_MFMAS, RingHalf, RingInfeasible, RingRead, ringLoadTargets,
+    ringReadTargets)
 
 
 class _SlotPlacer:
@@ -3461,7 +3464,13 @@ def _feedsCell(em, cellSources) -> bool:
         for inst in em.instructions if _isDsRead(inst))
 
 
-def _splitHalfDisjointCell(emittedModules, pathOrders, preMfmaOrders, mfmas):
+def _isBalancedCurrentCellRead(em) -> bool:
+    return em.opType == "lr" and any(
+        BALANCED_CURRENT_CELL_NOTE in (getattr(inst, "comment", "") or "")
+        for inst in em.instructions if _isDsRead(inst))
+
+
+def _splitHalfDisjointCell(emittedModules, pathOrders, preMfmaOrders, mfmas, ring=False):
     """Sort a half-disjoint cell's paths into what each placement step takes.
 
     Returns (syncItems, prefix, reads, requests, others) as lists of
@@ -3469,7 +3478,9 @@ def _splitHalfDisjointCell(emittedModules, pathOrders, preMfmaOrders, mfmas):
     drain and barrier. prefix stays ahead of MFMA 0: the cell's local-read
     wait, the reads the cell's own MFMAs consume, and the opener when such
     a read needs it. reads, requests and others are the paths that carry a
-    local read, a global read, or neither.
+    local read, a global read, or neither. With ring a balanced current-cell
+    read (planHalfDisjointBalance) joins the reads: it has a window behind the
+    barrier and insertRingConsumerWaits retires it before its consumer.
     """
     cellSources = set()
     for mfma in mfmas:
@@ -3487,7 +3498,8 @@ def _splitHalfDisjointCell(emittedModules, pathOrders, preMfmaOrders, mfmas):
             em = emittedModules[mid]
             if em.opType == "wait_gr" or inSync:
                 inSync = em.opType != "sync"
-            elif _feedsCell(em, cellSources):
+            elif _feedsCell(em, cellSources) and not (
+                    ring and _isBalancedCurrentCellRead(em)):
                 keepUntil = i
         inSync = False
         for i, mid in enumerate(order):
@@ -4002,7 +4014,7 @@ def _halfMemoryPlan(eligible, readGroups, loadCount, evenLoads=False):
     return None
 
 
-def _halfCellOrderSafe(sequence, cellOf, pathOrders, modules):
+def _halfCellOrderSafe(sequence, cellOf, pathOrders, modules, swapsCrossFences=False):
     """Whether a half's final order keeps every cross-cell dependency.
 
     sequence is the half's (moduleId, instruction) in issue order, MFMAs
@@ -4011,7 +4023,9 @@ def _halfCellOrderSafe(sequence, cellOf, pathOrders, modules):
     free to reorder by register spans, nothing may cross a barrier or a
     VMEM wait, and every SCC reader must still see the SCC writer ahead
     of it in its own path. Local-read waits only gain coverage when a
-    read moves ahead of them, so reads may cross them.
+    read moves ahead of them, so reads may cross them. With
+    swapsCrossFences an LR pointer swap (v_xor_b32), which touches no
+    memory or loaded data, may cross a barrier or VMEM wait.
     """
     producer = {}
     for order in pathOrders:
@@ -4045,6 +4059,10 @@ def _halfCellOrderSafe(sequence, cellOf, pathOrders, modules):
             if later <= cell:
                 continue
             for other in items:
+                if swapsCrossFences and (
+                        (fence(inst) and isinstance(other, VXorB32))
+                        or (fence(other) and isinstance(inst, VXorB32))):
+                    continue
                 if fence(inst) or fence(other) or not _mayReorder(
                         inst, other, scc=False):
                     return False
@@ -4116,7 +4134,7 @@ def _relaxCrossedFences(sequence, cellOf, fenceCell):
 
 def _scheduleHalfDisjointHalf(
         cells, minGapDsReadToWait, earliestWriteShadow=None, mfmaBase=0,
-        scaleShadows=None, cellComments=(), crossCellReads=False):
+        scaleShadows=None, cellComments=(), crossCellReads=False, ring=False):
     """Schedule every partition cell of one half-disjoint half together.
 
     cells holds (emittedModules, pathOrders, preMfmaOrders, mfmas) per cell
@@ -4153,6 +4171,11 @@ def _scheduleHalfDisjointHalf(
     keeps every gap within its limits and the load-run cap, or the result
     would reorder a cross-cell dependency; the caller then schedules each
     cell on its own.
+
+    With ring (TENSILE_MXFP8_RING=1) the loads and reads take the gaps
+    RingPlacement gives them (ringTargets) in one pass, in place of
+    _halfMemoryPlan and the fallback attempts, and RingInfeasible is raised
+    rather than falling back.
     """
     spi = _MXFP8_FOLLOWER_SLOTS
     modules, mfmas, starts, split, orders, cellOf = [], [], [], [], [], {}
@@ -4166,7 +4189,7 @@ def _scheduleHalfDisjointHalf(
         pre = [[base + mid for mid in order] for order in preMfmaOrders]
         paths = [[base + mid for mid in order] for order in pathOrders]
         orders += pre + paths
-        split.append(_splitHalfDisjointCell(modules, paths, pre, cellMfmas))
+        split.append(_splitHalfDisjointCell(modules, paths, pre, cellMfmas, ring))
         starts.append(len(mfmas))
         mfmas.extend(cellMfmas)
     ends = starts[1:] + [len(mfmas)]
@@ -4208,6 +4231,8 @@ def _scheduleHalfDisjointHalf(
         isinstance(inst, SWaitCnt) and not _isFullLgkmDrain(inst)
         and (inst.dscnt > 0 or inst.kmcnt > 0)
         for em in modules for inst in em.instructions)
+    if ring and not crossCellReads:
+        raise RingInfeasible("partial local-read wait in the half")
 
     def clearOfLaterFences(placer, pos, inst):
         gap = pos // spi
@@ -4234,11 +4259,18 @@ def _scheduleHalfDisjointHalf(
     syncItems = split[0][0]
     if syncItems:
         placer.placePath(syncItems, startLimit=0)
-    opened = _nextPlacementSlot(placer)
-    if any(_isBarrier(inst) for _, inst in syncItems) and opened % spi:
+    opened = syncEnd = _nextPlacementSlot(placer)
+    barrierAtTop = any(_isBarrier(inst) for _, inst in syncItems)
+    if barrierAtTop and opened % spi:
         rounded = (opened // spi + 1) * spi
         if rounded < ends[0] * spi - spi:
             opened = rounded
+    shadowFirst = opened // spi
+    if ring:
+        # The ring's barrier-gap ds_read issues right behind the barrier.
+        if not barrierAtTop or syncEnd % spi == 0:
+            raise RingInfeasible("no room for a ds_read in the barrier gap")
+        opened = syncEnd
     for gap, c in seams.items():
         for j, item in enumerate(split[c][1]):
             placer.place(gap * spi + min(j, spi - 1), item)
@@ -4266,8 +4298,7 @@ def _scheduleHalfDisjointHalf(
     if scaleShadows:
         shadowGaps = [[inst for _, inst in split[0][1]]] + [
             intervalInsts(i) for i in range(intervals)]
-        shadowStart = firstInterval + 1 if any(
-            _isBarrier(inst) for _, inst in syncItems) else 0
+        shadowStart = shadowFirst + 1 if barrierAtTop else 0
         shadowTiers = [tier for tier in _SCALE_SHADOW_TIERS if not tier[0]]
         reservedShadows, scaleShadows[:] = placeScaleShadowReads(
             scaleShadows, shadowGaps, shadowStart, base=mfmaBase - 1, tiers=shadowTiers)
@@ -4300,6 +4331,15 @@ def _scheduleHalfDisjointHalf(
         _orderReadsAroundLiveSourceWrites(
             split[c][2], rules.earliestWriteShadow, mfmaBase)
         for c in range(len(cells))]
+    if ring:
+        # The LR pointer swaps ahead of a chain's first read would fill the
+        # barrier gap; they issue ahead of MFMA 0 instead.
+        for c in range(len(cells)):
+            lead = 0
+            while lead < len(readPaths[c]) and isinstance(readPaths[c][lead][1], VXorB32):
+                lead += 1
+            split[0][1].extend(readPaths[c][:lead])
+            readPaths[c] = readPaths[c][lead:]
     requests = [item for c in range(len(cells)) for item in split[c][3]]
     bundles, pending = _requestBundles(requests)
 
@@ -4322,8 +4362,11 @@ def _scheduleHalfDisjointHalf(
     if crossCellReads:
         for c in range(1, len(cells)):
             floors[c] = [
-                max(floor, -(-opened // spi)) for floor in _crossCellReadFloors(
+                max(floor, firstInterval if ring else -(-opened // spi))
+                for floor in _crossCellReadFloors(
                     readPaths[c], mfmas, starts[c], ends[c], firstInterval)]
+    if ring:
+        floors[0] = [firstInterval] * len(readPaths[0])
     nearFence = {
         gap for fence in seams if crossCellReads
         for gap in range(fence - minGapDsReadToWait + 1, fence)}
@@ -4338,8 +4381,8 @@ def _scheduleHalfDisjointHalf(
                 groups.append(([g for g in eligible if low <= g <= high
                                 and g not in nearFence], count))
                 groupCells.append(c)
-    plan = _halfMemoryPlan(eligible, groups, len(bundles),
-                           evenLoads=crossCellReads)
+    plan = None if ring else _halfMemoryPlan(eligible, groups, len(bundles),
+                                             evenLoads=crossCellReads)
 
     def placeReads(c, targets):
         """One cell's read path from its floor on, inside its own cell
@@ -4372,13 +4415,69 @@ def _scheduleHalfDisjointHalf(
         rules.earliestWaitCntPos = savedWait
         placer.window = None
 
+    def ringTargets():
+        """Read targets per cell and load targets from RingPlacement, and each
+        ds_read's (cell, deadline)."""
+        loadGapList = [g for g in range(firstInterval, tailFrom(firstInterval))
+                       if memoryGap(g) and not shadowReads[g]]
+        loadTargets = ringLoadTargets(loadGapList, len(bundles))
+        operands = [set().union(*(_vgprIndices(getattr(m, name, None))
+                                  for name in ("a", "b", "mxsa", "mxsb")))
+                    for m in mfmas]
+        blocked = set(seams) | {
+            gap for fence in seams
+            for gap in range(fence - minGapDsReadToWait + 1, fence)}
+        reads = []
+        for c in range(len(cells)):
+            for (_mid, inst), floor in zip(readPaths[c], floors[c]):
+                if not _isDsRead(inst):
+                    continue
+                dest = set(_vgprIndices(_dsReadDstAddr(inst)[0]))
+                floor = max(floor, -(-rules.deferLiveSourceWrite(placer, 0, inst) // spi))
+                deadline = ends[c] - 1 - minGapDsReadToWait
+                consumer = next((j for j in range(starts[c], len(mfmas))
+                                 if dest & operands[j]), None)
+                if consumer is not None:
+                    deadline = min(deadline, consumer - RING_READ_LEAD_MFMAS)
+                reads.append(RingRead(floor, deadline, c, (inst.comment or "ds_read").split(";")[0]))
+        half = RingHalf(
+            gaps=intervals, barrierGap=firstInterval, loadGaps=loadGapList,
+            loadCount=len(bundles), reads=reads, readBlocked=blocked,
+            reserved={g: n for g, n in enumerate(shadowReads) if n})
+        ringReadTargets(half, loadTargets)
+        targets = {}
+        for c in range(len(cells)):
+            # EDF may swap two reads of one chain; their windows nest, so the
+            # chain takes its gaps in order.
+            mine = [read for read in reads if read.chain == c]
+            for read, gap in zip(mine, sorted(read.target for read in mine)):
+                read.target = gap
+                targets.setdefault(c, []).append(gap)
+        return targets, loadTargets, [(read.chain, read.deadline, read.name) for read in reads]
+
     readTargets = {}
-    if plan is not None:
+    if ring:
+        readTargets, ringLoads, ringDeadlines = ringTargets()
+    elif plan is not None:
         for c, targets in zip(groupCells, plan[0]):
             readTargets.setdefault(c, []).extend(targets)
     for c in range(len(cells)):
         if readPaths[c]:
-            placeReads(c, readTargets.get(c) if plan is not None else None)
+            placeReads(c, readTargets.get(c) if plan is not None or ring else None)
+    if ring:
+        readIds = {id(inst) for c in range(len(cells)) for _, inst in readPaths[c]}
+        placedGaps = {c: [] for c in range(len(cells))}
+        for p, slot in enumerate(placer._placed):
+            for mid, inst in slot:
+                if _isDsRead(inst) and id(inst) in readIds:
+                    placedGaps[cellOf[mid]].append(p // spi)
+        landed = [gap for c in range(len(cells)) for gap in placedGaps[c]]
+        for (_c, deadline, name), gap in zip(ringDeadlines, landed):
+            if gap > deadline:
+                raise RingInfeasible(f"{name}: placed at gap {gap} past its deadline {deadline}")
+        if firstInterval not in landed:
+            raise RingInfeasible(
+                f"no ds_read landed in the barrier gap of the half at MFMA {mfmaBase}")
 
     tailEnd = tailFrom(firstInterval)
 
@@ -4576,13 +4675,19 @@ def _scheduleHalfDisjointHalf(
     # The first attempt that keeps the rules wins. When none does, the
     # half is too dense to place jointly; its cells keep their own
     # schedules, which measure faster there than any joint packing.
+    if ring:
+        attempt(ringLoads, 0, True)
+        if overfullIntervals() > before or longestDtlRun() > _MXFP8_MAX_DTL_RUN:
+            raise RingInfeasible("ring load targets overfill a gap")
+        attempts = []
     for targets, readLimit, capped in attempts:
         attempt(targets, readLimit, capped)
         if capped and overfullIntervals() <= before and (
                 readLimit is None or longestDtlRun() <= _MXFP8_MAX_DTL_RUN):
             break
     else:
-        return None
+        if not ring:
+            return None
     _attachComments(placer, anchors)
 
     sequence = [item for item in split[0][1]] + [(None, mfmas[0])]
@@ -4619,7 +4724,9 @@ def _scheduleHalfDisjointHalf(
             mid = ("mfma", id(inst))
             cellOf[mid] = mfmaOf[id(inst)]
         keyed.append((mid, inst))
-    if not _halfCellOrderSafe(keyed, cellOf, orders, modules):
+    if not _halfCellOrderSafe(keyed, cellOf, orders, modules, swapsCrossFences=ring):
+        if ring:
+            raise RingInfeasible("ring placement reorders a cross-cell dependency")
         return None
     if crossCellReads:
         _relaxCrossedFences(
@@ -4758,7 +4865,7 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
 def instructionScheduleHalf(
         emittedLists, minGapDsReadToWait=_MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
         earliestWriteShadow=None, mfmaBase: int = 0, scaleShadows=None,
-        cellComments=()):
+        cellComments=(), ring: bool = False):
     """Schedule the partition cells of one half-disjoint MXFP8 half.
 
     emittedLists holds each cell's emitted modules in issue order and
@@ -4768,6 +4875,8 @@ def instructionScheduleHalf(
     as instructionSchedule would; the schedule estimated to run closest
     to the MFMA cadence (_issueExcess) wins.
     The C0-entry scale refreshes the winner reserves leave ``scaleShadows``.
+    With ring only the joint schedule with cross-cell reads is built, on the
+    RingPlacement targets; a half it does not fit raises RingInfeasible.
     """
     cells = []
     for emitted in emittedLists:
@@ -4791,7 +4900,16 @@ def instructionScheduleHalf(
             return None
         return _scheduleHalfDisjointHalf(
             cells, minGapDsReadToWait, earliestWriteShadow, mfmaBase,
-            shadows, cellComments, crossCellReads)
+            shadows, cellComments, crossCellReads, ring)
+
+    if ring:
+        shadows = None if scaleShadows is None else list(scaleShadows)
+        scheduled = joint(True, shadows)
+        if scheduled is None:
+            raise RingInfeasible("half does not fit the joint scheme")
+        if scaleShadows is not None:
+            scaleShadows[:] = shadows
+        return scheduled
 
     def alone(shadows):
         result = Module()
@@ -4990,6 +5108,50 @@ def relaxWaitGrForOutstandingStores(module):
 
 BALANCED_CURRENT_CELL_NOTE = "balanced current-cell"
 _BALANCED_READ_LEAD_MFMAS = 4
+
+
+def insertRingConsumerWaits(module) -> int:
+    """Retire every ds_read of a ring body before the first MFMA that reads its destination.
+
+    The ring placement (TENSILE_MXFP8_RING) lets a read feed an MFMA of its own half
+    with no fence between, as the balanced current-cell reads do. Walking the body in
+    issue order, an MFMA that reads a ds_read still in flight gets an lgkm wait right
+    ahead of it, counting the LDS and scalar ops issued after that read, or 0 when a
+    scalar load is among them. Reads in flight at the body's top are left to its own
+    waits. Returns the number of waits added.
+    """
+    items = list(module.flatitems())
+    pending = []  # [inst, dest spans, ops issued after, scalar issued after]
+    out, added = [], 0
+    for inst in items:
+        if _isWaitCnt(inst) and (getattr(inst, "waitAll", False)
+                                 or inst.dscnt >= 0 or inst.kmcnt >= 0):
+            pending = [p for p in pending if not (not p[3] and _lgkmCovers(inst, p[2]))]
+            if _isFullLgkmDrain(inst):
+                pending = []
+        elif _isMfma(inst):
+            needed = [p for p in pending if _readsSpans(inst, p[1])]
+            if needed:
+                count = 0 if any(p[3] for p in needed) else min(
+                    min(p[2] for p in needed), _MAX_LGKM_COUNT)
+                wait = SWaitCnt(dscnt=count, comment="Wait for ring LR")
+                out.append(wait)
+                added += 1
+                pending = [p for p in pending if not (not p[3] and _lgkmCovers(wait, p[2]))]
+                if count == 0:
+                    pending = []
+        elif _incrementsLgkm(inst):
+            scalar = isinstance(inst, SMemLoadInstruction)
+            for p in pending:
+                p[2] += 1
+                p[3] = p[3] or scalar
+            if _isDsRead(inst):
+                pending.append([inst, [span for role, span in _instructionRegisterSpans(inst)
+                                       if role == "dst"], 0, False])
+        out.append(inst)
+    if added:
+        module.setItems(out)
+    return added
 
 
 def _lgkmCovers(wait, issuedAfter) -> bool:

@@ -7767,3 +7767,237 @@ class TestHalfDisjointClumping:
             scheduled = self._scheduledFirstHalf(comments)
             return [[inst.comment for inst in g] for g in self._gaps(scheduled)]
         assert code(True) == code(False)
+
+
+class TestRingPlacement:
+    """TENSILE_MXFP8_RING: ring load and read targets for one half-disjoint half."""
+
+    @staticmethod
+    def _sol102C0H1():
+        """C0H1 of sol 102 (MT256x320, 8x10 tiles, n-major 4/4 x 6/4) as the generator
+        builds it: P0 has 24 MFMAs and P1 16, P1's fence is gap 23."""
+        from tensilelite.Components.Subtile.RingPlacement import RingHalf, RingRead
+        reads = (
+            [RingRead(0, 12, 0, f"A3.{i}") for i in range(2)]
+            + [RingRead(0, 18, 0, f"B6.{i}") for i in range(2)]
+            + [RingRead(0, 19, 0, f"B{t}.{i}") for t in (7, 8, 9) for i in range(2)]
+            + [RingRead(0, 19, 0, "SA4"), RingRead(4, 19, 0, "SA6"),
+               RingRead(2, 18, 0, "SB6"), RingRead(4, 19, 0, "SB8")]
+            + [RingRead(0, 35, 1, f"A{t}.{i}") for t in range(4, 8) for i in range(2)])
+        return RingHalf(
+            gaps=39, barrierGap=0, loadGaps=[g for g in range(1, 38) if g != 23],
+            loadCount=9, reads=reads, readBlocked={20, 21, 22, 23})
+
+    @staticmethod
+    def _sol102C1H2():
+        """C1H2 of sol 102: P3's reads of the next B tiles wait for P2's last reader of
+        each, and five gaps hold a C0-entry scale refresh."""
+        from tensilelite.Components.Subtile.RingPlacement import RingHalf, RingRead
+        reads = ([RingRead(0, 35, 1, f"A{t}.{i}") for t in range(3) for i in range(2)]
+                 + [RingRead(19 + t, 35, 1, f"B{t}.{i}") for t in range(6) for i in range(2)])
+        loadGaps = [2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                    24, 25, 26, 28, 30, 32, 33, 34, 35, 36, 37, 38]
+        return RingHalf(
+            gaps=39, barrierGap=0, loadGaps=loadGaps, loadCount=9, reads=reads,
+            readBlocked={20, 21, 22, 23}, reserved={1: 1, 7: 1, 27: 1, 29: 1, 31: 1})
+
+    @staticmethod
+    def _place(half):
+        from tensilelite.Components.Subtile.RingPlacement import (
+            ringLoadTargets, ringReadTargets)
+        loads = ringLoadTargets(half.loadGaps, half.loadCount)
+        ringReadTargets(half, loads)
+        return loads, half.reads
+
+    @pytest.mark.parametrize("build", ["_sol102C0H1", "_sol102C1H2"])
+    def test_sol102_half_places_every_load_and_read(self, build):
+        from collections import Counter
+        half = getattr(self, build)()
+        loads, reads = self._place(half)
+        assert len(loads) == 9 and len(set(loads)) == 9
+        assert min(b - a for a, b in zip(loads, loads[1:])) >= 2
+        assert all(read.floor <= read.target <= read.deadline for read in reads)
+        assert not {read.target for read in reads} & (set(loads) | half.readBlocked)
+        perGap = Counter(read.target for read in reads) + Counter(half.reserved)
+        assert max(perGap.values()) <= 2
+        assert any(read.target == half.barrierGap for read in reads)
+
+    def test_sol102_c0h1_reads_lead_their_consumers(self):
+        _loads, reads = self._place(self._sol102C0H1())
+        where = {read.name: read.target for read in reads}
+        assert sorted(where[f"A3.{i}"] for i in range(2))[0] == 0
+        assert max(where[f"A3.{i}"] for i in range(2)) <= 18 - 6
+        assert max(where[f"B6.{i}"] for i in range(2)) <= 24 - 6
+        assert all(where[f"A{t}.{i}"] <= 35 for t in range(4, 8) for i in range(2))
+
+    def test_loads_take_the_middle_of_equal_shares(self):
+        from tensilelite.Components.Subtile.RingPlacement import ringLoadTargets
+        assert ringLoadTargets(list(range(1, 37)), 9) == [3, 7, 11, 15, 19, 23, 27, 31, 35]
+        assert ringLoadTargets([1, 2, 3], 0) == []
+
+    def test_reads_of_one_chain_keep_their_order(self):
+        from tensilelite.Components.Subtile.RingPlacement import RingHalf, RingRead
+        half = RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0, reads=[
+            RingRead(0, 9, 0, "first"), RingRead(0, 2, 0, "second"),
+            RingRead(5, 9, 1, "late"), RingRead(0, 9, 1, "after late")])
+        _loads, reads = self._place(half)
+        # A chain's later read inherits the earlier read's floor, an earlier
+        # read the later read's deadline.
+        assert [(r.floor, r.deadline) for r in reads] == [(0, 2), (0, 2), (5, 9), (5, 9)]
+        assert reads[0].target <= reads[1].target <= 2
+        assert 5 <= reads[2].target <= reads[3].target
+
+    def test_empty_or_full_window_raises(self):
+        from tensilelite.Components.Subtile.RingPlacement import (
+            RingHalf, RingInfeasible, RingRead, ringLoadTargets, ringReadTargets)
+        with pytest.raises(RingInfeasible, match="late"):
+            ringReadTargets(RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0, reads=[
+                RingRead(0, 9, 0, "head"), RingRead(6, 4, 0, "late")]), [])
+        with pytest.raises(RingInfeasible, match="full"):
+            ringReadTargets(RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0, reads=[
+                RingRead(0, 1, c, f"r{c}") for c in range(5)]), [])
+        with pytest.raises(RingInfeasible, match="barrier gap"):
+            ringReadTargets(RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0, reads=[
+                RingRead(1, 9, 0, "r")]), [])
+        with pytest.raises(RingInfeasible):
+            ringLoadTargets([1, 2], 3)
+
+
+class TestRingHalfSchedule:
+    """_scheduleHalfDisjointHalf(ring=True) on a sol-102-shaped half: P0 has 24 MFMAs,
+    P1 16; P0 reads A3 for its own MFMAs 18-23 and B6-B9 for P1, P1 reads A4-A7 for the
+    next half; nine loads."""
+
+    _gfx950 = TestHalfDisjointHalf._gfx950
+    _opener = staticmethod(TestHalfDisjointCell._opener)
+    _load = staticmethod(TestHalfDisjointCell._load)
+    _gaps = staticmethod(TestHalfDisjointCell._gaps)
+    _cell = staticmethod(TestHalfDisjointHalf._cell)
+    _fence = staticmethod(TestHalfDisjointHalf._fence)
+    _marker = staticmethod(TestHalfDisjointHalf._marker)
+    _read_into = staticmethod(TestHalfDisjointHalf._read_into)
+
+    @staticmethod
+    def _mfma(a, b, comment):
+        from rocisa.container import vgpr
+        from rocisa.enum import InstType
+        from rocisa.instruction import MXMFMAInstruction
+        return MXMFMAInstruction(
+            instType=InstType.INST_F32, accType=InstType.INST_F32,
+            variant=[16, 16, 128], acc=vgpr(0, 4), a=vgpr(a, 8), b=vgpr(b, 8),
+            mxsa=vgpr(17), mxsb=vgpr(246), comment=comment)
+
+    def _cells(self, nextIntoLiveB=False):
+        a3 = [(LRPlacement(tensor="A", mtIteration=0, tiles=MFMATileRange(3, 4, 0, 1),
+                           subIterK_slot=0, partition=0, targetPartition=0),
+               [self._read_into(108 + 4 * i, f"A3.{i}")]) for i in range(2)]
+        b = [(LRPlacement(tensor="B", mtIteration=0, tiles=MFMATileRange(0, 1, t, t + 1),
+                          subIterK_slot=0, partition=0, targetPartition=1),
+              [self._read_into(196 + 8 * (t - 6) + 4 * i, f"B{t}.{i}")])
+             for t in range(6, 10) for i in range(2)]
+        # With nextIntoLiveB the next-half reads land on the B registers P0 reads.
+        base = 148 if nextIntoLiveB else 116
+        a = [(LRPlacement(tensor="A", mtIteration=0, tiles=MFMATileRange(t, t + 1, 0, 1),
+                          subIterK_slot=0, partition=1, targetPartition=2),
+              [self._read_into(base + 8 * (t - 4) + 4 * i, f"A{t}.{i}")])
+             for t in range(4, 8) for i in range(2)]
+        first = self._cell(
+            [self._opener() + a3 + b, [self._load(t) for t in range(5)]],
+            [self._mfma(108 if n >= 18 else 84, 148, f"M{n}") for n in range(24)])
+        second = self._cell(
+            [a, [self._load(8 + t) for t in range(4)]],
+            [self._mfma(84, 196, f"M{24 + n}") for n in range(16)],
+            preMfma=[self._fence("fence 1")])
+        return [first, second]
+
+    def _schedule(self, cells, ring=True):
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            _scheduleHalfDisjointHalf)
+        return _scheduleHalfDisjointHalf(
+            cells, 4, {}, 0, None, [self._marker("cell 1")], True, ring)
+
+    def _where(self, scheduled):
+        _prefix, gaps = self._gaps(scheduled)
+        return gaps, {c: i for i, gap in enumerate(gaps) for c in gap}
+
+    def test_ring_places_nine_loads_and_eighteen_reads(self):
+        gaps, where = self._where(self._schedule(self._cells()))
+        reads = [n for n in where if n[:1] in "AB" and "." in n and "MT" not in n]
+        loads = sorted(where[n] for n in where if n.startswith("A MT=n+2"))
+        assert len(reads) == 18 and len(loads) == 9
+        assert min(b - a for a, b in zip(loads, loads[1:])) >= 2
+        readGaps = [where[n] for n in reads]
+        assert not set(readGaps) & set(loads)
+        assert max(readGaps.count(g) for g in readGaps) <= 2
+        # The barrier gap holds a read, behind the barrier.
+        assert where["barrier"] == 0
+        assert any(where[n] == 0 for n in reads)
+        assert gaps[0].index("barrier") < min(
+            gaps[0].index(n) for n in reads if where[n] == 0)
+        assert max(where["A3.0"], where["A3.1"]) <= 18 - 6
+        assert max(where["B6.0"], where["B6.1"]) <= 24 - 6
+        assert not set(readGaps) & {20, 21, 22}
+        assert [c for c in gaps[23] if c] == ["fence 1"]
+
+    def test_ring_reads_wait_for_the_last_reader_of_their_registers(self):
+        _gaps, where = self._where(self._schedule(self._cells(nextIntoLiveB=True)))
+        # P0's MFMA 23 is the last to read v148; gap g follows MFMA g.
+        assert min(where[f"A{t}.{i}"] for t in range(4, 8) for i in range(2)) >= 24
+
+    def test_flag_off_keeps_todays_schedule(self):
+        def text(ring):
+            return str(self._schedule(self._cells(), ring=ring))
+        assert text(False) == text(False)
+        assert text(False) != text(True)
+
+
+class TestRingGate:
+    """The ring placement applies to sol 102's geometry only."""
+
+    @staticmethod
+    def _sched(ring=True, **kw):
+        s = LogicalScheduler(TestHalfDisjointLds._cfg(8, 10, grB=1, grSA=8, size_n=6, **kw))
+        s.config.ringPlacement = ring
+        s.build(stop_after=Pass.LR)
+        return s
+
+    def test_sol102_geometry_applies(self):
+        assert self._sched().ringSkipReason() is None
+        assert self._sched().ringPlacement
+
+    def test_flag_off_or_other_geometry_skips(self):
+        assert self._sched(ring=False).ringSkipReason() == "off"
+        assert self._sched(half_disjoint=False).ringSkipReason() == "not half-disjoint"
+        s = LogicalScheduler(TestHalfDisjointLds._cfg(8, 8, grB=1, grSA=8))
+        s.config.ringPlacement = True
+        s.build(stop_after=Pass.LR)
+        assert s.ringSkipReason().startswith("geometry")
+
+
+class TestInsertRingConsumerWaits:
+    """A ring body retires each ds_read before the first MFMA that reads its destination."""
+
+    def test_wait_counts_the_ops_behind_the_read(self):
+        mfma, read, drain, _SBarrier, SWaitCnt = TestDeferBalancedCurrentCellWait._parts()
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            insertRingConsumerWaits)
+        module = Module("MAINLOOP")
+        for inst in [drain("top"), mfma(20, "M0"), read(108, 2, "A3 low"),
+                     read(200, 7, "next"), mfma(20, "M1"), mfma(108, "M2"),
+                     mfma(108, "M3")]:
+            module.add(inst)
+        assert insertRingConsumerWaits(module) == 1
+        assert _labels(module) == ["top", "M0", "A3 low", "next", "M1",
+                                   "Wait for ring LR", "M2", "M3"]
+        wait = [x for x in module.flatitems() if x.comment == "Wait for ring LR"]
+        assert wait[0].dscnt == 1
+
+    def test_existing_wait_covers_the_read(self):
+        mfma, read, drain, _SBarrier, SWaitCnt = TestDeferBalancedCurrentCellWait._parts()
+        from tensilelite.Components.Subtile.InstructionScheduler import (
+            insertRingConsumerWaits)
+        module = Module("MAINLOOP")
+        for inst in [read(108, 2, "A3 low"), read(200, 7, "next"),
+                     SWaitCnt(dscnt=1, comment="fence"), mfma(108, "M0")]:
+            module.add(inst)
+        assert insertRingConsumerWaits(module) == 0

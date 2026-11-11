@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import math
+import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
@@ -1568,6 +1569,8 @@ def mainLoop(writer, kernel):
           uniformPgrEpoch=(schedulerPartitionPrefetch and schedulerPgr == 2),
           uniformEpochVmemCohortSize=5,
           halfDisjointLds=schedulerPartitionPrefetch,
+          ringPlacement=(schedulerPartitionPrefetch
+                         and os.environ.get("TENSILE_MXFP8_RING", "0") == "1"),
           grLoadsPerAtom=grLoadsPerAtom,
           partitionOrder=schedulerPartitionOrder,
           grPlacement=grPlacement,

@@ -206,6 +206,8 @@ class MFMATileRange:
 
 BALANCE_MIN_LEAD_MFMAS = 6
 BALANCE_MIN_HALF_MFMAS = 28
+# Partition sizes (M, N) the ring placement applies to (SchedulerConfig.ringPlacement).
+RING_GEOMETRIES = frozenset({((4, 4), (6, 4))})
 
 
 def planHalfDisjointBalance(firstHalfMfmas, secondHalfMfmas, wrapTiles, ownTiles,
@@ -335,6 +337,9 @@ class SchedulerConfig:
     # when every A/B tile is read in a single half; any other schedule keeps
     # the uniform epoch cohorts.
     halfDisjointLds: bool = False
+    # TENSILE_MXFP8_RING=1: place the half-disjoint main loop's loads and reads by
+    # the ring targets (RingPlacement), on the geometries in RING_GEOMETRIES only.
+    ringPlacement: bool = False
     # Buffer loads one GR atom issues, per tensor.  A tensor missing here
     # issues one load per atom.
     grLoadsPerAtom: Dict[str, int] = field(default_factory=dict)
@@ -1035,6 +1040,32 @@ class LogicalScheduler:
     @property
     def halfDisjoint(self) -> bool:
         return self._halfLoadHalf is not None
+
+    @property
+    def ringPlacement(self) -> bool:
+        """Whether the main loop takes the ring targets (ringSkipReason is None)."""
+        return self.ringSkipReason() is None
+
+    def ringSkipReason(self) -> Optional[str]:
+        """Why the ring placement does not apply, or None when it does.
+
+        Only geometries the offline ring model places with even per-half load and
+        read counts, no infeasible item and a barrier-gap read in both bodies are
+        taken: today the 8x10 tile grid split 4/4 x 6/4 (MT256x320, sol 102).
+        """
+        cfg = self.config
+        if not cfg.ringPlacement:
+            return "off"
+        if not self.halfDisjoint:
+            return "not half-disjoint"
+        if cfg.partitionOrder != "n-major":
+            return "m-major"
+        if not (cfg.uniformPgrEpoch and cfg.dualPeriodScale):
+            return "not dual-period"
+        geometry = (tuple(cfg.partitionSizesM), tuple(cfg.partitionSizesN))
+        if geometry not in RING_GEOMETRIES:
+            return f"geometry {geometry}"
+        return None
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -5402,6 +5433,7 @@ class LogicalScheduler:
             dropEntryScaleReads,
             guardExitOverwriteReread,
             insertPrefetchedScaleCopies,
+            insertRingConsumerWaits,
             instructionSchedule,
             instructionScheduleHalf,
             issueSaluFirst,
@@ -5480,6 +5512,14 @@ class LogicalScheduler:
         # than one partition together, so its loads and reads share the
         # half's MFMA gaps.
         half_cells = {}
+        ring = False
+        if schedule and label.startswith("MAINLOOP") and self.config.ringPlacement:
+            reason = self.ringSkipReason()
+            ring = reason is None
+            if label == "MAINLOOP_C0":
+                print(f"[mxfp8-ring] {'applied' if ring else 'skipped: ' + reason} "
+                      f"tiles {self.config.numMFMATilesM}x{self.config.numMFMATilesN} "
+                      f"partitions {self.config.partitionSizesM}x{self.config.partitionSizesN}")
         if (schedule and self.halfDisjoint and label.startswith("MAINLOOP")
                 and injectAfterPartition is None and injectBeforeSlot is None):
             numP = len(emitted_3d)
@@ -5539,7 +5579,8 @@ class LogicalScheduler:
                             mfmaBase=body_mfma_base,
                             scaleShadows=(
                                 shadow_entries if pi in shadow_tail else None),
-                            cellComments=markers.items()))
+                            cellComments=markers.items(),
+                            ring=ring))
                         body_mfma_base += sum(
                             len(em.instructions)
                             for group_list in group_lists
@@ -5730,12 +5771,15 @@ class LogicalScheduler:
         if label.startswith("NGLL") or label.startswith("NLL"):
             module = guardExitOverwriteReread(
                 module, getattr(self, "_earlyOverwriteVgprs", ()))
+        if ring:
+            insertRingConsumerWaits(module)
         if (label.startswith("MAINLOOP")
                 and self.config.uniformPgrEpoch
                 and self.config.dualPeriodScale):
             dropDominatedLgkmWaits(module)
         if self.halfDisjoint and label.startswith("MAINLOOP"):
-            deferBalancedCurrentCellWait(module)
+            if not ring:
+                deferBalancedCurrentCellWait(module)
             issueSaluFirst(module)
             keepValuBehindLeader(module)
         return module
