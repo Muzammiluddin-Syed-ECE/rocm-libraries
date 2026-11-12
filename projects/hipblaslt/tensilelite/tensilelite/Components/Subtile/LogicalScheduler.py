@@ -5249,6 +5249,35 @@ class LogicalScheduler:
                 pg={}
                 for p,g in capturePlan.items(): pg[id(g)]=pg.get(id(g),0)+1
                 __import__("sys").stderr.write(f"[WEAVE_DIAG] placed={len(capturePlan)} distinct_gaps={len(pg)} fill={sorted(pg.values(),reverse=True)}\n")
+            if __import__("os").environ.get("WEAVE_PLACE"):
+                # Ground-truth placement dump for the forward-allocator recreate experiment.
+                # Per producer (in allInsts order): its index, its consumer (store read)
+                # position, and the chosen gap's pairIdx. Shows whether the current solver's
+                # placement is reproducible by a deterministic forward interleave.
+                _sys = __import__("sys")
+                _instIdx = {id(_p): _i for _i, _p in enumerate(allInsts)}
+                def _pairOf(_g):
+                    _nm = getattr(_g, "name", "") or ""
+                    import re as _re
+                    _m = _re.search(r"pair(\d+)", _nm)
+                    return int(_m.group(1)) if _m else -1
+                _rows = []
+                for _p in qualifying:
+                    _g = capturePlan.get(id(_p))
+                    if _g is None:
+                        continue
+                    _rows.append((_instIdx.get(id(_p), -1),
+                                  consumers.get(id(_p), -1),
+                                  _pairOf(_g)))
+                # does placement follow allInsts order? count inversions in (idx -> pair)
+                _byIdx = sorted(_rows)
+                _pairSeq = [r[2] for r in _byIdx]
+                _inv = sum(1 for _i in range(1, len(_pairSeq))
+                           if _pairSeq[_i] < _pairSeq[_i-1])
+                _sys.stderr.write(
+                    f"[WEAVE_PLACE] placed={len(_rows)} pairs_used={len(set(_pairSeq))} "
+                    f"order_inversions={_inv} "
+                    f"idx->pair[:24]={_pairSeq[:24]}\n")
             if __import__("os").environ.get("WEAVE_SUPPLY"):
                 # Retirement-timeline supply probe (read-only; no codegen change).
                 # Proves/refutes the Repack co-schedule's load-bearing assumption:
