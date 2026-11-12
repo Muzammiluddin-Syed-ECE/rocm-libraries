@@ -4868,6 +4868,8 @@ class LogicalScheduler:
                 # mfma, mfma, step-2). Spread the convert VALU into those MFMA
                 # issue shadows (2 v_cvt_pk per gap), matching main-loop ds_read.
                 self._interleaveStoreConvertIntoGapMfmas(storeModule)
+                if __import__("os").environ.get("WEAVE_FINALPROBE"):
+                    self._finalProbeCaptures = writer.states.subtileWeaveCaptureInstances
         finally:
             writer.states.subtileWeaveMfmaGroups = savedGroups
             writer.states.subtileWeaveMfmaGroupsMaster = savedMaster
@@ -4899,6 +4901,49 @@ class LogicalScheduler:
             fusedLoopModule = self._weaveStoreInitIntoLoop(fusedLoopModule, hoistUnits,
                                                            f"{label}_FUSED")
             writer.states.subtileHoistedStoreInit = None
+        if __import__("os").environ.get("WEAVE_FINALPROBE") and getattr(self, "_finalProbeCaptures", None):
+            # Feasibility probe for the final-coordinate lease: does _emitLoop preserve object
+            # identity (can we map capture pair reads into fusedLoopModule), and where do v72's
+            # reads + the coalesces land in the FINAL (staged, post-_emitLoop) order?
+            import sys as _ps
+            _ff = list(fusedLoopModule.flatitems())
+            _pos = {id(it): i for i, it in enumerate(_ff)}
+            _trueLast = {}
+            for it in _ff:
+                p = _pos.get(id(it))
+                for c in self._plsinOperands(it, self._PLSIN_MFMA_SOURCES):
+                    for k in (self._plsinRegisterKeys(c) or ()):
+                        if k is not None and len(k) == 3 and k[1] is None:
+                            _trueLast[k[2]] = max(_trueLast.get(k[2], -1), p)
+            for _cap in self._finalProbeCaptures:
+                _found = _tot = 0
+                _drains = []
+                for pr in _cap.get("pairs", []):
+                    rps = []
+                    for ri, s in pr.get("reads", []):
+                        _tot += 1
+                        if id(ri) in _pos:
+                            _found += 1
+                            rps.append(_pos[id(ri)])
+                    if rps:
+                        _drains.append(min(rps))
+                # content-based coalesce positions: find cvt-gap modules by name (pairN=weavePairB)
+                import re as _re
+                _coalPos = {}
+                for it in _ff:
+                    nm = getattr(it, "name", "") or ""
+                    m = _re.search(r"foldcvt_pair(\d+)", nm)
+                    if m:
+                        _coalPos[int(m.group(1))] = _pos.get(id(it))
+                _coalMax = max((p for p in _coalPos.values() if p is not None), default=-1)
+                _coalMin = min((p for p in _coalPos.values() if p is not None), default=-1)
+                _ps.stderr.write(
+                    f"[WEAVE_FINALPROBE] flat={len(_ff)} reads_found={_found}/{_tot} "
+                    f"trueLast72={_trueLast.get(72)} trueLast76={_trueLast.get(76)} "
+                    f"maxpos={max(_trueLast.values()) if _trueLast else 0} nOperandRegs={len(_trueLast)} "
+                    f"cvtGaps={len(_coalPos)} coalPos(min,max)=({_coalMin},{_coalMax}) "
+                    f"deadBeforeFirstCoal={sum(1 for v in _trueLast.values() if v<_coalMin) if _coalMin>=0 else 0}\n")
+            self._finalProbeCaptures = None
         module.add(fusedLoopModule)
         if storeModule is not None:
             module.add(storeModule)
