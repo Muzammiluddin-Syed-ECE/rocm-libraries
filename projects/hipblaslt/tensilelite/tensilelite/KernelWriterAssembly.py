@@ -16209,6 +16209,26 @@ class KernelWriterAssembly(KernelWriter):
         if getattr(_vt.regList, "is_vgpr", False):
           for _idx in _vt.regList.indices:
             _protected.add(_idx)
+    # PROTOTYPE (weave distribution, correct version): dedicated blend-output + batchB-pack quads from
+    # GENUINELY-free registers, allocated BEFORE the operand lend below adds the K=0 holes to the pool.
+    # At this point the operand tiles are still checked out, so checkOutAligned draws from real headroom
+    # (above the high-water), NOT from an operand hole the weave re-makes live -- so the blend/pack do
+    # not alias any woven terminal-MFMA operand, and the weave guard permits the later gaps. Costs +8
+    # VGPRs (overflows MT256x256 at 249/256 -> falls back to the ValuC-reuse cluster; fits on roomier
+    # tiles). This is the correct kernel to MEASURE whether the distributed weave is worth anything;
+    # the zero-cost version is the Repack co-schedule (see proposal).
+    self.states.subtileCoalesceDedStoreData = -1
+    self.states.subtileCoalesceDedPack = -1
+    if self.states.subtileFusedLendVgprs:   # weave-with-lend path
+      try:
+        self.states.subtileCoalesceDedStoreData = self.vgprPool.checkOutAligned(4, 2, tag="coalesceDedStoreData", preventOverflow=True)
+        self.states.subtileCoalesceDedPack = self.vgprPool.checkOutAligned(4, 2, tag="coalesceDedPack", preventOverflow=True)
+      except Exception:
+        # +8 does not fit (saturated tile): release any partial grab, fall back to ValuC reuse.
+        if self.states.subtileCoalesceDedStoreData >= 0:
+          self.vgprPool.checkIn(self.states.subtileCoalesceDedStoreData)
+        self.states.subtileCoalesceDedStoreData = -1
+        self.states.subtileCoalesceDedPack = -1
     lentVgprs = []
     for _base, _size in (self.states.subtileFusedLendVgprs or []):
       if any((_base + _k) in _protected for _k in range(_size)):
@@ -16601,6 +16621,11 @@ class KernelWriterAssembly(KernelWriter):
     # the end-of-kernel deallocVgprTiles observe the exact original pool state.
     for _base in reversed(lentVgprs):
       self.vgprPool.removeFromCheckOut(_base)
+    # PROTOTYPE: release the dedicated blend/pack quads.
+    if getattr(self.states, "subtileCoalesceDedPack", -1) >= 0:
+      self.vgprPool.checkIn(self.states.subtileCoalesceDedPack)
+    if getattr(self.states, "subtileCoalesceDedStoreData", -1) >= 0:
+      self.vgprPool.checkIn(self.states.subtileCoalesceDedStoreData)
 
     return module
 
@@ -18535,6 +18560,8 @@ class KernelWriterAssembly(KernelWriter):
     coalesceAllocated: bool = False   # coalesce cvt-block reserved? (gates the coalesce in GlobalWriteBatch)
     vgprVoff: int = -1            # per-store blended voffset (base vs base+64B by odd-lane mask)
     vgprBlendTmp: int = -1        # scratch for the quad_perm data/addr blend
+    vgprCoalesceStoreData: int = -1  # PROTOTYPE: dedicated blend-output quad (genuinely-free; weave distribution)
+    vgprCoalescePack2: int = -1      # PROTOTYPE: dedicated batchB-pack quad (genuinely-free; weave distribution)
     # (The blended store data and batchB's packed data reuse dead ValuC slots -- vCoalesceStoreData=
     # sumIdx1, vCoalescePack=sumIdx0 -- at zero VGPR cost; the terminal-MFMA clobber that threatened
     # that reuse under the weave is handled by the store-module clobber guard in
@@ -19370,6 +19397,8 @@ class KernelWriterAssembly(KernelWriter):
                                                coalesceAllocated=isSubtileCoalesce, \
                                                vgprVoff=(cvtVgpr+coalesceVoff) if isSubtileCoalesce else -1, \
                                                vgprBlendTmp=(cvtVgpr+coalesceBlend) if isSubtileCoalesce else -1, \
+                                               vgprCoalesceStoreData=getattr(self.states, "subtileCoalesceDedStoreData", -1) if isSubtileCoalesce else -1, \
+                                               vgprCoalescePack2=getattr(self.states, "subtileCoalesceDedPack", -1) if isSubtileCoalesce else -1, \
                                                coalesceMaskSgpr=coalesceMaskSgpr, \
                                                coalesceOddMaskSgpr=coalesceOddMaskSgpr)
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))

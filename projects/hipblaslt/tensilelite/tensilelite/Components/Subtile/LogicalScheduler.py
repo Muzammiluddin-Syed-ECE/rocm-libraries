@@ -5245,6 +5245,10 @@ class LogicalScheduler:
                     chosen = _lastQualifyingGap(storeGaps, readPos, producer)
                 if chosen is not None:
                     capturePlan[id(producer)] = chosen
+            if __import__("os").environ.get("WEAVE_DIAG"):
+                pg={}
+                for p,g in capturePlan.items(): pg[id(g)]=pg.get(id(g),0)+1
+                __import__("sys").stderr.write(f"[WEAVE_DIAG] placed={len(capturePlan)} distinct_gaps={len(pg)} fill={sorted(pg.values(),reverse=True)}\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}

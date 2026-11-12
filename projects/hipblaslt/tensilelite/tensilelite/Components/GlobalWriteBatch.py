@@ -4776,6 +4776,15 @@ class GlobalWriteBatchWriter:
       f"(sumIdx0={sumIdx0}, sumIdx1={sumIdx1})"
     vCoalescePack       = sumIdx0   # batchA sba0's 4 dead ValuC slots  -> batchB packed data
     vCoalesceStoreData  = sumIdx1   # batchA sba1's 4 dead ValuC slots  -> blended store src
+    # PROTOTYPE (weave distribution): on the weave path use dedicated genuinely-free quads for the
+    # blend output and batchB pack instead of the ValuC slots, so they don't alias the live woven
+    # terminal-MFMA operands (which collapses the weave to one cluster; see _planCapturedTerminalMfmas).
+    _dedSD = getattr(self.cvtVgprStruct, "vgprCoalesceStoreData", -1)
+    _dedPk = getattr(self.cvtVgprStruct, "vgprCoalescePack2", -1)
+    if foldCvtInterleave and _dedSD >= 0:
+      vCoalesceStoreData = _dedSD
+    if foldCvtInterleave and _dedPk >= 0:
+      vCoalescePack = _dedPk
     if foldCvtInterleave:
       phase1Mod = Module("16bitSubtileCoalescePhase1")
       phase2Mod = Module("16bitSubtileCoalescePhase2")
