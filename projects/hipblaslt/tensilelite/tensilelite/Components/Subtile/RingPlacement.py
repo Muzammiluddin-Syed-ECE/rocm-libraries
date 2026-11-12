@@ -14,7 +14,8 @@ direct-to-LDS load and every ds_read its half; this module picks the gap of each
   deadline (RING_READ_LEAD_MFMAS ahead of its first consumer, and ahead of the fence
   that drains its cell). Reads take a uniform grid of their own, kept off the load
   gaps, at most RING_READS_PER_GAP to a gap, earliest deadline first.
-- One ds_read always goes in the barrier gap.
+- One ds_read always goes in the barrier gap, and no second one: the waves leave the
+  barrier together, and a second read there delays the next MFMA in every wave.
 - Reads that can only fit on load targets keep them; the loads then spread over the
   load gaps left free.
 
@@ -28,6 +29,7 @@ from typing import Dict, List, Optional, Sequence, Set
 
 RING_READ_LEAD_MFMAS = 6
 RING_READS_PER_GAP = 2
+RING_BARRIER_GAP_READS = 1
 
 
 class RingInfeasible(Exception):
@@ -60,6 +62,9 @@ class RingHalf:
     readBlocked: Set[int] = field(default_factory=set)
     reserved: Dict[int, int] = field(default_factory=dict)
     barrierRead: bool = True
+
+    def readCap(self, g: int) -> int:
+        return RING_BARRIER_GAP_READS if g == self.barrierGap else RING_READS_PER_GAP
 
 
 def ringLoadTargets(loadGaps: Sequence[int], count: int) -> List[int]:
@@ -108,7 +113,7 @@ def _readGrid(half: RingHalf, loadSet: Set[int], last: int) -> Dict[int, int]:
 
     def room(g):
         return (first <= g <= last and g not in loadSet and g not in half.readBlocked
-                and grid.get(g, 0) + half.reserved.get(g, 0) < RING_READS_PER_GAP)
+                and grid.get(g, 0) + half.reserved.get(g, 0) < half.readCap(g))
 
     for k in range(n):
         target = first + k * span // n
@@ -142,7 +147,7 @@ def ringReadTargets(half: RingHalf, loadTargets: Sequence[int]) -> List[RingRead
             used[g] = used.get(g, 0) + 1
 
     def free(g):
-        return 0 if g in half.readBlocked else RING_READS_PER_GAP - count.get(g, 0)
+        return 0 if g in half.readBlocked else half.readCap(g) - count.get(g, 0)
 
     if half.barrierRead and reads:
         heads = {}
