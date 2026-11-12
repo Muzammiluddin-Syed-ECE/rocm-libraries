@@ -4785,35 +4785,46 @@ class GlobalWriteBatchWriter:
       vCoalesceStoreData = _dedSD
     if foldCvtInterleave and _dedPk >= 0:
       vCoalescePack = _dedPk
-    # WEAVE_FOLDLEASE (zero-cost pass 2): draw the blend-output (vCoalesceStoreData) and batchB
-    # pack (vCoalescePack) from two RETIRED operand VGPR quads the planner leased for THIS capture,
-    # instead of the +8 dedicated quads.  The leased quads are dead operands (no later woven MFMA
-    # reads them -- the store-clobber guard enforces it), so writing them clobbers nothing and the
-    # weave distributes at zero VGPR cost.  Selected per capture (one activation arm); the current
-    # capture is the last appended instance.  Correctness does NOT depend on retirement (the guard
-    # protects any operand choice); retirement only buys distribution.
+    # WEAVE_FOLDLEASE (zero-cost pass 2): per-COALESCE lease from TRUE post-schedule operand
+    # liveness (planner _buildFoldLeasePlans).  For this coalesce (keyed by weavePairB within the
+    # current capture = last appended instance) the planner either hands 2 genuinely-dead operand
+    # quads -- whose last terminal-MFMA read precedes this coalesce's drain, so writing them
+    # clobbers no live operand -- which become vCoalesceStoreData/vCoalescePack at zero VGPR cost;
+    # or marks the coalesce UNFOLD (its early drain has < 2 dead quads), in which case we emit the
+    # plain 2x woven paired store (no blend/pack reg) instead of the coalesced DPP store.
     _foldLease = None
     if foldCvtInterleave and weavePairB is not None:
       _leasePlans = getattr(self.parentWriter.states, "subtileCoalesceLeasePlan", None)
       if _leasePlans:
         _caps = self.parentWriter.states.subtileWeaveCaptureInstances
         _ci = (len(_caps) - 1) if _caps else -1
-        if 0 <= _ci < len(_leasePlans):
-          _foldLease = _leasePlans[_ci]
+        if 0 <= _ci < len(_leasePlans) and _leasePlans[_ci]:
+          _foldLease = _leasePlans[_ci].get(weavePairB)
     if _foldLease is not None and __import__("os").environ.get("WEAVE_FOLDLEASE_NOREG"):
-      # DIAGNOSTIC: run the two-pass but keep the ORIGINAL registers (no lease override).
-      # Isolates the two-pass re-emit mechanism from the leased-register correctness.
-      _foldLease = None
+      _foldLease = None   # DIAGNOSTIC: two-pass mechanism only, keep original registers
+    phase1ModComment = ""
+    if _foldLease is not None and _foldLease.get("unfold"):
+      # UNFOLD: this early coalesce has no 2 dead operand quads yet -> emit batchA and batchB as
+      # separate plain woven paired stores (each draws its pack from the dedicated ring; no blend
+      # clobber of any operand).  Preserves the weave for these pairs via their own gaps.
+      if not getattr(self.parentWriter.states, "_foldLeaseUnfoldDiagDone", False):
+        self.parentWriter.states._foldLeaseUnfoldDiagDone = True
+        __import__("sys").stderr.write(
+          f"[WEAVE_FOLDLEASE] emit: UNFOLD coalesce pair{weavePairB} -> 2x woven paired store\n")
+      module.addComment1(f"DPP coalesce UNFOLD (fold-lease early drain): pair{weavePairB}")
+      module.add(self._emit16bitSubtilePairedStoreWoven(
+        addrCalc, sumIdx0, sumIdx1, prefixOffset, weavePairB - 1, tt0,
+        blockIdxM=blockIdxM, blockIdxN=blockIdxN, forceSlc=forceSlc))
+      module.add(self._emit16bitSubtilePairedStoreWoven(
+        partnerAddrCalc, partnerSumIdx0, partnerSumIdx1, prefixOffset, weavePairB, tt0 + 2,
+        blockIdxM=blockIdxM + 2, blockIdxN=blockIdxN, forceSlc=forceSlc))
+      return module
     if _foldLease is not None:
       _lq0, _lq1 = _foldLease["q0"], _foldLease["q1"]
       # Hard invariants (silent-wrong-data territory): the two leased windows must be 2-aligned,
-      # mutually disjoint, and disjoint from batchA's own pack quad (vPack) -- otherwise the
-      # coalesce's own Phase1-pack -> Phase2-blend dataflow self-corrupts.
+      # mutually disjoint, disjoint from batchA's pack quad (vPack) and ALL store cvt scratch.
       assert _lq0 % 2 == 0 and _lq1 % 2 == 0 and abs(_lq1 - _lq0) >= COALESCE_VALUC_WINDOW, \
         f"fold-lease quads not 2-aligned/disjoint: q0={_lq0} q1={_lq1}"
-      # Each leased 4-reg window must not overlap batchA's pack quad nor ANY of the store's
-      # own cvt scratch (voffset/blend/perm-addr/lane-delta/addr-scratch/addrD).  An overlap
-      # would silently corrupt the coalesce's own dataflow -- fail loud instead.
       def _ovl(_base):
         return any(abs((_base) - (_other)) < COALESCE_VALUC_WINDOW
                    for _other in (vPack, vVoff, vBlend, vPermAddr, vLGDelta, vAddrScratch, addrDVgpr)
@@ -4828,10 +4839,8 @@ class GlobalWriteBatchWriter:
         self.parentWriter.states._foldLeaseDiagDone = True
         __import__("sys").stderr.write(
           f"[WEAVE_FOLDLEASE] emit: coalesce blend->v{_lq0}..{_lq0+3} pack->v{_lq1}..{_lq1+3} "
-          f"(vPack=v{vPack}, T={_foldLease['T']})\n")
+          f"(vPack=v{vPack})\n")
       phase1ModComment = f" [FOLDLEASE blend=v{_lq0} pack=v{_lq1}]"
-    else:
-      phase1ModComment = ""
     if foldCvtInterleave:
       phase1Mod = Module("16bitSubtileCoalescePhase1")
       phase2Mod = Module("16bitSubtileCoalescePhase2")

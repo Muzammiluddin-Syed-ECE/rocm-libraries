@@ -4837,10 +4837,10 @@ class LogicalScheduler:
                     fusedEmitted, writer.states.subtileWeaveCaptureInstances,
                     storeModule,
                     int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)),
-                    dryRun=_foldLeaseEnv)
+                    leaseDiscovery=_foldLeaseEnv)
                 if _foldLeaseEnv:
                     _leasePlans = getattr(self, "_foldLeasePlans", None)
-                    _nLeased = sum(1 for _l in (_leasePlans or []) if _l is not None)
+                    _nLeased = sum(1 for _l in (_leasePlans or []) if _l)
                     __import__("sys").stderr.write(
                         f"[WEAVE_FOLDLEASE] two-pass re-emit: {_nLeased}"
                         f"/{len(_leasePlans or [])} captures leased\n")
@@ -4861,7 +4861,7 @@ class LogicalScheduler:
                         fusedEmitted, writer.states.subtileWeaveCaptureInstances,
                         storeModule,
                         int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)),
-                        dryRun=False)
+                        leaseDiscovery=False)
                     writer.states.subtileCoalesceLeasePlan = None
                     writer.states.subtileCoalesceLeaseActive = False
                 # Planner appends the gap MFMAs after Phase1 (mfma, mfma, step-1,
@@ -5102,7 +5102,7 @@ class LogicalScheduler:
         return True
 
     def _planCapturedTerminalMfmas(self, emitted_3d, captures, storeModule,
-                                   requiredCycles, dryRun=False):
+                                   requiredCycles, leaseDiscovery=False):
         """Move only producers with a safe generated gap in every runtime path.
 
         requiredCycles is MfmaToAccReadLatency: the separation a consumer must
@@ -5485,80 +5485,23 @@ class LogicalScheduler:
                     f"firstDrain={_firstDrain} lastDrain={_lastDrain} "
                     f"dead_before_first={_deadByFirst} dead_before_last={_deadByLast} "
                     f"aligned_quads_dead_before_last={_quadCount(_offsDead)}\n")
-            if __import__("os").environ.get("WEAVE_FOLDLEASE"):
-                # REAL lease (stashed, drives the pass-2 fold).  Same selection as the
-                # WEAVE_LEASE dry-run: build the operand retirement timeline from this
-                # capture's placement, pick the 2 earliest-fully-retired disjoint 2-aligned
-                # operand quads (threshold T = max retire pos over their 8 lanes), and mark
-                # every coalesce pair draining at or before T to unfold (those quads are not
-                # yet dead there).  None when < 2 retired quads exist (whole capture unfolds).
-                _gpL = {}
-                for _a, _g, _role in candidates:
-                    _gpL[id(_g)] = _a
-                _fpL = {}
-                for _p in qualifying:
-                    _g = capturePlan.get(id(_p))
-                    _pm = _gpL.get(id(_g)) if _g is not None else None
-                    if _pm is None:
-                        continue
-                    for _k in (_producerSources(_p) or ()):
-                        if _k is not None:
-                            _fpL[_k] = max(_fpL.get(_k, -1), _pm)
-                _offRetireL = {}
-                for _k, _rp in _fpL.items():
-                    if isinstance(_k, tuple) and len(_k) == 3 and _k[1] is None:
-                        _offRetireL[_k[2]] = max(_offRetireL.get(_k[2], -1), _rp)
-                _offsL = sorted(_offRetireL)
-                _offSetL = set(_offsL)
-                _quadsL = []
-                for _b in _offsL:
-                    if _b % 2 == 0 and all((_b + _j) in _offSetL for _j in range(4)):
-                        _quadsL.append((max(_offRetireL[_b + _j] for _j in range(4)), _b))
-                _quadsL.sort()
-                _chosenL = []
-                for _ret, _b in _quadsL:
-                    if all(abs(_b - _cb) >= 4 for _, _cb in _chosenL):
-                        _chosenL.append((_ret, _b))
-                    if len(_chosenL) == 2:
-                        break
-                _leasePlan = None
-                if len(_chosenL) == 2:
-                    _TL = max(_chosenL[0][0], _chosenL[1][0])
-                    _q0L, _q1L = sorted(_b for _, _b in _chosenL)
-                    assert _q0L % 2 == 0 and _q1L % 2 == 0 and (_q1L - _q0L) >= 4, \
-                        f"fold-lease quads not 2-aligned/disjoint: {_q0L},{_q1L}"
-                    _unfoldL = set()
-                    for _pi, _pr in enumerate(capture.get("pairs", [])):
-                        _rps = [position.get(id(_ri)) for _ri, _s in _pr.get("reads", [])
-                                if position.get(id(_ri)) is not None]
-                        if _rps and min(_rps) <= _TL:
-                            _unfoldL.add(_pi)
-                    _leasePlan = {"q0": _q0L, "q1": _q1L, "T": _TL, "unfold": _unfoldL}
-                    __import__("sys").stderr.write(
-                        f"[WEAVE_FOLDLEASE] capture={len(self._foldLeasePlans)} "
-                        f"q0=v{_q0L}..{_q0L+3} q1=v{_q1L}..{_q1L+3} T={_TL} "
-                        f"unfold_pairs={sorted(_unfoldL)}\n")
-                else:
-                    __import__("sys").stderr.write(
-                        f"[WEAVE_FOLDLEASE] capture={len(self._foldLeasePlans)} "
-                        f"INSUFFICIENT retired quads ({len(_chosenL)}/2) -> no lease\n")
-                self._foldLeasePlans.append(_leasePlan)
             plans.append(capturePlan)
-
-        # dryRun (WEAVE_FOLDLEASE pass 1): compute capturePlan + lease ONLY; do NOT move any
-        # terminal MFMA out of the loop.  The real move permanently deletes the woven MFMAs from
-        # `emitted_3d` (below), so a mutating discovery pass would deplete the loop and the pass-2
-        # re-plan would LOSE those MFMAs (missing final-K accumulation -> wrong D).  Pass 2 runs
-        # with dryRun=False and performs the real move on the intact loop.
-        if dryRun:
-            return 0
 
         moved = {id(inst) for inst in allInsts}
         moved -= self._plsinProducersWithClobberedSources(emitted_3d, allInsts)
         for plan in plans:
             moved.intersection_update(plan.keys())
         if not moved:
+            if leaseDiscovery:
+                self._foldLeasePlans = self._buildFoldLeasePlans(storeModule, captures)
             return 0
+
+        # Snapshot the loop's terminal-MFMA module contents BEFORE the move so a
+        # lease-discovery pass can restore them: the move permanently deletes the woven
+        # MFMAs from `emitted_3d` (below), which would deplete the loop for the pass-2
+        # re-plan (missing final-K accumulation -> wrong D).  Discovery needs the REAL
+        # moved layout to measure true operand liveness, then puts the loop back.
+        _loopSnap = [(em, list(em.instructions)) for em, _insts in mfmaEms] if leaseDiscovery else None
 
         # Every activation/runtime path receives its own instruction objects.
         for plan in plans:
@@ -5567,7 +5510,76 @@ class LogicalScheduler:
                     plan[id(producer)].add(copy.deepcopy(producer))
         for em, insts in mfmaEms:
             em.instructions = [inst for inst in insts if id(inst) not in moved]
+
+        if leaseDiscovery:
+            # storeModule now holds the moved terminal MFMAs in their final gap order;
+            # measure TRUE operand liveness from it and build the per-coalesce lease, then
+            # restore the loop so pass 2 re-emits + re-plans the full MFMA set.
+            self._foldLeasePlans = self._buildFoldLeasePlans(storeModule, captures)
+            for em, snap in _loopSnap:
+                em.instructions = snap
         return len(moved)
+
+    def _alignedQuadBases(self, offs):
+        """Even bases b where b..b+3 are all in `offs` (a 2-aligned 4-dword VGPR quad)."""
+        s = set(offs)
+        return [b for b in sorted(s) if b % 2 == 0 and all((b + j) in s for j in range(4))]
+
+    def _buildFoldLeasePlans(self, storeModule, captures):
+        """WEAVE_FOLDLEASE: per-capture {pairIdx -> lease} from TRUE post-schedule operand
+        liveness.  For each terminal-MFMA operand VGPR, its last-read position over the FINAL
+        store order (the order that becomes the .s) is the point past which it is genuinely
+        dead.  A coalesce firing at pair P writes its leased blend/pack quads AFTER both its
+        pairs' accvgpr reads, so its leasable pool is the operand quads whose last-read is
+        before P's (and its partner P-1's) drain position.  Pool GROWS along the drain, so the
+        earliest coalesces (pool < 2 quads) UNFOLD and the rest fold at zero VGPR cost.
+        """
+        import sys as _sys
+        flat = list(storeModule.flatitems())
+        position = {id(it): i for i, it in enumerate(flat)}
+        trueLast = {}
+        for it in flat:
+            p = position.get(id(it))
+            if p is None:
+                continue
+            for c in self._plsinOperands(it, self._PLSIN_MFMA_SOURCES):
+                for k in (self._plsinRegisterKeys(c) or ()):
+                    if k is not None and len(k) == 3 and k[1] is None:
+                        trueLast[k[2]] = max(trueLast.get(k[2], -1), p)
+        plans = []
+        for capture in captures:
+            pairDrain = {}
+            for pi, pr in enumerate(capture.get("pairs", [])):
+                rps = [position.get(id(ri)) for ri, s in pr.get("reads", [])
+                       if position.get(id(ri)) is not None]
+                if rps:
+                    pairDrain[pi] = min(rps)
+            lease = {}
+            _nf = _nu = 0
+            for pi in sorted(pairDrain):
+                Q = min(pairDrain.get(pi, 1 << 30), pairDrain.get(pi - 1, 1 << 30))
+                deadOffs = [o for o, lr in trueLast.items() if lr < Q]
+                chosen = []
+                for b in self._alignedQuadBases(deadOffs):
+                    if all(abs(b - cb) >= 4 for cb in chosen):
+                        chosen.append(b)
+                    if len(chosen) == 2:
+                        break
+                if len(chosen) == 2:
+                    lease[pi] = {"q0": chosen[0], "q1": chosen[1]}
+                    _nf += 1
+                else:
+                    lease[pi] = {"unfold": True}
+                    _nu += 1
+            plans.append(lease)
+            _firstFold = next((pi for pi in sorted(lease) if "q0" in lease[pi]), None)
+            _ffQ = min(pairDrain.get(_firstFold, 1 << 30), pairDrain.get((_firstFold or 0) - 1, 1 << 30)) if _firstFold is not None else -1
+            _sys.stderr.write(
+                f"[WEAVE_FOLDLEASE] capture={len(plans)-1} pairs={len(lease)} "
+                f"fold={_nf} unfold={_nu} maxpos={max(position.values()) if position else 0} "
+                f"trueLast72={trueLast.get(72)} trueLast76={trueLast.get(76)} "
+                f"firstFoldPair={_firstFold} itsQ={_ffQ} itsQuad={lease.get(_firstFold)}\n")
+        return plans
 
     def _weaveFillersIntoMfmaGaps(self, flat, numFillers, emitFiller, woven,
                                   perGap=None, stride=None, tailStart=None):
