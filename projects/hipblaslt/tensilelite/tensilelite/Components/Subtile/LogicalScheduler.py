@@ -5428,6 +5428,34 @@ class LogicalScheduler:
 
         flat = list(storeModule.flatitems())
         position = {id(item): idx for idx, item in enumerate(flat)}
+        if __import__("os").environ.get("WEAVE_LIVENESS"):
+            # Validate the general epilogue liveness: every VGPR's last-use (death).
+            # Must capture the buffer_store's vdata read (dst/srcs miss it; getParams
+            # does), so the pack quad dies at the STORE, not the permlane.
+            _sys = __import__("sys")
+            _lastUse = {}
+            for _idx, _it in enumerate(flat):
+                if not hasattr(_it, "getParams"):
+                    continue
+                _w, _r = self._epilogueDefUse(_it)
+                for _k in _r:
+                    _lastUse[_k] = max(_lastUse.get(_k, -1), _idx)
+            # report death of the first pack quad (v-reg, name None) seen written by a cvt
+            _packKeys = []
+            for _it in flat:
+                if type(_it).__name__.startswith("VCvtPk"):
+                    _dk = self._plsinRegisterKeys(getattr(_it, "dst", None))
+                    if _dk:
+                        _packKeys.append(_dk[0])
+                if len(_packKeys) >= 4:
+                    break
+            _rows = []
+            for _k in _packKeys:
+                _du = _lastUse.get(_k, -1)
+                _ty = type(flat[_du]).__name__ if 0 <= _du < len(flat) else "?"
+                _rows.append((_k[2], _du, _ty))
+            _sys.stderr.write(f"[WEAVE_LIVENESS] tracked_regs={len(_lastUse)} "
+                              f"pack_quad_death(reg,pos,type)={_rows}\n")
         plans = []
         # EXPERIMENT (WEAVE_PACKFREE): per capture, a {pairIdx: quadBase} lease letting
         # the plain-woven store draw its pack scratch quad from retired operand VGPRs
@@ -5769,6 +5797,34 @@ class LogicalScheduler:
     _PLSIN_MFMA_SOURCES = ("a", "b", "mxsa", "mxsb")
     _PLSIN_UNIT_READS  = ("srcs", "src")
     _PLSIN_UNIT_WRITES = ("dst", "dsts")
+
+    def _epilogueDefUse(self, inst):
+        """General (writes, reads) register-key sets for ONE store-module instruction.
+
+        writes = the ``dst`` register (the single VALU/scalar write; memory stores have
+        none). reads = every other register operand, taken from ``getParams()`` rather
+        than ``srcs`` -- ``getParams`` is the only accessor that also exposes a memory
+        op's operands (a buffer_store's vdata/vaddr live nowhere in ``dst``/``srcs``, so
+        a srcs-only scan would wrongly free the store's data quad before the store). The
+        dst appears first in ``getParams`` when present, so reads = params minus dst.
+        Both are sets of ``_plsinRegisterKeys`` keys; immediates contribute nothing.
+        """
+        writes = set()
+        dst = getattr(inst, "dst", None)
+        dk = self._plsinRegisterKeys(dst) if dst is not None else None
+        if dk:
+            writes.update(dk)
+        reads = set()
+        try:
+            params = list(inst.getParams())
+        except Exception:
+            params = []
+        for p in params:
+            k = self._plsinRegisterKeys(p)
+            if k:
+                reads.update(k)
+        reads -= writes   # a reg that is only the dst is a write, not a read
+        return writes, reads
 
     def _plsinDrainReadyBars(self, flat, mfmaPos, units):
         """For each drain unit, the last MFMA index it must be placed after.
