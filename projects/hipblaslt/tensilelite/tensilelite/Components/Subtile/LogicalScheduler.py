@@ -5608,6 +5608,51 @@ class LogicalScheduler:
                         f"monotonic={_mono} matches_schedule={_curve == _expect} "
                         f"pairs_with_quad={_nAcq} free_before_pair={_curve}\n")
                     _sys.stderr.write(f"[WEAVE_FREELIST] acquired_quad_base_per_pair={_acq}\n")
+                if __import__("os").environ.get("WEAVE_VALUC"):
+                    # Expanded pool: dead ValuC accumulator slots (the original fold's reuse
+                    # target). A ValuC slot's death = its convert read (general liveness over
+                    # flat); the woven MFMA only WRITES acc (before the convert), never reads
+                    # it, so store-local last-use is the true death even pre-move. ValuC keys
+                    # stay symbolic (name='ValuC'), so this is a separate symbolic pool from
+                    # the physical operand free-list. Report dead-ValuC aligned quads per pair.
+                    _valcDeath = {}
+                    for _idx2, _it2 in enumerate(flat):
+                        if not hasattr(_it2, "getParams"):
+                            continue
+                        _w2, _r2 = self._epilogueDefUse(_it2)
+                        for _k2 in _r2:
+                            if _k2[1] == "ValuC":
+                                _valcDeath[_k2[2]] = max(_valcDeath.get(_k2[2], -1), _idx2)
+                    def _alignedQuadCount(_offsset):
+                        _o2 = sorted(_offsset); _q = 0; _i2 = 0
+                        while _i2 + 3 < len(_o2):
+                            _b2 = _o2[_i2]
+                            if _b2 % 2 == 0 and all(_o2[_i2+_j] == _b2+_j for _j in range(4)):
+                                _q += 1; _i2 += 4
+                            else:
+                                _i2 += 1
+                        return _q
+                    _valcCurve = []
+                    for _P in _pairPos:
+                        _dead = [_o for _o, _d in _valcDeath.items() if _d < _P]
+                        _valcCurve.append(_alignedQuadCount(_dead))
+                    _opQuadCurve = []
+                    _fl2 = EpilogueFreeList()
+                    _rc2 = {}                    # fresh reader counts (outer _readerCount is spent)
+                    for _pos3, _p in _placed:
+                        for _off in _opoffs(_p):
+                            _rc2[_off] = _rc2.get(_off, 0) + 1
+                    for _P in _pairPos:
+                        _opQuadCurve.append(_alignedQuadCount(set(_fl2._free)))
+                        for _p in _byPos.get(_P, ()):
+                            for _off in _opoffs(_p):
+                                _rc2[_off] -= 1
+                                if _rc2[_off] == 0:
+                                    _fl2.release([_off])
+                    _sys.stderr.write(
+                        f"[WEAVE_VALUC] dead_valuc_regs={len(_valcDeath)} "
+                        f"operand_quads_per_pair={_opQuadCurve} "
+                        f"dead_valuc_quads_per_pair={_valcCurve}\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}
