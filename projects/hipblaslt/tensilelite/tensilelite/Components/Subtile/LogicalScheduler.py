@@ -5366,26 +5366,34 @@ class LogicalScheduler:
                 plans.append({})
                 continue
 
-            def _lastQualifyingGap(gapList, readPos):
+            qualifying = [p for p in allInsts
+                          if consumers.get(id(p)) is not None
+                          and consumedRegs.get(id(p)) == writesByProducer.get(id(p))]
+            # Epilogue register allocator (single-pass placement). Each movable terminal
+            # MFMA has a liveness window [lower, readPos): `lower` is the position after
+            # its operands are written -- for the woven store the operands are produced in
+            # the main loop, before the store module, so lower == 0 -- and `readPos` is
+            # where the store reads its accumulator. Place it ALAP: the latest store gap
+            # strictly before readPos that still leaves >= requiredCycles instructions of
+            # MFMA->acc separation. This IS the production placement (it replaces the former
+            # _lastQualifyingGap solver with the same rule expressed as the allocator's
+            # forward pass), so the fold free-list -- which recycles each operand as its
+            # MFMA retires at its gap -- is an incremental addition, not a second scheduler.
+            # candidates is built in store-pair order == ascending anchorPos, so the
+            # in-order scan's last qualifying gap is the ALAP (highest-anchor) one.
+            capturePlan = {}
+            for producer in qualifying:
+                readPos = consumers[id(producer)]
                 chosen = None
-                for anchorPos, gap in gapList:
+                for anchorPos, gap in candidates:
                     if anchorPos >= readPos:
                         continue
-                    # Instructions, not cycles: a conservative stand-in, since
-                    # each issues in at least one cycle, so N of them span at
-                    # least N cycles.
+                    # Instructions, not cycles: a conservative stand-in, since each issues
+                    # in at least one cycle, so N of them span at least N cycles.
                     instsBetween = sum(1 for item in flat[anchorPos + 1:readPos]
                                        if isinstance(item, Instruction))
                     if instsBetween >= requiredCycles:
                         chosen = gap
-                return chosen
-
-            qualifying = [p for p in allInsts
-                          if consumers.get(id(p)) is not None
-                          and consumedRegs.get(id(p)) == writesByProducer.get(id(p))]
-            capturePlan = {}
-            for producer in qualifying:
-                chosen = _lastQualifyingGap(candidates, consumers[id(producer)])
                 if chosen is not None:
                     capturePlan[id(producer)] = chosen
             if __import__("os").environ.get("WEAVE_PLACE"):
@@ -5405,58 +5413,6 @@ class LogicalScheduler:
                 _sys.stderr.write(
                     f"[WEAVE_PLACE] placed={len(_rows)} pairs_used={len(set(_pairSeq))} "
                     f"order_inversions={_inv} idx->pair[:24]={_pairSeq[:24]}\n")
-            if __import__("os").environ.get("WEAVE_ALLOC"):
-                # Forward epilogue allocator (plain-woven recreate milestone): reproduce
-                # the current ALAP placement from a liveness model, validate EXACT parity
-                # with the production capturePlan, and compute the operand retirement
-                # timeline (the free-list release schedule the fold path will consume).
-                _sys = __import__("sys")
-                def _opkeys(_p):
-                    _s = set()
-                    for _c in self._plsinOperands(_p, self._PLSIN_MFMA_SOURCES):
-                        _k = self._plsinRegisterKeys(_c)
-                        if _k:
-                            _s.update(_k)
-                    return _s
-                # Liveness window per producer: [lower=0 (operands written in the main
-                # loop, before the store), readPos). Allocator = latest gap < readPos with
-                # instsBetween >= requiredCycles (ALAP), i.e. the current rule, expressed
-                # as a forward pass so the fold free-list is an incremental add.
-                _allocPlan = {}
-                _gapsByPos = sorted(candidates, key=lambda t: t[0])
-                for _p in qualifying:
-                    _readPos = consumers.get(id(_p))
-                    if _readPos is None:
-                        continue
-                    _chosen = None
-                    for _ap, _g in _gapsByPos:
-                        if _ap >= _readPos:
-                            continue
-                        _ib = sum(1 for _it in flat[_ap + 1:_readPos]
-                                  if isinstance(_it, Instruction))
-                        if _ib >= requiredCycles:
-                            _chosen = _g
-                    if _chosen is not None:
-                        _allocPlan[id(_p)] = _chosen
-                _mismatch = sum(1 for _k in set(_allocPlan) | set(capturePlan)
-                                if _allocPlan.get(_k) is not capturePlan.get(_k))
-                # Operand retirement timeline = free-list release schedule: per operand
-                # reg, the LAST (max) placed position among the woven MFMAs reading it.
-                _gapAnchor = {id(_g): _ap for _ap, _g in candidates}
-                _readers = {}
-                for _p in qualifying:
-                    for _k in _opkeys(_p):
-                        _readers.setdefault(_k, set()).add(id(_p))
-                _retire = {}
-                for _k, _rs in _readers.items():
-                    _poss = [_gapAnchor[id(_allocPlan[_pid])] for _pid in _rs
-                             if _pid in _allocPlan and id(_allocPlan[_pid]) in _gapAnchor]
-                    if _poss:
-                        _retire[_k] = max(_poss)
-                _sys.stderr.write(
-                    f"[WEAVE_ALLOC] alloc_placed={len(_allocPlan)} "
-                    f"parity_mismatch={_mismatch} operand_regs={len(_readers)} "
-                    f"retired={len(_retire)}\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}
