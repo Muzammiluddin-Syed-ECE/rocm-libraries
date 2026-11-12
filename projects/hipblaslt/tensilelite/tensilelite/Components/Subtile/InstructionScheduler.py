@@ -3682,16 +3682,20 @@ def _tailEnd(placer, shadowReads, begin, pending):
     return end
 
 
+def _roomForLoad(insts, spi):
+    """Whether a gap holding insts takes an m0 and its load."""
+    return (not any(_isWaitCnt(x) or _isBarrier(x) or _isVALU(x) for x in insts)
+            and len(insts) <= spi - 2)
+
+
 def _loadGaps(placer, begin, end, closed, reads):
     """Gaps in [begin, end) outside closed with this many ds_reads and
     room for a request."""
-    spi = placer.slotsPerInterval
     gaps = []
     for interval in range(begin, end):
         insts = placer.intervalInsts(interval)
         if (not closed(interval) and sum(map(_isDsRead, insts)) == reads
-                and not any(_isWaitCnt(x) or _isBarrier(x) or _isVALU(x) for x in insts)
-                and len(insts) <= spi - 2):
+                and _roomForLoad(insts, placer.slotsPerInterval)):
             gaps.append(interval)
     return gaps
 
@@ -3749,6 +3753,19 @@ def _placeFirstFitting(placer, rules, dtlRun, attempts, place):
     return False
 
 
+def _waitCountRestorer(emittedModules):
+    """A function that puts back the counts the waits of emittedModules
+    hold now, which every schedule built from them changes."""
+    waits = [inst for em in emittedModules for inst in em.instructions
+             if _isWaitCnt(inst)]
+    counts = [(inst.vlcnt, inst.dscnt) for inst in waits]
+
+    def restore():
+        for inst, (vlcnt, dscnt) in zip(waits, counts):
+            inst.vlcnt, inst.dscnt = vlcnt, dscnt
+    return restore
+
+
 def _addLoadsAheadToVmcnt(scheduled):
     """Add the buffer loads ahead of each VMEM wait to its count."""
     bufLoadCount = 0
@@ -3789,14 +3806,11 @@ def _scheduleHalfDisjointCell(
     (_issueExcess); the forced placements of a dense cell can land either way.
     """
     if commentsTakeSlots is None:
-        waits = [inst for em in emittedModules for inst in em.instructions
-                 if _isWaitCnt(inst)]
-        counts = [(inst.vlcnt, inst.dscnt) for inst in waits]
+        restoreCounts = _waitCountRestorer(emittedModules)
         shadows = list(scaleShadows) if scaleShadows else None
 
         def build(slotted):
-            for inst, (vlcnt, dscnt) in zip(waits, counts):
-                inst.vlcnt, inst.dscnt = vlcnt, dscnt
+            restoreCounts()
             if shadows:
                 scaleShadows[:] = shadows
             return _scheduleHalfDisjointCell(
@@ -3844,9 +3858,7 @@ def _scheduleHalfDisjointCell(
     firstInterval = opened // spi
 
     def loadable(interval):
-        insts = placer.intervalInsts(interval)
-        return (not any(_isWaitCnt(x) or _isBarrier(x) or _isVALU(x) for x in insts)
-                and len(insts) <= spi - 2)
+        return _roomForLoad(placer.intervalInsts(interval), spi)
 
     # The prefix sits in the gap ahead of the cell's first MFMA, so a
     # cell without the half's barrier offers that gap too.  A scale
@@ -4739,13 +4751,8 @@ def instructionScheduleHalf(
         cells.append((emitted, pathOrders, preMfmaOrders, mfmas))
     # The schedulers add the loads ahead of a VMEM wait to its count, and
     # relax the local-read drains reads were moved ahead of.
-    waits = [inst for emitted in emittedLists for em in emitted
-             for inst in em.instructions if _isWaitCnt(inst)]
-    counts = [(inst.vlcnt, inst.dscnt) for inst in waits]
-
-    def restoreCounts():
-        for inst, (vlcnt, dscnt) in zip(waits, counts):
-            inst.vlcnt, inst.dscnt = vlcnt, dscnt
+    restoreCounts = _waitCountRestorer(
+        [em for emitted in emittedLists for em in emitted])
 
     def joint(crossCellReads, shadows):
         if not all(_isMx8Schedule(cell[3]) for cell in cells):

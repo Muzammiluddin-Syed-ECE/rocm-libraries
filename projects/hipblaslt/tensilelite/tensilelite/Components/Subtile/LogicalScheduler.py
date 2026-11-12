@@ -1012,16 +1012,16 @@ class LogicalScheduler:
         return {'A': (cfg._prefixM[piM], cfg._prefixM[piM + 1]),
                 'B': (cfg._prefixN[piN], cfg._prefixN[piN + 1])}
 
+    def _partition_mfmas(self, pi: int) -> int:
+        """MFMAs one body issues in partition pi."""
+        tiles = self._partition_tile_range(pi)
+        return ((tiles['A'][1] - tiles['A'][0])
+                * (tiles['B'][1] - tiles['B'][0])
+                * self.config.numSubIterK)
+
     def _first_half_mfmas(self) -> int:
         """MFMAs one body issues in partitions [0, P/2)."""
-        cfg = self.config
-        total = 0
-        for pi in range(cfg.numPartitions // 2):
-            tiles = self._partition_tile_range(pi)
-            total += ((tiles['A'][1] - tiles['A'][0])
-                      * (tiles['B'][1] - tiles['B'][0])
-                      * cfg.numSubIterK)
-        return total
+        return sum(map(self._partition_mfmas, range(self.config.numPartitions // 2)))
 
     @staticmethod
     def _flatEmittedInstructions(emitted_3d):
@@ -1069,11 +1069,7 @@ class LogicalScheduler:
         from .InstructionScheduler import (
             selectLateScalePrefetch, selectScaleShadowPlan)
 
-        firstPartitionMfmas = (
-            (first['A'][1] - first['A'][0])
-            * (first['B'][1] - first['B'][0])
-            * cfg.numSubIterK
-        )
+        firstPartitionMfmas = self._partition_mfmas(0)
         plan = selectScaleShadowPlan(
             list(self._flatEmittedInstructions(
                 self._emitted_per_unroll[0])),
@@ -5513,14 +5509,7 @@ class LogicalScheduler:
                 module.add(selfCover)
         if self._scaleShadowPlan and label == "MAINLOOP_C1":
             # A half-disjoint body's last barrier opens its second half.
-            finalPartitionMfmas = 0
-            for pi in shadow_tail:
-                final = self._partition_tile_range(pi)
-                finalPartitionMfmas += (
-                    (final['A'][1] - final['A'][0])
-                    * (final['B'][1] - final['B'][0])
-                    * self.config.numSubIterK
-                )
+            finalPartitionMfmas = sum(map(self._partition_mfmas, shadow_tail))
             placed = appendC1ScaleShadowReads(
                 module,
                 self._scaleShadowPlan["entry"],
