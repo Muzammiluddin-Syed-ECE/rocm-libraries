@@ -5309,6 +5309,72 @@ class LogicalScheduler:
                     f"max_supply={max(_supplyAt) if _supplyAt else 0} "
                     f"aligned_quads_at_drain={_alignedQuads(_vgprOffs)} "
                     f"curve_sampled={_supplyAt[0:256:16]}\n")
+            if __import__("os").environ.get("WEAVE_LEASE"):
+                # Lease DECISION (dry-run: compute + assert consistency; NO codegen change).
+                # Per arm, pick 2 aligned operand quads whose last reader retires earliest
+                # (threshold T = max freePos over their 8 lanes); every coalesce pair whose
+                # drain position Q > T folds using those quads (zero VGPR); pairs at Q <= T
+                # unfold (early-drain residual). Asserts the quads are 2-aligned, disjoint,
+                # and dead (freePos < Q) for every folded pair.
+                _sys = __import__("sys")
+                _gp = {}
+                for _a, _g, _role in candidates:
+                    _gp[id(_g)] = _a
+                _fp = {}
+                for _p in qualifying:
+                    _g = capturePlan.get(id(_p))
+                    _pm = _gp.get(id(_g)) if _g is not None else None
+                    if _pm is None:
+                        continue
+                    for _k in (_producerSources(_p) or ()):
+                        if _k is not None:
+                            _fp[_k] = max(_fp.get(_k, -1), _pm)
+                # concrete freed VGPR offsets -> their retirement position
+                _offRetire = {}
+                for _k, _rp in _fp.items():
+                    if isinstance(_k, tuple) and len(_k) == 3 and _k[1] is None:
+                        _offRetire[_k[2]] = max(_offRetire.get(_k[2], -1), _rp)
+                # enumerate fully-retired 2-aligned quads: (maxRetire, baseOff)
+                _quads = []
+                _offs = sorted(_offRetire)
+                _offset_set = set(_offs)
+                for _b in _offs:
+                    if _b % 2 == 0 and all((_b + _j) in _offset_set for _j in range(4)):
+                        _quads.append((max(_offRetire[_b + _j] for _j in range(4)), _b))
+                _quads.sort()
+                # pick 2 disjoint quads with the smallest retirement threshold
+                _chosen = []
+                for _ret, _b in _quads:
+                    if all(abs(_b - _cb) >= 4 for _, _cb in _chosen):
+                        _chosen.append((_ret, _b))
+                    if len(_chosen) == 2:
+                        break
+                # per coalesce pair, drain position = min read position of that pair
+                _pairDrain = []
+                for _pi, _pr in enumerate(capture.get("pairs", [])):
+                    _rps = [position.get(id(_ri)) for _ri, _s in _pr.get("reads", [])
+                            if position.get(id(_ri)) is not None]
+                    if _rps:
+                        _pairDrain.append((_pi, min(_rps)))
+                if len(_chosen) == 2:
+                    _T = max(_chosen[0][0], _chosen[1][0])
+                    _q0, _q1 = sorted(_b for _, _b in _chosen)
+                    assert _q0 % 2 == 0 and _q1 % 2 == 0 and (_q1 - _q0) >= 4, \
+                        f"lease quads not 2-aligned/disjoint: {_q0},{_q1}"
+                    _foldPairs = [pi for pi, q in _pairDrain if q > _T]
+                    _unfoldPairs = [pi for pi, q in _pairDrain if q <= _T]
+                    # safety: both quads dead before every folded pair's drain
+                    for _pi, _q in _pairDrain:
+                        if _q > _T:
+                            assert _T < _q, "fold pair drain not after threshold (impossible)"
+                    _sys.stderr.write(
+                        f"[WEAVE_LEASE] quads=v{_q0}..{_q0+3},v{_q1}..{_q1+3} T={_T} "
+                        f"total_pairs={len(_pairDrain)} fold={len(_foldPairs)} "
+                        f"unfold={len(_unfoldPairs)} unfold_pi={sorted(_unfoldPairs)[:12]}\n")
+                else:
+                    _sys.stderr.write(
+                        f"[WEAVE_LEASE] INSUFFICIENT retired quads ({len(_chosen)}/2); "
+                        f"all {len(_pairDrain)} pairs would unfold\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}
