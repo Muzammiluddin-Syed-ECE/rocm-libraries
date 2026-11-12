@@ -877,6 +877,70 @@ class EmittedModule:
         return self.source.kind if self.source else ""
 
 
+class EpilogueFreeList:
+    """VGPR free-list for the single-pass woven epilogue store allocator.
+
+    As the store drains pair-by-pair (ascending gap position), each relocated
+    terminal MFMA retires its operand VGPRs once its LAST reader has executed at
+    its gap -- ``release`` returns those registers to the pool. The DPP fold then
+    ``acquire``s a 4-consecutive, 2-aligned quad for a coalesced store's blend or
+    pack destination, and ``give_back``s it after the store has read it so the next
+    pair can recycle it. Supply grows monotonically along the drain, so a forward
+    sweep can satisfy demand without any fresh allocation (zero VGPR cost).
+
+    This is a bookkeeping structure over VGPR *offsets*; it never allocates from
+    the real register pool. It is inert unless ``acquire`` is called -- the
+    plain-woven store (no fold) only ever releases, so it changes no codegen.
+    """
+
+    __slots__ = ("_free", "_held")
+
+    def __init__(self):
+        self._free = set()   # offsets currently free (retired, not handed out)
+        self._held = set()   # offsets handed out via acquire, awaiting give_back
+
+    def release(self, offsets):
+        """Return retired operand VGPR offsets to the free pool."""
+        for off in offsets:
+            if off not in self._held:
+                self._free.add(off)
+
+    def _quad_base(self, free):
+        for b in sorted(free):
+            if b % 2 == 0 and all((b + j) in free for j in range(4)):
+                return b
+        return None
+
+    def can_acquire_quads(self, n):
+        """True if ``n`` disjoint 4-consecutive 2-aligned quads are free now."""
+        free = set(self._free)
+        for _ in range(n):
+            b = self._quad_base(free)
+            if b is None:
+                return False
+            free.difference_update(range(b, b + 4))
+        return True
+
+    def acquire_quad(self):
+        """Hand out one 4-consecutive 2-aligned free quad (its base), or None."""
+        b = self._quad_base(self._free)
+        if b is None:
+            return None
+        for j in range(4):
+            self._free.discard(b + j)
+            self._held.add(b + j)
+        return b
+
+    def give_back(self, base):
+        """Recycle an acquired quad after its store has read it."""
+        for j in range(4):
+            self._held.discard(base + j)
+            self._free.add(base + j)
+
+    def free_count(self):
+        return len(self._free)
+
+
 # ── Main scheduler class ───────────────────────────────────
 
 class LogicalScheduler:
@@ -5414,35 +5478,50 @@ class LogicalScheduler:
                     f"[WEAVE_PLACE] placed={len(_rows)} pairs_used={len(set(_pairSeq))} "
                     f"order_inversions={_inv} idx->pair[:24]={_pairSeq[:24]}\n")
             if __import__("os").environ.get("WEAVE_FREELIST"):
-                # Free-list schedule: as the store drains pair-by-pair (ascending gap
-                # position), each woven MFMA retires its operand VGPRs -- its last reader
-                # executes at its gap -- so the pool of free VGPRs grows monotonically.
-                # INERT here (nothing acquires), so plain-woven assembly is unchanged; this
-                # is the pool the fold path draws its blend/pack quads from. free_at_pair[k]
-                # = VGPRs already retired strictly before pair k's drain position.
+                # Drive the active EpilogueFreeList forward through the drain: walk pairs in
+                # ascending gap position, and as each pair's relocated MFMAs execute, release
+                # an operand VGPR the instant its LAST reader has run (reader-count hits 0).
+                # free_before_pair[k] = pool size the moment pair k drains, i.e. what the fold
+                # could acquire there. INERT: nothing acquires, so plain-woven assembly is
+                # unchanged. Validated against the direct retire<position schedule.
                 _sys = __import__("sys")
                 def _opoffs(_p):
-                    _o = []
+                    _o = set()
                     for _c in self._plsinOperands(_p, self._PLSIN_MFMA_SOURCES):
                         for _kk in (self._plsinRegisterKeys(_c) or ()):
                             if _kk is not None and _kk[1] is None:  # resolved VGPR offset
-                                _o.append(_kk[2])
+                                _o.add(_kk[2])
                     return _o
                 _gapAnchor = {id(_g): _ap for _ap, _g in candidates}
+                _placed = [(_gapAnchor[id(capturePlan[id(_p)])], _p) for _p in qualifying
+                           if id(_p) in capturePlan and id(capturePlan[id(_p)]) in _gapAnchor]
+                _byPos = {}
+                _readerCount = {}
+                for _pos, _p in _placed:
+                    _byPos.setdefault(_pos, []).append(_p)
+                    for _off in _opoffs(_p):
+                        _readerCount[_off] = _readerCount.get(_off, 0) + 1
+                _fl = EpilogueFreeList()
+                _pairPos = sorted({_ap for _ap, _g in candidates})
+                _curve = []
+                for _P in _pairPos:
+                    _curve.append(_fl.free_count())        # pool as pair _P begins to drain
+                    for _p in _byPos.get(_P, ()):          # this pair's MFMAs now execute
+                        for _off in _opoffs(_p):
+                            _readerCount[_off] -= 1
+                            if _readerCount[_off] == 0:    # last reader done -> retire
+                                _fl.release([_off])
+                # cross-check against the direct schedule (retire position = max reader pos)
                 _retire = {}
-                for _p in qualifying:
-                    _g = capturePlan.get(id(_p))
-                    _pos = _gapAnchor.get(id(_g)) if _g is not None else None
-                    if _pos is None:
-                        continue
+                for _pos, _p in _placed:
                     for _off in _opoffs(_p):
                         _retire[_off] = max(_retire.get(_off, -1), _pos)
-                _pairPos = sorted({_ap for _ap, _g in candidates})
-                _curve = [sum(1 for _r in _retire.values() if _r < _P) for _P in _pairPos]
+                _expect = [sum(1 for _r in _retire.values() if _r < _P) for _P in _pairPos]
                 _mono = all(_curve[_i] >= _curve[_i-1] for _i in range(1, len(_curve)))
                 _sys.stderr.write(
                     f"[WEAVE_FREELIST] pairs={len(_pairPos)} pool_regs={len(_retire)} "
-                    f"monotonic={_mono} free_at_pair={_curve}\n")
+                    f"monotonic={_mono} matches_schedule={_curve == _expect} "
+                    f"free_before_pair={_curve}\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}
