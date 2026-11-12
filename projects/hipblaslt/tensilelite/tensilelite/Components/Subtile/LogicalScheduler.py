@@ -5125,10 +5125,16 @@ class LogicalScheduler:
             _packSlot0 = getattr(writer.states, "subtilePairPackSlot", 0)
             storeModule = writer.buildSubtileFusedStore(kernel, writer.tPA, writer.tPB)
             if weaveGroups is not None:
+                _mfmaLatency = int(writer.states.archCaps.get("MfmaToAccReadLatency", 0))
+                # In pack-lease mode a second emit pass below rebuilds the store; the
+                # terminal-MFMA move must happen on THAT store, not this one. So pass 1
+                # only computes the lease plans (applyMoves=False) and leaves the loop's
+                # terminal MFMAs intact. Stock (no lease env) moves them here as before.
+                _leaseMode = bool(__import__("os").environ.get("WEAVE_PACKVALC")
+                                  or __import__("os").environ.get("WEAVE_PACKFREE"))
                 self._planCapturedTerminalMfmas(
                     fusedEmitted, writer.states.subtileWeaveCaptureInstances,
-                    storeModule,
-                    int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)))
+                    storeModule, _mfmaLatency, applyMoves=not _leaseMode)
                 # EXPERIMENT (WEAVE_PACKFREE): a second emit pass that draws each eligible
                 # woven pair's pack scratch quad from the free-list lease computed above
                 # (retired operand VGPRs) instead of the dedicated pack ring. Re-emit with
@@ -5168,6 +5174,14 @@ class LogicalScheduler:
                         int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)))
                     writer.states.subtileWovenPackPlan = None
                     writer.states.subtileWovenPackPlanAnchorSVV = None
+                elif _leaseMode:
+                    # Lease mode but no pair qualified for a lease, so no second pass
+                    # ran. Pass 1 deferred the terminal-MFMA move (applyMoves=False);
+                    # perform it now on the pass-1 store so the weave is not lost --
+                    # the kernel is then identical to stock.
+                    self._planCapturedTerminalMfmas(
+                        fusedEmitted, writer.states.subtileWeaveCaptureInstances,
+                        storeModule, _mfmaLatency, applyMoves=True)
                 # Planner appends the gap MFMAs after Phase1 (mfma, mfma, step-1,
                 # mfma, mfma, step-2). Spread the convert VALU into those MFMA
                 # issue shadows (2 v_cvt_pk per gap), matching main-loop ds_read.
@@ -5406,7 +5420,7 @@ class LogicalScheduler:
         return True
 
     def _planCapturedTerminalMfmas(self, emitted_3d, captures, storeModule,
-                                   requiredCycles):
+                                   requiredCycles, applyMoves=True):
         """Move only producers with a safe generated gap in every runtime path.
 
         requiredCycles is MfmaToAccReadLatency: the separation a consumer must
@@ -5416,6 +5430,14 @@ class LogicalScheduler:
         issues in at least one cycle -- but it means a gap can qualify on
         instruction count while being tighter in cycles than the name suggests,
         never the reverse.
+
+        applyMoves: when False, compute the lease plans (_wovenPackPlans /
+        _wovenPackValcPlans) as side effects but do NOT move any terminal MFMA out
+        of the loop into the store gaps. The pack-lease two-pass uses this: pass 1
+        only needs the lease plan, and MUST NOT consume the loop's terminal MFMAs,
+        or pass 2 (which rebuilds the store) would find none left to weave and
+        silently drop them. Pass 2 then runs with applyMoves=True to perform the
+        real single move on the final (lease-applied) store.
         """
         mfmaEms, allInsts = self._plsinTerminalMfmas(emitted_3d)
         if not allInsts or not captures or requiredCycles <= 0:
@@ -5721,6 +5743,11 @@ class LogicalScheduler:
                         f"[WEAVE_VALUC] writePos_known={len(_writePos)}/{len(_sortedGaps)} "
                         f"operand_quads@write={_opCurve} valuc_quads@write={_vcCurve}\n")
             plans.append(capturePlan)
+
+        if not applyMoves:
+            # Lease pass-1: plans/leases computed above; defer the actual move to
+            # pass 2 so the loop keeps its terminal MFMAs for the re-emitted store.
+            return 0
 
         moved = {id(inst) for inst in allInsts}
         moved -= self._plsinProducersWithClobberedSources(emitted_3d, allInsts)
