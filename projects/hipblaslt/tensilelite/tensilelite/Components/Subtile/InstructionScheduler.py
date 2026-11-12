@@ -4518,7 +4518,7 @@ def _scheduleHalfDisjointHalf(
     # The joint plan goes first. Otherwise, as in the cell scheduler,
     # requests take the gaps the reads left free and only the ones left
     # over take gaps with one read, then two, under the run cap; then
-    # requests are spaced over every gap, with the cap and then without.
+    # requests are spaced over every gap, still under the cap.
     def snapped(targets):
         """Planned load gaps moved to the nearest gaps the reads left free.
 
@@ -4545,30 +4545,11 @@ def _scheduleHalfDisjointHalf(
         attempts.append((*tiered, True))
     open_ = [g for g in range(firstInterval, max(intervals, firstInterval + 1))
              if g not in seams and (g >= intervals or not shadowReads[g])] or [firstInterval]
-    spaced = _evenly(open_, len(bundles))
-    attempts += [(spaced, None, True), (spaced, None, False)]
-    saved = placer.snapshot(), dict(rules.__dict__)
-    before = placer.overfullIntervals()
-
-    def attempt(targets, readLimit, capped):
-        placer.restore(saved[0])
-        rules.__dict__.update(saved[1])
-        rules.dtlDsReadLimit = readLimit
-        if capped and dtlRun not in placer._validators:
-            placer._validators.append(dtlRun)
-        if not capped and dtlRun in placer._validators:
-            placer._validators.remove(dtlRun)
-        placeRequestsAndOthers(targets)
-
+    attempts.append((_evenly(open_, len(bundles)), None, True))
     # The first attempt that keeps the rules wins. When none does, the
     # half is too dense to place jointly; its cells keep their own
     # schedules, which measure faster there than any joint packing.
-    for targets, readLimit, capped in attempts:
-        attempt(targets, readLimit, capped)
-        if capped and placer.overfullIntervals() <= before and (
-                readLimit is None or placer.longestDtlRun() <= _MXFP8_MAX_DTL_RUN):
-            break
-    else:
+    if not _placeFirstFitting(placer, rules, dtlRun, attempts, placeRequestsAndOthers):
         return None
     _attachComments(placer, anchors)
 
