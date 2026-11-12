@@ -302,6 +302,17 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
     else:
       requiredParametersTemp.discard("TDMFuse")
 
+    # DPPStoreFold only changes codegen on the gfx950 MXF4->bf16 subtile coalesce path.
+    # Its default is True, so gating the name token on the parameter alone would attach
+    # DPPSF1 to every freshly-generated kernel (renaming unrelated ones that are byte-
+    # identical because isSubtileCoalesce never fires for them). Scope the token to the
+    # eligible arch+type -- gfx950 + MXF4 subtile -- where the fold can actually fire.
+    _dppsfEligible = tuple(state.get("ISA", ())[:2]) == (9, 5) and isMxf4SubtilePath(state)
+    if state.get("DPPStoreFold", False) and _dppsfEligible:
+      requiredParametersTemp.add("DPPStoreFold")
+    else:
+      requiredParametersTemp.discard("DPPStoreFold")
+
     # StinkyTofuRegisterAllocation=0 leaves Tensile's colouring, so naming it
     # would rename every kernel that does not opt in. Any other value changes
     # the colouring (and mode 3 changes which kernels are accepted), so it
