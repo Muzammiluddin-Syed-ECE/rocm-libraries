@@ -4305,7 +4305,7 @@ class GlobalWriteBatchWriter:
     (permlane + buffer_store) stays after the convert has filled vPack.
     """
     module = Module("16bitSubtilePairedStoreWoven")
-    vPack = self._pairPackQuad()
+    vPack = self._pairPackQuad(pairIdx)
     phase1 = self._emit16bitSubtilePairedStorePhase1(
       addrCalc, sumIdx0, sumIdx1, prefixOffset, tt0=tt0, blockIdxM=blockIdxM, blockIdxN=blockIdxN,
       vPackOverride=vPack)
@@ -4664,7 +4664,7 @@ class GlobalWriteBatchWriter:
     self.parentWriter.states.subtileStoreStageHighWater = stage
     module.add(Module(f"PlsinStageBoundary{stage}"))
 
-  def _pairPackQuad(self) -> int:
+  def _pairPackQuad(self, pairIdx=None) -> int:
     """Base vgpr of the 4-dword pack quad this paired store uses.
 
     A store cannot be scheduled away from the quad it packs into: the next
@@ -4675,6 +4675,16 @@ class GlobalWriteBatchWriter:
     Like the unpaired ring, the counter lives on the writer state so it keeps
     rotating across the per-batch rebuild of this object.
     """
+    # EXPERIMENT (WEAVE_PACKFREE): draw this woven pair's pack quad from a retired
+    # operand VGPR (the free-list lease) instead of the dedicated pack ring. The lease
+    # is computed by the planner in the first emit pass and keyed by pairIdx; only pairs
+    # whose drain position has >=1 fully-retired aligned quad are present. Correctness
+    # hinges on the leased quad being genuinely dead here (no woven MFMA at this pair or
+    # later reads it) -- this experiment validates exactly that against --verify.
+    if pairIdx is not None and __import__("os").environ.get("WEAVE_PACKFREE"):
+      _lease = getattr(self.parentWriter.states, "subtileWovenPackPlan", None)
+      if _lease and pairIdx in _lease:
+        return _lease[pairIdx]
     ring  = self.cvtVgprStruct.vgprPairPackRing
     if ring < 0:
       return self.cvtVgprStruct.vgprBf16Temp

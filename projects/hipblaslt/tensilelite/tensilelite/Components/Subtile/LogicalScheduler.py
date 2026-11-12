@@ -5122,12 +5122,38 @@ class LogicalScheduler:
             # 4d-3a/3b: build the real beta0/NonEdge D store exactly once, then use
             # its captured reads and gaps to perform 4d-3b latency hiding.
             writer.states.subtileHoistedStoreInit = None
+            _packSlot0 = getattr(writer.states, "subtilePairPackSlot", 0)
             storeModule = writer.buildSubtileFusedStore(kernel, writer.tPA, writer.tPB)
             if weaveGroups is not None:
                 self._planCapturedTerminalMfmas(
                     fusedEmitted, writer.states.subtileWeaveCaptureInstances,
                     storeModule,
                     int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)))
+                # EXPERIMENT (WEAVE_PACKFREE): a second emit pass that draws each eligible
+                # woven pair's pack scratch quad from the free-list lease computed above
+                # (retired operand VGPRs) instead of the dedicated pack ring. Re-emit with
+                # the lease installed, then re-plan on the new module. Gated -- default
+                # (no env) never runs the second pass and codegen is unchanged.
+                _packPlan = {}
+                for _d in getattr(self, "_wovenPackPlans", []) or []:
+                    _packPlan.update(_d)
+                if __import__("os").environ.get("WEAVE_PACKFREE") and _packPlan:
+                    writer.states.subtileWovenPackPlan = _packPlan
+                    writer.states.subtileWeaveMfmaGroups = \
+                        copy.deepcopy(weaveGroups) if weaveGroups is not None else None
+                    writer.states.subtileWeaveLookahead = 0
+                    writer.states.subtileWeavePairCounter = 0
+                    writer.states.subtileWeaveEmitted = set()
+                    writer.states.subtileWeaveCaptureInstances = [] if weaveGroups is not None else None
+                    writer.states.subtileWeaveCaptureCurrent = None
+                    writer.states.subtileHoistedStoreInit = None
+                    writer.states.subtilePairPackSlot = _packSlot0
+                    storeModule = writer.buildSubtileFusedStore(kernel, writer.tPA, writer.tPB)
+                    self._planCapturedTerminalMfmas(
+                        fusedEmitted, writer.states.subtileWeaveCaptureInstances,
+                        storeModule,
+                        int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)))
+                    writer.states.subtileWovenPackPlan = None
                 # Planner appends the gap MFMAs after Phase1 (mfma, mfma, step-1,
                 # mfma, mfma, step-2). Spread the convert VALU into those MFMA
                 # issue shadows (2 v_cvt_pk per gap), matching main-loop ds_read.
@@ -5400,6 +5426,11 @@ class LogicalScheduler:
         flat = list(storeModule.flatitems())
         position = {id(item): idx for idx, item in enumerate(flat)}
         plans = []
+        # EXPERIMENT (WEAVE_PACKFREE): per capture, a {pairIdx: quadBase} lease letting
+        # the plain-woven store draw its pack scratch quad from retired operand VGPRs
+        # (the free-list) instead of the dedicated pack ring. Consumed by the caller's
+        # second emit pass + _pairPackQuad. Empty unless the env flag is set.
+        self._wovenPackPlans = []
         for capture in captures:
             consumers = {}
             consumedRegs = {}
@@ -5477,7 +5508,8 @@ class LogicalScheduler:
                 _sys.stderr.write(
                     f"[WEAVE_PLACE] placed={len(_rows)} pairs_used={len(set(_pairSeq))} "
                     f"order_inversions={_inv} idx->pair[:24]={_pairSeq[:24]}\n")
-            if __import__("os").environ.get("WEAVE_FREELIST"):
+            if (__import__("os").environ.get("WEAVE_FREELIST")
+                    or __import__("os").environ.get("WEAVE_PACKFREE")):
                 # Drive the active EpilogueFreeList forward through the drain: walk pairs in
                 # ascending gap position, and as each pair's relocated MFMAs execute, release
                 # an operand VGPR the instant its LAST reader has run (reader-count hits 0).
@@ -5504,8 +5536,15 @@ class LogicalScheduler:
                 _fl = EpilogueFreeList()
                 _pairPos = sorted({_ap for _ap, _g in candidates})
                 _curve = []
+                _acq = []                                   # per-pair acquired quad base (or -1)
                 for _P in _pairPos:
                     _curve.append(_fl.free_count())        # pool as pair _P begins to drain
+                    # try to draw one 2-aligned quad from the pool available BEFORE this pair
+                    # drains (regs retired strictly earlier); scratch, so give it right back.
+                    _qb = _fl.acquire_quad()
+                    _acq.append(_qb if _qb is not None else -1)
+                    if _qb is not None:
+                        _fl.give_back(_qb)
                     for _p in _byPos.get(_P, ()):          # this pair's MFMAs now execute
                         for _off in _opoffs(_p):
                             _readerCount[_off] -= 1
@@ -5518,10 +5557,26 @@ class LogicalScheduler:
                         _retire[_off] = max(_retire.get(_off, -1), _pos)
                 _expect = [sum(1 for _r in _retire.values() if _r < _P) for _P in _pairPos]
                 _mono = all(_curve[_i] >= _curve[_i-1] for _i in range(1, len(_curve)))
-                _sys.stderr.write(
-                    f"[WEAVE_FREELIST] pairs={len(_pairPos)} pool_regs={len(_retire)} "
-                    f"monotonic={_mono} matches_schedule={_curve == _expect} "
-                    f"free_before_pair={_curve}\n")
+                _nAcq = sum(1 for _q in _acq if _q >= 0)
+                # Build the pack lease: pair position -> pairIdx (from the gap name), then
+                # {pairIdx: acquired quad base} for pairs that got one. Stash per capture.
+                import re as _re
+                _posToPair = {}
+                for _ap, _g in candidates:
+                    _m = _re.search(r"pair(\d+)", getattr(_g, "name", "") or "")
+                    if _m is not None:
+                        _posToPair[_ap] = int(_m.group(1))
+                _packPlan = {}
+                for _i, _P in enumerate(_pairPos):
+                    if _acq[_i] >= 0 and _P in _posToPair:
+                        _packPlan[_posToPair[_P]] = _acq[_i]
+                self._wovenPackPlans.append(_packPlan)
+                if __import__("os").environ.get("WEAVE_FREELIST"):
+                    _sys.stderr.write(
+                        f"[WEAVE_FREELIST] pairs={len(_pairPos)} pool_regs={len(_retire)} "
+                        f"monotonic={_mono} matches_schedule={_curve == _expect} "
+                        f"pairs_with_quad={_nAcq} free_before_pair={_curve}\n")
+                    _sys.stderr.write(f"[WEAVE_FREELIST] acquired_quad_base_per_pair={_acq}\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}
