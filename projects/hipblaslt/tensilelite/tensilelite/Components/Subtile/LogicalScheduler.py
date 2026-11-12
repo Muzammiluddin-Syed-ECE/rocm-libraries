@@ -5388,6 +5388,75 @@ class LogicalScheduler:
                 chosen = _lastQualifyingGap(candidates, consumers[id(producer)])
                 if chosen is not None:
                     capturePlan[id(producer)] = chosen
+            if __import__("os").environ.get("WEAVE_PLACE"):
+                # Ground-truth placement dump for the forward-allocator recreate experiment.
+                # Per producer (allInsts order): index, consumer (store read) position, and
+                # the chosen gap's pairIdx; plus order-inversion count of idx->pair.
+                _sys = __import__("sys"); import re as _re
+                _instIdx = {id(_p): _i for _i, _p in enumerate(allInsts)}
+                def _pairOf(_g):
+                    _m = _re.search(r"pair(\d+)", getattr(_g, "name", "") or "")
+                    return int(_m.group(1)) if _m else -1
+                _rows = sorted((_instIdx.get(id(_p), -1), consumers.get(id(_p), -1),
+                                _pairOf(capturePlan[id(_p)]))
+                               for _p in qualifying if id(_p) in capturePlan)
+                _pairSeq = [r[2] for r in _rows]
+                _inv = sum(1 for _i in range(1, len(_pairSeq)) if _pairSeq[_i] < _pairSeq[_i-1])
+                _sys.stderr.write(
+                    f"[WEAVE_PLACE] placed={len(_rows)} pairs_used={len(set(_pairSeq))} "
+                    f"order_inversions={_inv} idx->pair[:24]={_pairSeq[:24]}\n")
+            if __import__("os").environ.get("WEAVE_ALLOC"):
+                # Forward epilogue allocator (plain-woven recreate milestone): reproduce
+                # the current ALAP placement from a liveness model, validate EXACT parity
+                # with the production capturePlan, and compute the operand retirement
+                # timeline (the free-list release schedule the fold path will consume).
+                _sys = __import__("sys")
+                def _opkeys(_p):
+                    _s = set()
+                    for _c in self._plsinOperands(_p, self._PLSIN_MFMA_SOURCES):
+                        _k = self._plsinRegisterKeys(_c)
+                        if _k:
+                            _s.update(_k)
+                    return _s
+                # Liveness window per producer: [lower=0 (operands written in the main
+                # loop, before the store), readPos). Allocator = latest gap < readPos with
+                # instsBetween >= requiredCycles (ALAP), i.e. the current rule, expressed
+                # as a forward pass so the fold free-list is an incremental add.
+                _allocPlan = {}
+                _gapsByPos = sorted(candidates, key=lambda t: t[0])
+                for _p in qualifying:
+                    _readPos = consumers.get(id(_p))
+                    if _readPos is None:
+                        continue
+                    _chosen = None
+                    for _ap, _g in _gapsByPos:
+                        if _ap >= _readPos:
+                            continue
+                        _ib = sum(1 for _it in flat[_ap + 1:_readPos]
+                                  if isinstance(_it, Instruction))
+                        if _ib >= requiredCycles:
+                            _chosen = _g
+                    if _chosen is not None:
+                        _allocPlan[id(_p)] = _chosen
+                _mismatch = sum(1 for _k in set(_allocPlan) | set(capturePlan)
+                                if _allocPlan.get(_k) is not capturePlan.get(_k))
+                # Operand retirement timeline = free-list release schedule: per operand
+                # reg, the LAST (max) placed position among the woven MFMAs reading it.
+                _gapAnchor = {id(_g): _ap for _ap, _g in candidates}
+                _readers = {}
+                for _p in qualifying:
+                    for _k in _opkeys(_p):
+                        _readers.setdefault(_k, set()).add(id(_p))
+                _retire = {}
+                for _k, _rs in _readers.items():
+                    _poss = [_gapAnchor[id(_allocPlan[_pid])] for _pid in _rs
+                             if _pid in _allocPlan and id(_allocPlan[_pid]) in _gapAnchor]
+                    if _poss:
+                        _retire[_k] = max(_poss)
+                _sys.stderr.write(
+                    f"[WEAVE_ALLOC] alloc_placed={len(_allocPlan)} "
+                    f"parity_mismatch={_mismatch} operand_regs={len(_readers)} "
+                    f"retired={len(_retire)}\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}
