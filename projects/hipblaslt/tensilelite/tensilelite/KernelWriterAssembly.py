@@ -16219,7 +16219,11 @@ class KernelWriterAssembly(KernelWriter):
     # the zero-cost version is the Repack co-schedule (see proposal).
     self.states.subtileCoalesceDedStoreData = -1
     self.states.subtileCoalesceDedPack = -1
-    if self.states.subtileFusedLendVgprs:   # weave-with-lend path
+    # WEAVE_FOLDLEASE pass 2: the coalesce draws its blend/pack from leased RETIRED operand
+    # quads (zero VGPR), so skip the +8 dedicated checkout entirely -- this is what makes the
+    # fix zero-cost (vgpr_count stays at the stock 249, not 257).  Pass 1 (lease inactive) keeps
+    # the dedicated checkout so its placement distributes for the lease discovery.
+    if self.states.subtileFusedLendVgprs and not getattr(self.states, "subtileCoalesceLeaseActive", False):   # weave-with-lend path
       try:
         self.states.subtileCoalesceDedStoreData = self.vgprPool.checkOutAligned(4, 2, tag="coalesceDedStoreData", preventOverflow=True)
         self.states.subtileCoalesceDedPack = self.vgprPool.checkOutAligned(4, 2, tag="coalesceDedPack", preventOverflow=True)

@@ -4785,6 +4785,53 @@ class GlobalWriteBatchWriter:
       vCoalesceStoreData = _dedSD
     if foldCvtInterleave and _dedPk >= 0:
       vCoalescePack = _dedPk
+    # WEAVE_FOLDLEASE (zero-cost pass 2): draw the blend-output (vCoalesceStoreData) and batchB
+    # pack (vCoalescePack) from two RETIRED operand VGPR quads the planner leased for THIS capture,
+    # instead of the +8 dedicated quads.  The leased quads are dead operands (no later woven MFMA
+    # reads them -- the store-clobber guard enforces it), so writing them clobbers nothing and the
+    # weave distributes at zero VGPR cost.  Selected per capture (one activation arm); the current
+    # capture is the last appended instance.  Correctness does NOT depend on retirement (the guard
+    # protects any operand choice); retirement only buys distribution.
+    _foldLease = None
+    if foldCvtInterleave and weavePairB is not None:
+      _leasePlans = getattr(self.parentWriter.states, "subtileCoalesceLeasePlan", None)
+      if _leasePlans:
+        _caps = self.parentWriter.states.subtileWeaveCaptureInstances
+        _ci = (len(_caps) - 1) if _caps else -1
+        if 0 <= _ci < len(_leasePlans):
+          _foldLease = _leasePlans[_ci]
+    if _foldLease is not None and __import__("os").environ.get("WEAVE_FOLDLEASE_NOREG"):
+      # DIAGNOSTIC: run the two-pass but keep the ORIGINAL registers (no lease override).
+      # Isolates the two-pass re-emit mechanism from the leased-register correctness.
+      _foldLease = None
+    if _foldLease is not None:
+      _lq0, _lq1 = _foldLease["q0"], _foldLease["q1"]
+      # Hard invariants (silent-wrong-data territory): the two leased windows must be 2-aligned,
+      # mutually disjoint, and disjoint from batchA's own pack quad (vPack) -- otherwise the
+      # coalesce's own Phase1-pack -> Phase2-blend dataflow self-corrupts.
+      assert _lq0 % 2 == 0 and _lq1 % 2 == 0 and abs(_lq1 - _lq0) >= COALESCE_VALUC_WINDOW, \
+        f"fold-lease quads not 2-aligned/disjoint: q0={_lq0} q1={_lq1}"
+      # Each leased 4-reg window must not overlap batchA's pack quad nor ANY of the store's
+      # own cvt scratch (voffset/blend/perm-addr/lane-delta/addr-scratch/addrD).  An overlap
+      # would silently corrupt the coalesce's own dataflow -- fail loud instead.
+      def _ovl(_base):
+        return any(abs((_base) - (_other)) < COALESCE_VALUC_WINDOW
+                   for _other in (vPack, vVoff, vBlend, vPermAddr, vLGDelta, vAddrScratch, addrDVgpr)
+                   if _other is not None and _other >= 0)
+      assert not _ovl(_lq0) and not _ovl(_lq1), \
+        f"fold-lease quad overlaps store scratch: q0={_lq0} q1={_lq1} " \
+        f"vPack={vPack} vVoff={vVoff} vBlend={vBlend} vPermAddr={vPermAddr} " \
+        f"vLGDelta={vLGDelta} vAddrScratch={vAddrScratch} addrD={addrDVgpr}"
+      vCoalesceStoreData = _lq0
+      vCoalescePack      = _lq1
+      if not getattr(self.parentWriter.states, "_foldLeaseDiagDone", False):
+        self.parentWriter.states._foldLeaseDiagDone = True
+        __import__("sys").stderr.write(
+          f"[WEAVE_FOLDLEASE] emit: coalesce blend->v{_lq0}..{_lq0+3} pack->v{_lq1}..{_lq1+3} "
+          f"(vPack=v{vPack}, T={_foldLease['T']})\n")
+      phase1ModComment = f" [FOLDLEASE blend=v{_lq0} pack=v{_lq1}]"
+    else:
+      phase1ModComment = ""
     if foldCvtInterleave:
       phase1Mod = Module("16bitSubtileCoalescePhase1")
       phase2Mod = Module("16bitSubtileCoalescePhase2")
@@ -4805,7 +4852,7 @@ class GlobalWriteBatchWriter:
     # overwrite vCoalescePack=sumIdx0, and the phase2 blend overwrites vCoalesceStoreData=sumIdx1.  Interleaving the two
     # batches, or hoisting any batchB pack / the blend ahead of batchA's reads, would clobber a
     # live source and silently corrupt the store.  Keep batchA-first; do not reorder.
-    phase1Mod.addComment1(f"DPP coalesce tt0={tt0}+{partnerTt0}: pack batchA -> v[{vPack}:{vPack+3}], batchB -> v[{vCoalescePack}:{vCoalescePack+3}]")
+    phase1Mod.addComment1(f"DPP coalesce tt0={tt0}+{partnerTt0}: pack batchA -> v[{vPack}:{vPack+3}], batchB -> v[{vCoalescePack}:{vCoalescePack+3}]{phase1ModComment}")
     packPair(vPack+0, vc(sumIdx0, 0), vc(sumIdx0, 1), f"batchA sba=0 tt0={tt0}[0:1]")
     packPair(vPack+1, vc(sumIdx0, 2), vc(sumIdx0, 3), f"batchA sba=0 tt0={tt0}[2:3]")
     packPair(vPack+2, vc(sumIdx1, 0), vc(sumIdx1, 1), f"batchA sba=1 tt0={tt0}[0:1]")
