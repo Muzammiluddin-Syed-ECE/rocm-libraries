@@ -5249,6 +5249,66 @@ class LogicalScheduler:
                 pg={}
                 for p,g in capturePlan.items(): pg[id(g)]=pg.get(id(g),0)+1
                 __import__("sys").stderr.write(f"[WEAVE_DIAG] placed={len(capturePlan)} distinct_gaps={len(pg)} fill={sorted(pg.values(),reverse=True)}\n")
+            if __import__("os").environ.get("WEAVE_SUPPLY"):
+                # Retirement-timeline supply probe (read-only; no codegen change).
+                # Proves/refutes the Repack co-schedule's load-bearing assumption:
+                # that the operands of the woven terminal MFMAs, freed AT their gap
+                # position, supply the blend/pack demand (>=8 VGPRs, 2 quads) at each
+                # coalesce drain position before it needs them. Counts DISTINCT freed
+                # operand VGPRs; the real lease also needs 4-aligned quads, so this is
+                # an UPPER bound on usable supply (alignment caveat noted in output).
+                _sys = __import__("sys")
+                _gapPos = {}
+                for _a, _g, _role in candidates:
+                    _gapPos[id(_g)] = _a
+                _freePos = {}  # operand reg key -> latest (max) retirement gap position
+                for _p in qualifying:
+                    _g = capturePlan.get(id(_p))
+                    if _g is None:
+                        continue
+                    _pm = _gapPos.get(id(_g))
+                    if _pm is None:
+                        continue
+                    _srcs = _producerSources(_p)
+                    if not _srcs:
+                        continue
+                    for _k in _srcs:
+                        if _k is None:
+                            continue
+                        _freePos[_k] = max(_freePos.get(_k, -1), _pm)
+                _readPositions = sorted(
+                    position.get(id(_ri))
+                    for _pr in capture.get("pairs", [])
+                    for _ri, _s in _pr.get("reads", [])
+                    if position.get(id(_ri)) is not None)
+                _supplyAt = [sum(1 for _fp in _freePos.values() if _fp < _R)
+                             for _R in _readPositions]
+                _residual = sum(1 for _n in _supplyAt if _n < 8)
+                _first8 = next((_i for _i, _n in enumerate(_supplyAt) if _n >= 8), -1)
+                # 4-aligned-quad supply at the drain end: blend/pack need
+                # checkOutAligned(4,2). Count non-overlapping runs of >=4
+                # consecutive freed VGPR offsets starting on an even base.
+                def _alignedQuads(freeOffs):
+                    offs = sorted(freeOffs)
+                    quads = 0
+                    i = 0
+                    while i + 3 < len(offs):
+                        b = offs[i]
+                        if b % 2 == 0 and offs[i+1] == b+1 and offs[i+2] == b+2 and offs[i+3] == b+3:
+                            quads += 1
+                            i += 4
+                        else:
+                            i += 1
+                    return quads
+                _vgprOffs = [_k[2] for _k in _freePos
+                             if isinstance(_k, tuple) and len(_k) == 3 and _k[1] is None]
+                _sys.stderr.write(
+                    f"[WEAVE_SUPPLY] woven={len(capturePlan)} "
+                    f"freed_operand_vgprs={len(_freePos)} reads={len(_readPositions)} "
+                    f"residual_lt8={_residual} first_read_ge8={_first8} "
+                    f"max_supply={max(_supplyAt) if _supplyAt else 0} "
+                    f"aligned_quads_at_drain={_alignedQuads(_vgprOffs)} "
+                    f"curve_sampled={_supplyAt[0:256:16]}\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}
