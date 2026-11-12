@@ -366,6 +366,126 @@ def test_paired_store_repack_is_scoped():
     )
 
 
+def test_fold_fires_unconditionally_with_no_runtime_size_gate():
+    """``DPPStoreFold`` is the singular decider for the coalesce.
+
+    When the solution parameter is set (and the structural preconditions hold) the
+    coalesce fires on the eligible MXF4->bf16 subtile kernel *unconditionally* -- there
+    is no runtime M,N size gate. The earlier design precomputed a
+    ``subtileCoalesceSizeOkSgpr`` predicate in ``_emitSubtileGuards`` and branched on it
+    at each coalesce site; that is gone. So the in-scope kernel carries the coalesced
+    stores and no ``coalesce size gate`` text, while the fp32 control, outside
+    ``isMxf4SubtilePath``, carries neither.
+    """
+    in_scope = "\n".join(src for _b, src, _e in _emit(_IN_SCOPE))
+    control = "\n".join(src for _b, src, _e in _emit(_CONTROL))
+
+    assert re.search(r"quad_perm:\[0,0,2,2\]", in_scope), (
+        "the coalesced store is not emitted for the fold-enabled kernel"
+    )
+    assert "coalesce size gate" not in in_scope, (
+        "a runtime size gate is still emitted; DPPStoreFold should be the sole decider"
+    )
+
+    assert not re.search(r"quad_perm:\[0,0,2,2\]", control), (
+        "fp32 control is outside the coalesce path but carries a coalesced store"
+    )
+    assert "coalesce size gate" not in control, (
+        "fp32 control is outside the coalesce path but carries the size gate"
+    )
+
+
+def test_no_runtime_size_gate_predicate_is_emitted():
+    """The old design precomputed an ``M,N > threshold`` predicate once per batch and
+    branched on it at each coalesce site. ``DPPStoreFold`` removes that entirely: there
+    is no size-gate compute and no size-gate branch anywhere in the emitted corpus.
+    """
+    in_scope = "\n".join(src for _b, src, _e in _emit(_IN_SCOPE))
+    assert in_scope.count("coalesce size gate") == 0, (
+        "a runtime size-gate predicate/branch is still emitted under DPPStoreFold"
+    )
+
+
+def test_fold_is_admitted_across_the_broadened_wavetile_floor():
+    """The admission floor is ``MIWaveTile[0] >= 4`` (two M-adjacent pairs to coalesce),
+    broadened from the earlier MIWT8-only gate.
+
+    So both MT256x256 (MIWT8) and MT128x128 (MIWT4) coalesce when ``DPPStoreFold`` is
+    set, while the out-of-scope fp32 control coalesces at neither -- the
+    ``isMxf4SubtilePath`` structural gate still holds. Matches the coalesce-only store
+    comment rather than a bare ``quad_perm`` (the MX scale path emits unrelated lane swaps).
+    """
+    tiles = _by_macro_tile(_emit(_IN_SCOPE))
+    control = _by_macro_tile(_emit(_CONTROL))
+    assert "all-lanes coalesced store" in tiles["MT256x256"], (
+        "MIWT8 MT256x256 is coalesce-eligible but has no coalesced store"
+    )
+    assert "all-lanes coalesced store" in tiles["MT128x128"], (
+        "MIWT4 MT128x128 is within the broadened floor but has no coalesced store"
+    )
+    assert "all-lanes coalesced store" not in control["MT256x256"], (
+        "fp32 control is outside isMxf4SubtilePath but carries a coalesced store"
+    )
+
+
+def test_coalesced_store_emits_the_full_dpp_blend_pattern():
+    """Structural (not numerical) lock on the coalesced store's byte pattern.
+
+    The coalesce replaces four half-filled paired stores with two all-lanes stores, each
+    assembled by a quad_perm DPP blend of batchA (even lanes) and batchB (odd lanes, selected by
+    a 0xaaaaaaaa v_cndmask mask). This pins that whole shape so a refactor of the blend math is
+    caught at codegen time. It does NOT prove the result is numerically correct -- that needs a
+    GPU ``hipblaslt-bench --verify`` (norm_error=0), the load-bearing gate for this cross-lane
+    DPP path.
+    """
+    in_scope = "\n".join(src for _b, src, _e in _emit(_IN_SCOPE))
+    assert re.search(r"quad_perm:\[0,0,2,2\]", in_scope), "even-column coalesced store missing"
+    assert re.search(r"quad_perm:\[1,1,3,3\]", in_scope), "odd-column coalesced store missing"
+    assert re.search(r"0x[aA]{8}", in_scope), "odd-lane (0xaaaaaaaa) blend mask missing"
+    assert "v_cndmask_b32" in in_scope, "the even/odd data blend (v_cndmask) is missing"
+    assert in_scope.count("all-lanes coalesced store") >= 2, (
+        "expected two all-lanes coalesced stores per coalesce site"
+    )
+
+
+def test_subtile_store_data_war_fence_uses_two_wait_states_on_gfx940():
+    """The subtile fold's >8B store-data WAR fence is ``s_nop 1`` (2 wait states), not ``s_nop 0``.
+
+    A VALU that overwrites a ``buffer_store_dwordx4``'s vdata needs 2 wait states on
+    GFX940-family parts, including gfx950, per LLVM ``checkVALUHazardsHelper``
+    (``hasGFX940Insts() ? 2 : 1``); the pre-GFX940 ``s_nop 0`` (1 wait state) is a latent
+    store-data corruption. The subtile paired/coalesced store emitters tag their WAR fence
+    with a ``gfx940+`` comment -- those must all be ``s_nop 1``. (The general serializedStore
+    epilogue WAR is a separate, library-wide site and is out of scope for this test.)
+    """
+    in_scope = "\n".join(src for _b, src, _e in _emit(_IN_SCOPE))
+    assert re.search(r"s_nop 1[^\n]*gfx940\+", in_scope), (
+        "the subtile fold must emit its store-data WAR fence as 's_nop 1' (2 wait states, gfx940+)"
+    )
+    assert not re.search(r"s_nop 0[^\n]*gfx940\+", in_scope), (
+        "a subtile-fold store-data WAR fence is still 's_nop 0' (1 wait state) -- one wait short on gfx940+"
+    )
+
+
+def test_uncoalesced_fallback_arm_is_the_partial_m_edge_guard_only():
+    """The plain arm keeps exactly one runtime branch over the coalesce: the partial-M
+    edge guard (``SubtileMGuard``).
+
+    When not all four M-blocks of a pair-of-pairs are in bounds the boundary arm falls
+    back to an un-coalesced paired store, because the cross-lane DPP needs full EXEC.
+    So the coalesced store and its ``subtile_coalesce_fallback`` arm coexist. The interior
+    peel, by contrast, coalesces unconditionally -- the old ``subtile_interior_coalesce_small``
+    size arm is gone, since ``DPPStoreFold`` is the only decider.
+    """
+    in_scope = "\n".join(src for _b, src, _e in _emit(_IN_SCOPE))
+    assert "all-lanes coalesced store" in in_scope, "coalesced store missing"
+    assert "subtile_coalesce_fallback" in in_scope, "partial-M edge-guard fallback arm missing"
+    assert "subtile_interior_coalesce_small" not in in_scope, (
+        "the interior-peel size-gate fallback should be gone under DPPStoreFold"
+    )
+    assert "buffer_store_dwordx4" in in_scope, "the fallback emits no paired store"
+
+
 def test_preloop_wait_is_partial_and_drains_the_first_batch():
     """The pre-loop waits on half its loads, and on exactly the right half.
 
