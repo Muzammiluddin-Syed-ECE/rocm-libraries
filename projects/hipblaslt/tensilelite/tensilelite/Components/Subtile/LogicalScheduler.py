@@ -5609,20 +5609,39 @@ class LogicalScheduler:
                         f"pairs_with_quad={_nAcq} free_before_pair={_curve}\n")
                     _sys.stderr.write(f"[WEAVE_FREELIST] acquired_quad_base_per_pair={_acq}\n")
                 if __import__("os").environ.get("WEAVE_VALUC"):
-                    # Expanded pool: dead ValuC accumulator slots (the original fold's reuse
-                    # target). A ValuC slot's death = its convert read (general liveness over
-                    # flat); the woven MFMA only WRITES acc (before the convert), never reads
-                    # it, so store-local last-use is the true death even pre-move. ValuC keys
-                    # stay symbolic (name='ValuC'), so this is a separate symbolic pool from
-                    # the physical operand free-list. Report dead-ValuC aligned quads per pair.
-                    _valcDeath = {}
+                    # UNIFIED allocator pool, evaluated at each pair's pack WRITE position
+                    # (its first convert) -- NOT the gap. A register is offered iff its last
+                    # use precedes the write, so pair-k's own ValuC (read AT those converts)
+                    # is naturally excluded; there is no same/cross-pair special case. The
+                    # unified last-use = max(store last-use over flat, operand retirement at
+                    # the woven gap), because a woven MFMA's operand reads are not yet in flat.
+                    import re as _re2
+                    _storeLU = {}
                     for _idx2, _it2 in enumerate(flat):
                         if not hasattr(_it2, "getParams"):
                             continue
                         _w2, _r2 = self._epilogueDefUse(_it2)
                         for _k2 in _r2:
-                            if _k2[1] == "ValuC":
-                                _valcDeath[_k2[2]] = max(_valcDeath.get(_k2[2], -1), _idx2)
+                            _storeLU[_k2] = max(_storeLU.get(_k2, -1), _idx2)
+                    _lu = dict(_storeLU)
+                    for _pos3, _p in _placed:
+                        for _c3 in self._plsinOperands(_p, self._PLSIN_MFMA_SOURCES):
+                            for _k3 in (self._plsinRegisterKeys(_c3) or ()):
+                                if _k3 is not None:
+                                    _lu[_k3] = max(_lu.get(_k3, -1), _pos3)
+                    # pack write position = first VCvtPk of each pair (the converts before its gap)
+                    _convPos = [_i4 for _i4, _it4 in enumerate(flat)
+                                if type(_it4).__name__.startswith("VCvtPk")]
+                    _sortedGaps = sorted((_ap, _re2.search(r"pair(\d+)", getattr(_g, "name", "") or ""))
+                                         for _ap, _g in candidates)
+                    _sortedGaps = [(_ap, int(_m.group(1))) for _ap, _m in _sortedGaps if _m]
+                    _writePos = {}
+                    _prev4 = -1
+                    for _gp4, _k4 in _sortedGaps:
+                        _firsts = [_c for _c in _convPos if _prev4 < _c <= _gp4]
+                        if _firsts:
+                            _writePos[_k4] = min(_firsts)
+                        _prev4 = _gp4
                     def _alignedQuadCount(_offsset):
                         _o2 = sorted(_offsset); _q = 0; _i2 = 0
                         while _i2 + 3 < len(_o2):
@@ -5632,27 +5651,16 @@ class LogicalScheduler:
                             else:
                                 _i2 += 1
                         return _q
-                    _valcCurve = []
-                    for _P in _pairPos:
-                        _dead = [_o for _o, _d in _valcDeath.items() if _d < _P]
-                        _valcCurve.append(_alignedQuadCount(_dead))
-                    _opQuadCurve = []
-                    _fl2 = EpilogueFreeList()
-                    _rc2 = {}                    # fresh reader counts (outer _readerCount is spent)
-                    for _pos3, _p in _placed:
-                        for _off in _opoffs(_p):
-                            _rc2[_off] = _rc2.get(_off, 0) + 1
-                    for _P in _pairPos:
-                        _opQuadCurve.append(_alignedQuadCount(set(_fl2._free)))
-                        for _p in _byPos.get(_P, ()):
-                            for _off in _opoffs(_p):
-                                _rc2[_off] -= 1
-                                if _rc2[_off] == 0:
-                                    _fl2.release([_off])
+                    _opCurve = []; _vcCurve = []
+                    for _gp4, _k4 in _sortedGaps:
+                        _wp = _writePos.get(_k4, _gp4)
+                        _opDead = [_kk[2] for _kk, _d in _lu.items() if _d < _wp and _kk[1] is None]
+                        _vcDead = [_kk[2] for _kk, _d in _lu.items() if _d < _wp and _kk[1] == "ValuC"]
+                        _opCurve.append(_alignedQuadCount(_opDead))
+                        _vcCurve.append(_alignedQuadCount(_vcDead))
                     _sys.stderr.write(
-                        f"[WEAVE_VALUC] dead_valuc_regs={len(_valcDeath)} "
-                        f"operand_quads_per_pair={_opQuadCurve} "
-                        f"dead_valuc_quads_per_pair={_valcCurve}\n")
+                        f"[WEAVE_VALUC] writePos_known={len(_writePos)}/{len(_sortedGaps)} "
+                        f"operand_quads@write={_opCurve} valuc_quads@write={_vcCurve}\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}
