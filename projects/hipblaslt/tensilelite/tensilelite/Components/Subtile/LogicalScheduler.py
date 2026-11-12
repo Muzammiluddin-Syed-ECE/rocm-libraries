@@ -5138,6 +5138,9 @@ class LogicalScheduler:
                 for _d in getattr(self, "_wovenPackPlans", []) or []:
                     _packPlan.update(_d)
                 if __import__("os").environ.get("WEAVE_PACKFREE") and _packPlan:
+                    __import__("sys").stderr.write(
+                        f"[WEAVE_PACKFREE] two-pass re-emit: leasing pack quads for "
+                        f"{len(_packPlan)} pairs -> {sorted(_packPlan.items())[:6]}...\n")
                     writer.states.subtileWovenPackPlan = _packPlan
                     writer.states.subtileWeaveMfmaGroups = \
                         copy.deepcopy(weaveGroups) if weaveGroups is not None else None
