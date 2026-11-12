@@ -4939,6 +4939,33 @@ class LogicalScheduler:
             if self.config.numSubIterK >= 2 and has_ab_holes:
                 return {}, self._operandLendVgprs(dead_ids)
             return None, self._operandLendVgprs(None)
+        # Small tile (MT<=256x256): default is the planner weave with no lend (the loop has
+        # headroom). But the DPP store-coalesce needs a >=4-entry fused-store batch (two M-pairs),
+        # and that extra element (batch 3->4) costs ~12 VGPRs: with the weave keeping every operand
+        # tile live, the MT256x256 OptNLL store overflows (268 VGPRs > 256 cap). Lending EVERY
+        # operand tile clears the overflow but only by forcing weaveGroups=None, which kills the
+        # store/MFMA overlap (~5-8% on MI355X @8192^3). Instead keep the weave ({}) and lend ONLY
+        # the dead K=0 operand holes -- the same overlap-preserving partial lend the large-tile
+        # path uses: the woven last-K MFMAs keep their live sources while the dead holes (far more
+        # than the +12 we need) back the floor-4 coalesce batch. Gate to the coalesce-firing
+        # conditions (gfx950, MXF4->bf16 TN subtile, MI16, MIWT8); elsewhere the coalesce never
+        # fires, so keep develop's no-lend policy. Single-K tiles (no A/B holes) fall back to the
+        # full lend -- same as before, correct, just without the overlap there is nothing to weave.
+        # MUST gate on DPPStoreFold: this partial-lend policy only applies when the coalesce is
+        # actually active. Without the fold, a non-fold MT256x256 MIWT8 kernel would otherwise take
+        # this dead-hole lend instead of develop's no-lend ({}, []) path, shifting the fused-store
+        # ValuC staging base and corrupting the plain store (GPU-verified: non-fold miscompare).
+        _miwt = kernel.get("MIWaveTile", [0, 0])
+        if (kernel.get("DPPStoreFold")
+                and isMxf4SubtilePath(kernel)
+                and tuple(kernel.get("ISA", ())) == (9, 5, 0)
+                and kernel.get("MatrixInstM") == 16
+                and len(_miwt) >= 2 and _miwt[0] == 8):
+            dead_ids = self._deadOperandTileIds(unroll_iter)
+            has_ab_holes = bool(dead_ids.get("A") or dead_ids.get("B"))
+            if self.config.numSubIterK >= 2 and has_ab_holes:
+                return {}, self._operandLendVgprs(dead_ids)   # weave kept, partial (dead-hole) lend
+            return None, self._operandLendVgprs(None)          # no holes: fall back to full lend
         return {}, []
 
     def _plsinStagedStoreCount(self, weaveGroups, lendTiles, storeCfg=None):
@@ -5367,7 +5394,7 @@ class LogicalScheduler:
                 return
             name = getattr(mod, "name", "") or ""
             # Both woven store forms use the Phase1(converts)/PlsinGap_/Phase2 shape.
-            if name in ("16bitSubtilePairedStoreWoven", "16bitSubtilePairedStoreRepack"):
+            if name in ("16bitSubtilePairedStoreWoven", "16bitSubtilePairedStoreCoalesce"):
                 if self._rewriteOneWovenPair(mod, valuPerGap):
                     rewritten += 1
                 return
@@ -5383,11 +5410,11 @@ class LogicalScheduler:
         others = []
         for child in list(woven.items()):
             cname = getattr(child, "name", "") or ""
-            if cname in ("16bitSubtilePairedStorePhase1", "16bitSubtileRepackPhase1"):
+            if cname in ("16bitSubtilePairedStorePhase1", "16bitSubtileCoalescePhase1"):
                 phase1 = child
             elif cname.startswith("PlsinGap_"):
                 gap = child
-            elif cname in ("16bitSubtilePairedStorePhase2", "16bitSubtileRepackPhase2"):
+            elif cname in ("16bitSubtilePairedStorePhase2", "16bitSubtileCoalescePhase2"):
                 phase2 = child
             else:
                 others.append(child)

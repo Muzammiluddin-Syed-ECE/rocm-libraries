@@ -253,6 +253,11 @@ class GlobalReadGprRecord:
 ################################################################################
 # Assembly Kernel
 ################################################################################
+# MEASUREMENT SWITCH (temporary): True forces the DPP store-coalesce off everywhere, for a
+# no-coalesce baseline build.  Leave False for normal always-coalesce behaviour.
+_COALESCE_MEASURE_OFF = False
+
+
 class KernelWriterAssembly(KernelWriter):
 
   ##############################################################################
@@ -16375,6 +16380,38 @@ class KernelWriterAssembly(KernelWriter):
         if getattr(_vt.regList, "is_vgpr", False):
           for _idx in _vt.regList.indices:
             _protected.add(_idx)
+    # PROTOTYPE (weave distribution, correct version): dedicated blend-output + batchB-pack quads from
+    # GENUINELY-free registers, allocated BEFORE the operand lend below adds the K=0 holes to the pool.
+    # At this point the operand tiles are still checked out, so checkOutAligned draws from real headroom
+    # (above the high-water), NOT from an operand hole the weave re-makes live -- so the blend/pack do
+    # not alias any woven terminal-MFMA operand, and the weave guard permits the later gaps. Costs +8
+    # VGPRs (overflows MT256x256 at 249/256 -> falls back to the ValuC-reuse cluster; fits on roomier
+    # tiles). This is the correct kernel to MEASURE whether the distributed weave is worth anything;
+    # the zero-cost version is the Repack co-schedule (see proposal).
+    self.states.subtileCoalesceDedStoreData = -1
+    self.states.subtileCoalesceDedPack = -1
+    # Gate the +8 dedicated-quad grab on the fold actually being active for this kernel. The lend
+    # (subtileFusedLendVgprs) also fires for NON-fold large-tile subtile kernels; grabbing quads
+    # there would change their codegen and break default byte-identity. The structural predicate
+    # mirrors isSubtileCoalesce (globalWriteElements) minus the coalesceFits headroom test, which
+    # the try/except below performs directly.
+    _miwtDed = kernel.get("MIWaveTile", [0, 0])
+    _foldActiveDed = bool(kernel.get("DPPStoreFold")
+                          and kernel.get("UseSubtileImpl")
+                          and isMxf4SubtilePath(kernel)
+                          and tuple(kernel.get("ISA", ())) == (9, 5, 0)
+                          and kernel.get("MatrixInstM") == 16
+                          and len(_miwtDed) >= 2 and _miwtDed[0] >= 4)
+    if self.states.subtileFusedLendVgprs and _foldActiveDed:   # weave-with-lend fold path
+      try:
+        self.states.subtileCoalesceDedStoreData = self.vgprPool.checkOutAligned(4, 2, tag="coalesceDedStoreData", preventOverflow=True)
+        self.states.subtileCoalesceDedPack = self.vgprPool.checkOutAligned(4, 2, tag="coalesceDedPack", preventOverflow=True)
+      except Exception:
+        # +8 does not fit (saturated tile): release any partial grab, fall back to ValuC reuse.
+        if self.states.subtileCoalesceDedStoreData >= 0:
+          self.vgprPool.checkIn(self.states.subtileCoalesceDedStoreData)
+        self.states.subtileCoalesceDedStoreData = -1
+        self.states.subtileCoalesceDedPack = -1
     lentVgprs = []
     for _base, _size in (self.states.subtileFusedLendVgprs or []):
       if any((_base + _k) in _protected for _k in range(_size)):
@@ -16774,6 +16811,11 @@ class KernelWriterAssembly(KernelWriter):
     # the end-of-kernel deallocVgprTiles observe the exact original pool state.
     for _base in reversed(lentVgprs):
       self.vgprPool.removeFromCheckOut(_base)
+    # PROTOTYPE: release the dedicated blend/pack quads.
+    if getattr(self.states, "subtileCoalesceDedPack", -1) >= 0:
+      self.vgprPool.checkIn(self.states.subtileCoalesceDedPack)
+    if getattr(self.states, "subtileCoalesceDedStoreData", -1) >= 0:
+      self.vgprPool.checkIn(self.states.subtileCoalesceDedStoreData)
 
     return module
 
@@ -17949,6 +17991,23 @@ class KernelWriterAssembly(KernelWriter):
     self.states.subtileHoistedPermAddr = False
     if not isMxf4SubtilePath(kernel) or cvtVgprStruct is None:
       return module
+    # Hoist the even-lane DPP blend mask stage here (once per store): the mask SGPR is held by
+    # globalWriteElements for the whole store and no batch writes it, so one copy -- emitted into
+    # this fixed preamble module, ahead of every store arm and not subject to store-module
+    # reordering -- dominates the per-coalesce re-stage and precedes every per-store VCC reload in
+    # program order. Done before the lane-math early return so it stands independent of that path.
+    _maskSgpr = getattr(cvtVgprStruct, "coalesceMaskSgpr", -1)
+    if _maskSgpr >= 0:
+      module.addComment1("hoisted even-lane DPP blend mask (0x5555...5555, once per store)")
+      module.add(SMovB32(dst=sgpr(_maskSgpr), src=hex(0x55555555), comment="even-lane select mask lo32"))
+      if self.states.laneSGPRCount >= 2:
+        module.add(SMovB32(dst=sgpr(_maskSgpr+1), src=hex(0x55555555), comment="even-lane select mask hi32"))
+    _oddMaskSgpr = getattr(cvtVgprStruct, "coalesceOddMaskSgpr", -1)
+    if _oddMaskSgpr >= 0:
+      module.addComment1("hoisted odd-lane DPP blend mask (0xAAAA...AAAA, store-2 batchA-identity, once per store)")
+      module.add(SMovB32(dst=sgpr(_oddMaskSgpr), src=hex(0xAAAAAAAA), comment="odd-lane select mask lo32"))
+      if self.states.laneSGPRCount >= 2:
+        module.add(SMovB32(dst=sgpr(_oddMaskSgpr+1), src=hex(0xAAAAAAAA), comment="odd-lane select mask hi32"))
     if getattr(cvtVgprStruct, "vgprLaneGroupDelta", -1) < 0:
       return module
     from .Components.GlobalWriteBatch import plsinStorePermlane16Active
@@ -17998,7 +18057,7 @@ class KernelWriterAssembly(KernelWriter):
       return False
     return self.states.useBias == DataDirection.READ
 
-  def _plsinFoldDeferredPtrNull(self, kernel, module, fieldName, badSgpr, flagSgpr, offSgpr, extOffset):
+  def _plsinCoalesceDeferredPtrNull(self, kernel, module, fieldName, badSgpr, flagSgpr, offSgpr, extOffset):
     """OR a deferred 64-bit kernarg pointer into *badSgpr* if it is non-null.
 
     *flagSgpr* / *offSgpr* are scratch; they are overwritten. *extOffset* is the
@@ -18182,10 +18241,10 @@ class KernelWriterAssembly(KernelWriter):
             + self.states.userArgsInfo.scaleDSize)
           extBias = extSav + self.states.userArgsInfo.scaleAlphaVecSize
         if kernel["ProblemType"]["UseScaleAlphaVec"]:
-          self._plsinFoldDeferredPtrNull(
+          self._plsinCoalesceDeferredPtrNull(
             kernel, m, "AddressScaleAlphaVec", bad, flag, off, extSav)
         if kernel["ProblemType"]["UseBias"]:
-          self._plsinFoldDeferredPtrNull(
+          self._plsinCoalesceDeferredPtrNull(
             kernel, m, "AddressBias", bad, flag, off, extBias)
         # StreamK: this WG started the tile (LocalStart == 0).
         if useStreamK:
@@ -18573,6 +18632,12 @@ class KernelWriterAssembly(KernelWriter):
                                      comment="numValid16NBlocks = clamped >> 4"))
     self.sgprPool.checkIn(tmpN)
 
+    # DPP store-coalesce: no runtime size gate. DPPStoreFold is the singular decider
+    # (see isSubtileCoalesce), so when the fold is active it fires on EVERY store path
+    # unconditionally. Leaving subtileCoalesceSizeOkSgpr = None makes the plain-arm and
+    # interior-peel dispatch in GlobalWriteBatch take their unconditional-coalesce branch.
+    self.states.subtileCoalesceSizeOkSgpr = None
+
     self.states.subtileMBlockSize = mBlockSize
 
   ##############################################################################
@@ -18679,6 +18744,29 @@ class KernelWriterAssembly(KernelWriter):
     vgprAddrScratch: int = -1     # per-store scratch: holds (addrDVgpr scaled + lane_group*8) without modifying addrDVgpr
     vgprPairPackRing: int = -1    # base of the paired-store pack ring (numPairPackQuads 4-vgpr quads)
     numPairPackQuads: int = 1     # quads in that ring; 1 puts every paired store on vgprBf16Temp
+    # DPP store-coalesce extras. Allocated only when isSubtileCoalesce.
+    # coalesceAllocated is a SENTINEL (True == the 9-reg coalesce cvt block was reserved); the blended
+    # store src is NOT a dedicated reg -- it lives in a reused dead ValuC slot (vCoalesceStoreData=sumIdx1).
+    coalesceAllocated: bool = False   # coalesce cvt-block reserved? (gates the coalesce in GlobalWriteBatch)
+    vgprVoff: int = -1            # per-store blended voffset (base vs base+64B by odd-lane mask)
+    vgprBlendTmp: int = -1        # scratch for the quad_perm data/addr blend
+    vgprCoalesceStoreData: int = -1  # PROTOTYPE: dedicated blend-output quad (genuinely-free; weave distribution)
+    vgprCoalescePack2: int = -1      # PROTOTYPE: dedicated batchB-pack quad (genuinely-free; weave distribution)
+    # (The blended store data and batchB's packed data reuse dead ValuC slots -- vCoalesceStoreData=
+    # sumIdx1, vCoalescePack=sumIdx0 -- at zero VGPR cost; the terminal-MFMA clobber that threatened
+    # that reuse under the weave is handled by the store-module clobber guard in
+    # _planCapturedTerminalMfmas, so no dedicated quad is allocated here.)
+    # Persistent even-lane blend mask SGPR (0x5555...5555) for the DPP v_cndmask blends. The DPP
+    # blend mask must sit in VCC (volatile), so it is reloaded per store; this pair holds the
+    # constant so the stage is hoisted ONCE (emitSubtileStoreLaneMath) instead of per coalesce.
+    # Allocated only when isSubtileCoalesce AND the SGPR pool has room (checkOutAligned with
+    # preventOverflow); -1 -> GlobalWriteBatch falls back to re-staging tmpS23 per coalesce.
+    coalesceMaskSgpr: int = -1
+    # Optional second mask holding 0xAAAA (odd-lane select), staged once next to coalesceMaskSgpr.
+    # Lets store 2 (odd n-columns) run the batchA-identity blend -> cleaner/symmetric generated store
+    # (drops store 2's per-dword batchA v_mov_dpp; perf-neutral, those movs overlap the store drain).
+    # Reserved only on weave kernels (which have the SGPR headroom); -1 -> store 2 keeps even-select.
+    coalesceOddMaskSgpr: int = -1
 
   class FP8CVTVgprStruct(NamedTuple):
     vgprFp8NanInf: int = -1
@@ -19382,6 +19470,71 @@ class KernelWriterAssembly(KernelWriter):
         # active feature appends its own disjoint sub-window, so no two offsets collide.
         base = 7 if kernel.get("UseSubtileImpl") else 4
         nxt  = base
+        # DPP store-coalesce: append 2 cvt VGPRs for the per-store
+        # voffset blend (vVoff) and the quad_perm blend temp (vBlend).  The blended store data
+        # is NOT a dedicated register -- it reuses a dead ValuC slot (see
+        # _emit16bitSubtilePairedStoreCoalesce).  This cvt footprint is absorbed by the
+        # coalesce's operand lend (see _selectPlsinFusedStorePolicy), so the high-water
+        # does not grow.
+        #
+        # Gate: the DPPStoreFold solution parameter is the SINGULAR decider for the fold.
+        # When set, EVERY store path (fused PLSIN arm, plain non-fused arm, interior peel)
+        # coalesces unconditionally -- there is no runtime M,N size gate (the old plain-path
+        # gate is disabled; see _emitSubtileGuards). The fold still requires its structural
+        # preconditions (gfx950 MXF4->bf16 TN subtile, MI16) and a floor of MIWaveTile[0] >= 4:
+        # the coalesce joins two M-adjacent pairs (4 M-blocks) into one store, so MIWT[0] < 4
+        # has no pair-of-pairs to coalesce. NOTE: only MIWT[0]==8 is correctness-verified; other
+        # heights (4/6) emit the as-yet-unproven row/half-line geometry -- gate on --verify.
+        COALESCE_MIWT_FLOOR = 4
+        miwt = kernel.get("MIWaveTile", [0, 0])
+        maxVgpr = self.states.regCaps["MaxVgpr"]
+        # Fold-attributable VGPR increment over the non-fold subtile store. The base-7 block (the
+        # 4-reg pack quad + vPermAddr/vLaneGroupDelta/vAddrScratch) is allocated for the subtile
+        # paired store whether or not the fold is active, so it is ALREADY reflected in
+        # pool.size(); the fold adds only the two coalesce-only registers vgprVoff + vgprBlendTmp.
+        # batchB's packed data and the blended store src reuse dead ValuC (see
+        # _emit16bitSubtilePairedStoreCoalesce), so the measured net cost is 0. Charge the +2
+        # increment, not the full base+2 block -- charging the shared base double-counts registers
+        # already in budget and spuriously rejects wider tiles (e.g. MT256x320) that have room.
+        coalesceFoldExtra = 2   # vgprVoff + vgprBlendTmp; base-7 is shared with the non-fold path
+        coalesceFits = (self.vgprPool.size() + coalesceFoldExtra) <= maxVgpr
+        # _COALESCE_MEASURE_OFF: measurement switch to force the coalesce off everywhere (no-coalesce
+        # baseline build), independent of DPPStoreFold.
+        # DPPStoreFold is the singular decider: when set (and the structural preconditions below
+        # hold) the fold is COMPILE-TIME allocated and fires UNCONDITIONALLY on every store path
+        # -- there is no runtime size gate. The structural preconditions are hard correctness
+        # bounds: gfx950, MXF4->bf16 TN subtile, MI16, and MIWaveTile[0] >= 4 (need 2 M-adjacent
+        # pairs to coalesce). Only MIWT[0]==8 is correctness-verified; 4/6 are experimental.
+        isSubtileCoalesce = bool(kernel.get("DPPStoreFold")
+                             and kernel.get("UseSubtileImpl")
+                             and isMxf4SubtilePath(kernel)
+                             and tuple(kernel.get("ISA", ())) == (9, 5, 0)
+                             and kernel.get("MatrixInstM") == 16
+                             and len(miwt) >= 2 and miwt[0] >= COALESCE_MIWT_FLOOR
+                             and coalesceFits
+                             and not _COALESCE_MEASURE_OFF)
+        # Published so the operand-lend policy (_selectPlsinFusedStorePolicy) couples the lend
+        # to the fold, and so GlobalWriteBatch knows the fold is live on this kernel.
+        self.states.subtileCoalesceActive = isSubtileCoalesce
+        if isSubtileCoalesce and __import__("os").environ.get("COALESCE_DIAG"):
+          __import__("sys").stderr.write(
+            f"[COALESCE_FIRE] DPP store-coalesce active: MT{kernel.get('MacroTile0')}x{kernel.get('MacroTile1')} "
+            f"MIWT{miwt} dedStoreData={getattr(self.states,'subtileCoalesceDedStoreData',-1)} "
+            f"dedPack={getattr(self.states,'subtileCoalesceDedPack',-1)} poolSize={self.vgprPool.size()}\n")
+        # The DPP coalesce requires the N-column-aligned batch tiling (_coalesceBatchBounds in the
+        # store-batch loop) so a batch never straddles an N-column -- but that tiling is only built
+        # on the non-CompactLoopStore path (CLS emits a reduced runtime-loop body, where
+        # numBatchesCLS<numBatches has its own meaning that our re-tiling would corrupt). Every
+        # current F4BS subtile-coalesce kernel is CLS-off; enforce that so a future CLS+fold kernel
+        # fails loud here instead of silently straddling N-columns (MIWT[0]%4!=0) and mis-placing
+        # the bias/ScaleAlphaVec store-drain barrier.
+        assert not (isSubtileCoalesce and kernel["CompactLoopStore"]), \
+          "DPP store-coalesce + CompactLoopStore is unsupported (N-column-aligned store batching " \
+          "is only applied on the non-CLS path)."
+        coalesceVoff = coalesceBlend = -1
+        if isSubtileCoalesce:
+          coalesceVoff, coalesceBlend = nxt, nxt + 1
+          nxt += 2
         numCvtVgprs = nxt if kernel.get("UseSubtileImpl") else 4
         # Paired-store pack ring is blk-sched's permlane16 paired-store mechanism, held in
         # its own allocation rather than appended to the cvt block (growing that block
@@ -19403,13 +19556,50 @@ class KernelWriterAssembly(KernelWriter):
         # off numElementsPerBatch, which has a hard floor at MIWaveTile[0] (see _pairPackQuad).
         pairRing = self.vgprPool.checkOutAligned(4 * (pairQuads - 1), 2, tag="subtilePairPackRing") \
                    if pairQuads > 1 else -1
+        # The coalesce blend reuses dead ValuC slots for batchB's packed data and the blended store
+        # src (vCoalescePack=sumIdx0, vCoalesceStoreData=sumIdx1) at zero VGPR cost; the terminal-MFMA
+        # relocation that threatened that reuse under the weave is handled by the store-module clobber
+        # guard in _planCapturedTerminalMfmas, so no dedicated store-data/pack quad is allocated.
+        #
+        # Persistent even-lane blend mask SGPR: hoist the 0x5555...5555 stage out of every coalesce
+        # into emitSubtileStoreLaneMath. Allocate ONLY when the pool has room; on the tight fold
+        # kernels (MT288x256 sits at the SGPR cap) the checkout overflows and we leave it -1, and
+        # GlobalWriteBatch re-stages tmpS23 per coalesce (correct, just a few extra scalar movs). A
+        # dedicated reg is never recycled as scratch, so one stage survives to every per-store reload.
+        coalesceMaskSgpr = -1
+        coalesceOddMaskSgpr = -1
+        if isSubtileCoalesce:
+          try:
+            coalesceMaskSgpr = self.sgprPool.checkOutAligned(self.states.laneSGPRCount, 2,
+                                 tag="subtileCoalesceMask", preventOverflow=True)
+          except Exception:  # pool overflow; RegisterPool's ResourceOverflowException is a mis-defined
+            coalesceMaskSgpr = -1  # function (raises TypeError), so catch broadly -- the fallback is always correct
+          # Second pair for the 0xAAAA odd-select mask (store-2 batchA-identity blend -> cleaner,
+          # symmetric generated store; perf-neutral). preventOverflow only checks the pool HERE, not
+          # the kernel's later peak (a downstream longBranch temp), so a successful checkout can still
+          # push a near-cap kernel to 103>102 and FATAL. The near-cap fold kernels are the non-weave
+          # (PLSIN0) ones; gate the second pair on the weave path, which has the headroom. Non-weave
+          # and tight kernels skip it and keep the even-select store-2 form (correct, just less tidy).
+          if coalesceMaskSgpr >= 0 and getattr(self.states, "subtileFusedWeave", False):
+            try:
+              coalesceOddMaskSgpr = self.sgprPool.checkOutAligned(self.states.laneSGPRCount, 2,
+                                      tag="subtileCoalesceOddMask", preventOverflow=True)
+            except Exception:
+              coalesceOddMaskSgpr = -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
                                                vgprLaneGroupDelta=(cvtVgpr+5) if kernel.get("UseSubtileImpl") else -1, \
                                                vgprAddrScratch=(cvtVgpr+6) if kernel.get("UseSubtileImpl") else -1, \
                                                vgprPairPackRing=pairRing, \
-                                               numPairPackQuads=pairQuads)
+                                               numPairPackQuads=pairQuads, \
+                                               coalesceAllocated=isSubtileCoalesce, \
+                                               vgprVoff=(cvtVgpr+coalesceVoff) if isSubtileCoalesce else -1, \
+                                               vgprBlendTmp=(cvtVgpr+coalesceBlend) if isSubtileCoalesce else -1, \
+                                               vgprCoalesceStoreData=getattr(self.states, "subtileCoalesceDedStoreData", -1) if isSubtileCoalesce else -1, \
+                                               vgprCoalescePack2=getattr(self.states, "subtileCoalesceDedPack", -1) if isSubtileCoalesce else -1, \
+                                               coalesceMaskSgpr=coalesceMaskSgpr, \
+                                               coalesceOddMaskSgpr=coalesceOddMaskSgpr)
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
@@ -19721,6 +19911,10 @@ class KernelWriterAssembly(KernelWriter):
         self.vgprPool.checkIn(cvtVgpr)
         if pairRing >= 0:
           self.vgprPool.checkIn(pairRing)
+        if coalesceMaskSgpr >= 0:
+          self.sgprPool.checkIn(coalesceMaskSgpr)
+        if coalesceOddMaskSgpr >= 0:
+          self.sgprPool.checkIn(coalesceOddMaskSgpr)
       # The hoisted values die with the cvtVgpr block.
       self.states.subtileHoistedLaneGroupDelta = False
       self.states.subtileHoistedPermAddr = False
@@ -19765,6 +19959,55 @@ class KernelWriterAssembly(KernelWriter):
       self.vgprPool.setOccupancyLimit(self.states.regCaps["MaxVgpr"], self.states.regCaps["PhysicalMaxVgpr"] // occupancy)
       self.sgprPool.setOccupancyLimit(self.states.regCaps["MaxSgpr"], self.states.regCaps["PhysicalMaxSgpr"] // occupancy)
     return maxVgprs, occupancy
+
+  @staticmethod
+  def _coalesceBatchFloorMult4(numElementsPerBatch, numElements):
+    """Floor a DPP store-coalesce batch to a multiple of 4 (>=4).
+
+    The coalesce joins 4 M-adjacent blocks (two M-pairs) that must ALL co-reside in one
+    store batch; a batch that is not a multiple of 4 strands the trailing <4 remainder
+    (it coalesces with nothing). Returns the adjusted batch size: the coalesce minimum
+    (min(numElements, 4)) when below one full group, else the batch aligned DOWN to the
+    nearest multiple of 4. Aligning down never raises VGPR pressure, so it cannot overflow.
+    Pure helper for refineOccupancy; unit-tested in test_subtile_coalesce_batch_sizing.py.
+    """
+    if numElementsPerBatch < 4:
+      return min(numElements, 4)
+    return (numElementsPerBatch // 4) * 4
+
+  @staticmethod
+  def _dppCoalesceBatchBounds(element, numElementsPerBatch):
+    """DPP-aware N-group batch split -> list of (start, stop) element-index bounds.
+
+    Within each N-column (consecutive elements sharing element[i][0]), separate the
+    complete DPP groups (multiples of 4 M-tiles) from the orphan tail so that a sub-batch
+    never straddles an N-column boundary and the orphan (MIWaveTile[0] % 4 != 0, e.g.
+    M-tiles 8..9 of 10 for MIWT[0]=10) is isolated into its own sub-batch -- regardless of
+    numElementsPerBatch. Pure helper for globalWriteElementBatch; unit-tested in
+    test_subtile_coalesce_batch_sizing.py.
+    """
+    bounds = []
+    n = len(element)
+    i = 0
+    while i < n:
+      ncol = element[i][0]
+      j = i
+      while j < n and element[j][0] == ncol:
+        j += 1
+      k = i
+      while k < j:
+        # End of the last complete DPP group (4-block boundary) within this N-column.
+        ncol_complete = k + ((j - k) // 4) * 4
+        if k < ncol_complete < j:
+          # Complete groups followed by an orphan tail: cap at the group boundary.
+          stop = min(k + numElementsPerBatch, ncol_complete)
+        else:
+          # Whole remainder is < 4 (pure orphan) or exactly a multiple of 4 (no tail).
+          stop = min(k + numElementsPerBatch, j)
+        bounds.append((k, stop))
+        k = stop
+      i = j
+    return bounds
 
   def refineOccupancy(self, kernel, atomic, element, actPCMaxTempSgpr, \
                       gwvw, maxVgprs, ss, beta=False, edge=False):
@@ -19831,6 +20074,37 @@ class KernelWriterAssembly(KernelWriter):
     #     "WARNING" if ss.cfg.numElementsPerBatchLimitedBySgprs < numElementsPerBatch else "okay")
     if ss.cfg.numElementsPerBatchLimitedBySgprs < numElementsPerBatch:
       numElementsPerBatch = ss.cfg.numElementsPerBatchLimitedBySgprs
+
+    # Coalesce-aware batch floor for the subtile-coalesce tiles (MT256x256 and the wide "320"
+    # tiles MT256x320 / MT320x256). The DPP coalesce's marginal cost is only +2 fresh VGPRs
+    # (vVoff/vBlend) -- batchB's pack and the blend reuse dead ValuC, the read window is reused
+    # across batchA->batchB -- so two M-pairs fit in one batch at vgpr 250+2<=256. The generic
+    # sizer prices elements at the non-coalesce rate and, on these register-tight weave tiles,
+    # caps the batch at one pair (3) -- below the coalesce's 4-element (two-M-pair) minimum, so
+    # the coalesce never forms. Floor to 4 so the clean pair-of-pairs is co-resident.
+    #
+    # For MT256x256 this floor REPLACES the former weave-off full-lend strategy (see
+    # _selectPlsinFusedStorePolicy): lending every operand tile grew the batch to a coalesce-able
+    # size but turned off the store/MFMA overlap (weaveGroups=None), stretching the last-MFMA->
+    # wave-end tail (~1.5k->5.9k cycles @8192^3, ~5-8% on MI355X). Keeping the weave and only
+    # flooring the batch recovers that overlap while still coalescing. Verified: vgpr_count<=256,
+    # norm_error 0.
+    _mt0 = kernel.get("MacroTile0")
+    _mt1 = kernel.get("MacroTile1")
+    if (getattr(self.states, "subtileCoalesceActive", False)
+            and getattr(self.states, "subtileFusedFullTileStore", False)
+            and ((_mt0 == 256 and _mt1 == 256)
+                 or (_mt0 == 256 and _mt1 == 320)
+                 or (_mt0 == 320 and _mt1 == 256))):
+      # The DPP coalesce joins 4 M-adjacent blocks (two pairs) that must ALL live in the same store
+      # batch -- _samePair rejects any 4-block group split across a batch boundary. So the batch must
+      # (a) be >= 4 (one full group) AND (b) be a MULTIPLE of 4: otherwise the trailing <4 remainder
+      # of every batch strands a pair that coalesces with nothing. The occupancy sizer otherwise
+      # lands on e.g. 6 (= one group + a stranded pair) -> only 67% of that kernel's stores coalesce
+      # (measured: MT256x256 kernels at batchLen 6 -> overall WA 1.15, vs 1.00 at batchLen 4/8/16).
+      # Align DOWN to the nearest multiple of 4 (>=4). Rounding down never raises VGPR pressure, so
+      # it cannot overflow -- it trades a slightly smaller batch for full coalesce coverage.
+      numElementsPerBatch = self._coalesceBatchFloorMult4(numElementsPerBatch, len(element))
 
     # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
     destType = kernel["ProblemType"]["DestDataType"]
@@ -20082,6 +20356,7 @@ class KernelWriterAssembly(KernelWriter):
         self.states.subtileN16ValidBlocksSgpr = None
         self.states.subtileTotalMOffsetSgpr = None
         self.states.subtileMBlockSize = 0
+      self.states.subtileCoalesceSizeOkSgpr = None
 
     # Activation
     actLoopEndLabel, actLoopLabelModules, actLoopEnumStrList = self.initActivationLoop(kernel, beta)
@@ -20150,6 +20425,38 @@ class KernelWriterAssembly(KernelWriter):
         else:
           numBatchesCLS = numBatches
 
+        # Subtile DPP coalesce: tile each N-group (contiguous same-blockIdxN run) on its OWN so a
+        # batch never straddles an N-column. The coalesce joins 4 M-adjacent blocks (two pairs);
+        # when the N-group (MIWaveTile[0] M-blocks) is NOT a multiple of 4, consecutive groups-of-4
+        # cross the N-column boundary, _samePair rejects the cross-N pair, and the whole straddling
+        # batch falls to the uncoalesced store. Capping batches at the N-group boundary keeps the
+        # clean pairs-of-pairs co-resident; the <4 remainder (e.g. the 2-block tail of a 10-tall
+        # MIWT[0]=10 column) becomes the uncoalesced orphan.
+        #   GATE: only when MIWaveTile[0] % 4 != 0. When MIWT[0] is a multiple of 4 (4, 8, 12, ...)
+        #   the groups-of-4 already tile every N-column cleanly regardless of batch size, so this
+        #   capping is pure loss -- it would SHRINK an efficiently-large multi-N-group batch down to
+        #   one N-group and regress those tiles (measured: MT256x288/MIWT4, MT256x256/MIWT8). It is
+        #   needed only for MIWT[0]=10 (MT320x256) et al. CLS is off on these subtile kernels, so
+        #   the all-zero look-ahead arrays below stay correct (indexing guarded in the loop).
+        _coalesceBatchBounds = None
+        _miwt0 = kernel.get("MIWaveTile", [0])[0]
+        if getattr(self.states, "subtileCoalesceActive", False) and not kernel["CompactLoopStore"] \
+            and _miwt0 % 4 != 0:
+          # DPP-aware sub-batch split: within each N-col, separate complete DPP groups
+          # (multiples of 4 M-tiles) from the orphan tail so the orphan gets its own
+          # sub-batch. Keeps batch boundaries at mult-of-4 M-tile positions regardless of
+          # numElementsPerBatch — the upstream coalesce floor already aligns nepb to mult-of-4,
+          # but this makes the split robust and explicitly isolates the orphan (e.g. M-tiles
+          # 8-9 out of 10 for MIWT[0]=10) so it doesn't dilute the VGPR window of clean batches.
+          _coalesceBatchBounds = self._dppCoalesceBatchBounds(element, numElementsPerBatch)
+          numBatchesCLS = len(_coalesceBatchBounds)
+          # The N-group split can create MORE batches than the uniform count. Make numBatches the
+          # real batch count so every batchIdx-count-dependent consumer stays correct -- in
+          # particular globalWriteBatch's isLastBatch (== numBatches-1), which places the single
+          # cross-wave s_barrier that drains bias/ScaleAlphaVec LDS reads before the subtile stores.
+          # (The look-ahead arrays below are all-zero here -- CLS is off -- so resizing is harmless.)
+          numBatches = numBatchesCLS
+
         # Per-batch look-ahead: boundary delta vs first real row jump (primer).
         next_rowInc_per_batch = [0] * numBatches
         next_firing_per_batch = [0] * numBatches
@@ -20181,8 +20488,11 @@ class KernelWriterAssembly(KernelWriter):
           passAccVgprRead = deepcopy(codeAccVgprRead) if codeAccVgprRead is not None else None
           passMulAlpha    = deepcopy(codeMulAlpha) if codeMulAlpha is not None else None
           for batchIdx in range(0, numBatchesCLS):
-            elementStartIdx = batchIdx * numElementsPerBatch
-            elementStopIdx = min( elementStartIdx + numElementsPerBatch, len(element) )
+            if _coalesceBatchBounds is not None:
+              elementStartIdx, elementStopIdx = _coalesceBatchBounds[batchIdx]
+            else:
+              elementStartIdx = batchIdx * numElementsPerBatch
+              elementStopIdx = min( elementStartIdx + numElementsPerBatch, len(element) )
             elementsThisBatch = element[elementStartIdx:elementStopIdx]
             #print("BATCH[%u/%u]: element[%u:%u] VGPRs=%u" % (batchIdx, numBatches, elementStartIdx, elementStopIdx,ss.numVgprsPerElement ))
             # elementVgprs can be large and should be perfectly tuned to the number of available
@@ -20193,7 +20503,7 @@ class KernelWriterAssembly(KernelWriter):
               self.StoreRemapLastBatch = 1 if (batchIdx+1) % nBatchesPerRow == 0 else 0
 
             # Primer uses the next real row jump; boundary delta may be 0 (mid-row).
-            _next_firing_rowInc = next_firing_per_batch[batchIdx]
+            _next_firing_rowInc = next_firing_per_batch[batchIdx] if batchIdx < numBatches else 0
             _direct_next_rowInc = next_rowInc_per_batch[batchIdx] if batchIdx < numBatches else 0
             m.add(self.globalWriteBatch(kernel, tPA, tPB, activation, ss, batchIdx, \
                 applyAlpha, beta, edge, atomic, gwvw, atomicW, \
@@ -20255,6 +20565,9 @@ class KernelWriterAssembly(KernelWriter):
     if self.states.subtileTotalMOffsetSgpr is not None:
       self.sgprPool.checkIn(self.states.subtileTotalMOffsetSgpr)
       self.states.subtileTotalMOffsetSgpr = None
+    if getattr(self.states, "subtileCoalesceSizeOkSgpr", None) is not None:
+      self.sgprPool.checkIn(self.states.subtileCoalesceSizeOkSgpr)
+      self.states.subtileCoalesceSizeOkSgpr = None
     if self.states.subtileM32ValidBlocksSgpr is not None and "SubtileMGuard" not in self.sgprs:
       self.sgprPool.checkIn(self.states.subtileM32ValidBlocksSgpr)
       self.sgprPool.checkIn(self.states.subtileN16ValidBlocksSgpr)
