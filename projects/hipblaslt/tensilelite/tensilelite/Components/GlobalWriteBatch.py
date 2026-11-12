@@ -4367,12 +4367,12 @@ class GlobalWriteBatchWriter:
 
     def packF32pair(dst, src0, src1, comment):
       """Pack two f32 VGPRs into one dword of two 16bit values."""
-      module.add(VCvtPkF32to16(dst=vgpr(dst), src0=src0, src1=src1, comment=f"{comment} -> {typeStr}"))
+      module.add(VCvtPkF32to16(dst=dst, src0=src0, src1=src1, comment=f"{comment} -> {typeStr}"))
 
-    packF32pair(vPack+0, vc(sumIdx0, 0), vc(sumIdx0, 1), f"sba=0 tt0={tt0}[0:1]")
-    packF32pair(vPack+1, vc(sumIdx0, 2), vc(sumIdx0, 3), f"sba=0 tt0={tt0}[2:3]")
-    packF32pair(vPack+2, vc(sumIdx1, 0), vc(sumIdx1, 1), f"sba=1 tt0={tt0}[0:1]")
-    packF32pair(vPack+3, vc(sumIdx1, 2), vc(sumIdx1, 3), f"sba=1 tt0={tt0}[2:3]")
+    packF32pair(self._vPackReg(vPack, 0), vc(sumIdx0, 0), vc(sumIdx0, 1), f"sba=0 tt0={tt0}[0:1]")
+    packF32pair(self._vPackReg(vPack, 1), vc(sumIdx0, 2), vc(sumIdx0, 3), f"sba=0 tt0={tt0}[2:3]")
+    packF32pair(self._vPackReg(vPack, 2), vc(sumIdx1, 0), vc(sumIdx1, 1), f"sba=1 tt0={tt0}[0:1]")
+    packF32pair(self._vPackReg(vPack, 3), vc(sumIdx1, 2), vc(sumIdx1, 3), f"sba=1 tt0={tt0}[2:3]")
 
     # Compute the adjusted D address into vgprAddrScratch (overlapping the
     # ds_bpermute on the fallback path).  addrDVgpr holds the M-byte offset
@@ -4400,7 +4400,7 @@ class GlobalWriteBatchWriter:
     if not getattr(self, "_permlane16Active", False):
       module.addComment1("ds_bpermute in-place: gather packed dwords from partner lane-group")
       for k in range(4):
-        module.add(DSBPermuteB32(dst=vgpr(vPack+k), src0=vgpr(vPermAddr), src1=vgpr(vPack+k),
+        module.add(DSBPermuteB32(dst=self._vPackReg(vPack, k), src0=vgpr(vPermAddr), src1=self._vPackReg(vPack, k),
                                  comment=f"perm dword {k}"))
 
     # The ds_bpermute has ~88 cycles of LDS latency.  Overlap SALU/VALU work here:
@@ -4507,8 +4507,8 @@ class GlobalWriteBatchWriter:
     # to drain; two v_permlane16_swap assemble the eight rows directly.
     if getattr(self, "_permlane16Active", False):
       module.addComment1("v_permlane16_swap_b32: cross-lane assembly (no ds_bpermute)")
-      module.add(VPermlane16SwapB32(dst=vgpr(vPack+0), src=vgpr(vPack+2), comment="swap dwords 0↔2"))
-      module.add(VPermlane16SwapB32(dst=vgpr(vPack+1), src=vgpr(vPack+3), comment="swap dwords 1↔3"))
+      module.add(VPermlane16SwapB32(dst=self._vPackReg(vPack, 0), src=self._vPackReg(vPack, 2), comment="swap dwords 0↔2"))
+      module.add(VPermlane16SwapB32(dst=self._vPackReg(vPack, 1), src=self._vPackReg(vPack, 3), comment="swap dwords 1↔3"))
     else:
       if pending_lgkm is None:
         module.add(SWaitCnt(dscnt=0, comment="wait for ds_bpermute (lgkmcnt=0)"))
@@ -4517,8 +4517,8 @@ class GlobalWriteBatchWriter:
         module.add(SWaitCnt(dscnt=dscnt, comment=f"wait for this pair's 4 ds_bpermute (lgkmcnt={dscnt})"))
 
       module.addComment1("v_permlane32_swap_b32: swap across lane-32 boundary")
-      module.add(VPermlane32SwapB32(dst=vgpr(vPack+0), src=vgpr(vPack+2), comment="swap dwords 0↔2"))
-      module.add(VPermlane32SwapB32(dst=vgpr(vPack+1), src=vgpr(vPack+3), comment="swap dwords 1↔3"))
+      module.add(VPermlane32SwapB32(dst=self._vPackReg(vPack, 0), src=self._vPackReg(vPack, 2), comment="swap dwords 0↔2"))
+      module.add(VPermlane32SwapB32(dst=self._vPackReg(vPack, 1), src=self._vPackReg(vPack, 3), comment="swap dwords 1↔3"))
 
     if useAlign8:
       module.add(self.getEdgeMovInstType()(EXEC(), sgpr(self._pairedStoreMaskSgpr, self.laneSGPRC), "apply exec mask"))
@@ -4526,7 +4526,7 @@ class GlobalWriteBatchWriter:
     module.addComment1("buffer_store_dwordx4: write 8 16bit values (4 dwords, 2-aligned src)")
     _soff, _soffTmp = self._subtileStoreSoffset(module, addrCalc)
     module.add(BufferStoreB128(
-      src=vgpr(vPack, 4),
+      src=self._vPackReg(vPack, 0, 4),
       vaddr=vgpr(vAddrScratch),
       saddr=sgpr("SrdD", 4),
       soffset=_soff,
@@ -4620,7 +4620,7 @@ class GlobalWriteBatchWriter:
     module.addComment1("buffer_store_dwordx4: write 8 16bit values (4 dwords, 2-aligned src)")
     _soff, _soffTmp = self._subtileStoreSoffset(module, addrCalc)
     module.add(BufferStoreB128(
-      src=vgpr(vPack, 4),
+      src=self._vPackReg(vPack, 0, 4),
       vaddr=vgpr(vAddrScratch),
       saddr=sgpr("SrdD", 4),
       soffset=_soff,
@@ -4664,7 +4664,20 @@ class GlobalWriteBatchWriter:
     self.parentWriter.states.subtileStoreStageHighWater = stage
     module.add(Module(f"PlsinStageBoundary{stage}"))
 
-  def _pairPackQuad(self, pairIdx=None) -> int:
+  def _vPackReg(self, vPack, k, n=1):
+    """Pack-quad register k (width n). vPack is either a plain int base (the
+    dedicated pack ring -- physical VGPR vPack+k) or a lease tuple (kind, base):
+    kind 'v' -> physical VGPR base+k; kind 'c' -> symbolic ValuC+(base+k) (a dead
+    accumulator slot leased by the epilogue allocator). For a plain int this is
+    exactly vgpr(vPack+k, n), so the default (unleased) path is byte-identical."""
+    if isinstance(vPack, tuple):
+      kind, base = vPack
+      if kind == 'c':
+        return vgpr("ValuC+" + str(base + k), n)
+      return vgpr(base + k, n)
+    return vgpr(vPack + k, n)
+
+  def _pairPackQuad(self, pairIdx=None):
     """Base vgpr of the 4-dword pack quad this paired store uses.
 
     A store cannot be scheduled away from the quad it packs into: the next
@@ -4681,10 +4694,11 @@ class GlobalWriteBatchWriter:
     # whose drain position has >=1 fully-retired aligned quad are present. Correctness
     # hinges on the leased quad being genuinely dead here (no woven MFMA at this pair or
     # later reads it) -- this experiment validates exactly that against --verify.
-    if pairIdx is not None and __import__("os").environ.get("WEAVE_PACKFREE"):
+    if pairIdx is not None and (__import__("os").environ.get("WEAVE_PACKFREE")
+                                or __import__("os").environ.get("WEAVE_PACKVALC")):
       _lease = getattr(self.parentWriter.states, "subtileWovenPackPlan", None)
       if _lease and pairIdx in _lease:
-        return _lease[pairIdx]
+        return _lease[pairIdx]   # int (ring-style) or (kind, base) lease tuple
     ring  = self.cvtVgprStruct.vgprPairPackRing
     if ring < 0:
       return self.cvtVgprStruct.vgprBf16Temp

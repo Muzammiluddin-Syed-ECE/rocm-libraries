@@ -5135,12 +5135,15 @@ class LogicalScheduler:
                 # the lease installed, then re-plan on the new module. Gated -- default
                 # (no env) never runs the second pass and codegen is unchanged.
                 _packPlan = {}
-                for _d in getattr(self, "_wovenPackPlans", []) or []:
+                _valcMode = bool(__import__("os").environ.get("WEAVE_PACKVALC"))
+                _planSrc = (getattr(self, "_wovenPackValcPlans", []) if _valcMode
+                            else getattr(self, "_wovenPackPlans", [])) or []
+                for _d in _planSrc:
                     _packPlan.update(_d)
-                if __import__("os").environ.get("WEAVE_PACKFREE") and _packPlan:
+                if (_valcMode or __import__("os").environ.get("WEAVE_PACKFREE")) and _packPlan:
                     __import__("sys").stderr.write(
-                        f"[WEAVE_PACKFREE] two-pass re-emit: leasing pack quads for "
-                        f"{len(_packPlan)} pairs -> {sorted(_packPlan.items())[:6]}...\n")
+                        f"[WEAVE_PACK{'VALC' if _valcMode else 'FREE'}] two-pass re-emit: leasing "
+                        f"pack quads for {len(_packPlan)} pairs -> {sorted(_packPlan.items())[:6]}...\n")
                     writer.states.subtileWovenPackPlan = _packPlan
                     writer.states.subtileWeaveMfmaGroups = \
                         copy.deepcopy(weaveGroups) if weaveGroups is not None else None
@@ -5462,6 +5465,7 @@ class LogicalScheduler:
         # (the free-list) instead of the dedicated pack ring. Consumed by the caller's
         # second emit pass + _pairPackQuad. Empty unless the env flag is set.
         self._wovenPackPlans = []
+        self._wovenPackValcPlans = []   # per capture: {pairIdx: ('c', valcBase)} ValuC leases
         for capture in captures:
             consumers = {}
             consumedRegs = {}
@@ -5540,7 +5544,8 @@ class LogicalScheduler:
                     f"[WEAVE_PLACE] placed={len(_rows)} pairs_used={len(set(_pairSeq))} "
                     f"order_inversions={_inv} idx->pair[:24]={_pairSeq[:24]}\n")
             if (__import__("os").environ.get("WEAVE_FREELIST")
-                    or __import__("os").environ.get("WEAVE_PACKFREE")):
+                    or __import__("os").environ.get("WEAVE_PACKFREE")
+                    or __import__("os").environ.get("WEAVE_PACKVALC")):
                 # Drive the active EpilogueFreeList forward through the drain: walk pairs in
                 # ascending gap position, and as each pair's relocated MFMAs execute, release
                 # an operand VGPR the instant its LAST reader has run (reader-count hits 0).
@@ -5608,7 +5613,8 @@ class LogicalScheduler:
                         f"monotonic={_mono} matches_schedule={_curve == _expect} "
                         f"pairs_with_quad={_nAcq} free_before_pair={_curve}\n")
                     _sys.stderr.write(f"[WEAVE_FREELIST] acquired_quad_base_per_pair={_acq}\n")
-                if __import__("os").environ.get("WEAVE_VALUC"):
+                if (__import__("os").environ.get("WEAVE_VALUC")
+                        or __import__("os").environ.get("WEAVE_PACKVALC")):
                     # UNIFIED allocator pool, evaluated at each pair's pack WRITE position
                     # (its first convert) -- NOT the gap. A register is offered iff its last
                     # use precedes the write, so pair-k's own ValuC (read AT those converts)
@@ -5625,10 +5631,16 @@ class LogicalScheduler:
                             _storeLU[_k2] = max(_storeLU.get(_k2, -1), _idx2)
                     _lu = dict(_storeLU)
                     for _pos3, _p in _placed:
-                        for _c3 in self._plsinOperands(_p, self._PLSIN_MFMA_SOURCES):
-                            for _k3 in (self._plsinRegisterKeys(_c3) or ()):
-                                if _k3 is not None:
-                                    _lu[_k3] = max(_lu.get(_k3, -1), _pos3)
+                        # Woven MFMA operands (a/b/scale) AND its accumulator (acc=ValuC) are
+                        # read at its gap -- MFMAs accumulate, so the acc slot is LIVE through
+                        # the gap. Neither is in the pre-move flat, so add both at the gap
+                        # position. (Missing the acc wrongly frees a ValuC slot that a later
+                        # woven MFMA still accumulates into -> silent clobber / illegal access.)
+                        for _attrs3 in (self._PLSIN_MFMA_SOURCES, self._PLSIN_MFMA_WRITES):
+                            for _c3 in self._plsinOperands(_p, _attrs3):
+                                for _k3 in (self._plsinRegisterKeys(_c3) or ()):
+                                    if _k3 is not None:
+                                        _lu[_k3] = max(_lu.get(_k3, -1), _pos3)
                     # pack write position = first VCvtPk of each pair (the converts before its gap)
                     _convPos = [_i4 for _i4, _it4 in enumerate(flat)
                                 if type(_it4).__name__.startswith("VCvtPk")]
@@ -5651,13 +5663,52 @@ class LogicalScheduler:
                             else:
                                 _i2 += 1
                         return _q
+                    def _firstAlignedBase(_offs):
+                        _ss = set(_offs)
+                        for _bb in sorted(_ss):
+                            if _bb % 2 == 0 and all((_bb + _j) in _ss for _j in range(4)):
+                                return _bb
+                        return None
                     _opCurve = []; _vcCurve = []
+                    _valcPlan = {}       # pairIdx -> ('c', valcBase): lease the pack from a
+                                         # dead ValuC accumulator slot (position-exact).
                     for _gp4, _k4 in _sortedGaps:
                         _wp = _writePos.get(_k4, _gp4)
                         _opDead = [_kk[2] for _kk, _d in _lu.items() if _d < _wp and _kk[1] is None]
                         _vcDead = [_kk[2] for _kk, _d in _lu.items() if _d < _wp and _kk[1] == "ValuC"]
                         _opCurve.append(_alignedQuadCount(_opDead))
                         _vcCurve.append(_alignedQuadCount(_vcDead))
+                        _vb = _firstAlignedBase(_vcDead)
+                        if _vb is not None:
+                            _valcPlan[_k4] = ('c', _vb)
+                            if __import__("os").environ.get("WEAVE_VALUC_DBG") and len(_valcPlan) <= 2:
+                                # which ValuC slots does THIS pair's own converts read?
+                                _ownSrc = set()
+                                for _it5 in flat[max(0, _wp):_gp4 + 1]:
+                                    if type(_it5).__name__.startswith("VCvtPk"):
+                                        _w5, _r5 = self._epilogueDefUse(_it5)
+                                        for _k5 in _r5:
+                                            if _k5[1] == "ValuC":
+                                                _ownSrc.add(_k5[2])
+                                _vbLU = max((_d for _kk, _d in _lu.items()
+                                             if _kk[1] == "ValuC" and _vb <= _kk[2] < _vb + 4), default=-99)
+                                __import__("sys").stderr.write(
+                                    f"[WEAVE_VALUC_DBG] pair={_k4} writePos={_wp} gap={_gp4} "
+                                    f"leased=ValuC+{_vb}..{_vb+3} leased_lastUse={_vbLU} "
+                                    f"this_pair_own_src_ValuC={sorted(_ownSrc)[:12]} "
+                                    f"overlap={sorted(set(range(_vb,_vb+4)) & _ownSrc)}\n")
+                                # every flat instr touching ValuC+_vb (read or write), with pos
+                                for _ix6, _it6 in enumerate(flat):
+                                    if not hasattr(_it6, "getParams"):
+                                        continue
+                                    _w6, _r6 = self._epilogueDefUse(_it6)
+                                    _hitW = any(_k6[1] == "ValuC" and _k6[2] == _vb for _k6 in _w6)
+                                    _hitR = any(_k6[1] == "ValuC" and _k6[2] == _vb for _k6 in _r6)
+                                    if _hitW or _hitR:
+                                        __import__("sys").stderr.write(
+                                            f"[WEAVE_VALUC_DBG]   ValuC+{_vb} @pos{_ix6} "
+                                            f"{type(_it6).__name__} {'W' if _hitW else ''}{'R' if _hitR else ''}\n")
+                    self._wovenPackValcPlans.append(_valcPlan)
                     _sys.stderr.write(
                         f"[WEAVE_VALUC] writePos_known={len(_writePos)}/{len(_sortedGaps)} "
                         f"operand_quads@write={_opCurve} valuc_quads@write={_vcCurve}\n")
