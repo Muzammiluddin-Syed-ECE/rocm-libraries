@@ -1537,7 +1537,7 @@ class GlobalWriteBatchWriter:
         for vi in range(self.gwvw):
           # loop over registers within one scalar
           for rIdx in range(0, regsPerScalar):
-            module.add(replaceHolder(self.codeAccVgprRead.popFirstItem(), self.ss.elementSumIdx[elementIdx]*regsPerScalar + regsPerScalar*vi + rIdx - self.parentWriter.states.c.startVgprValu))
+            module.add(replaceHolder(self.codeAccVgprRead.popFirstItem(), self._epilogueStagingReg(elementIdx, vi, rIdx)))
 
       if self.kernel["MIArchVgpr"] and self.kernel["LocalSplitU"] > 1:
         self.parentWriter.states.c.startVgprValu = tmpStartVgprValuC
@@ -4026,6 +4026,44 @@ class GlobalWriteBatchWriter:
       pairs.append({"reads": [], "gap": None, "gapAnchor": None})
     return pairs[pairIdx]
 
+  def _epilogueStagingReg(self, elementIdx: int, vi: int = 0, rIdx: int = 0) -> int:
+    """Single source of truth for element `elementIdx`'s ValuC-relative STAGING
+    register -- the VGPR that `v_accvgpr_read` copies the accumulator into and that
+    the element's convert/pack then reads back. Both the up-front per-batch
+    accvgpr_read block (AccVgpr read section) and the weave per-pair pop
+    (_popSubtileAccVgprReads) derive their dest from here, so exactly ONE place maps
+    (element -> staging register).
+
+    Today this is the hard-coded elementSumIdx expression (the register checked out
+    by AsmStoreState.setupStoreElementsForBatch via vgprPool.checkOutAligned). That
+    direct, pool-order-dependent reference is what makes a dead-ValuC pack lease
+    unsafe across the two-pass re-emit: reserving a ValuC slot in pass 2 perturbs the
+    first-fit checkout so the staging layout shifts out from under a lease computed on
+    pass 1 (see 2026-11-12 findings). This accessor is the chokepoint the epilogue
+    register pool will acquire from in a single emission, so lease and staging agree
+    on register identity by construction."""
+    regsPerScalar = self.parentWriter.states.bpeCinternal // self.parentWriter.states.bpr
+    return self.ss.elementSumIdx[elementIdx]*regsPerScalar + regsPerScalar*vi + rIdx \
+           - self.parentWriter.states.c.startVgprValu
+
+  def _recordStagingLedger(self, elementIdx: int) -> None:
+    """EPILOGUE_STAGING_LEDGER diagnostic: capture (element -> staging quad base)
+    from the single accessor as each element's accvgpr_read is emitted, so the
+    staging allocation is observable in one place (the data a future pool/lease
+    consumes). Pure observation -- emits nothing into the kernel, so codegen stays
+    byte-identical with the flag off or on."""
+    if not __import__("os").environ.get("EPILOGUE_STAGING_LEDGER"):
+      return
+    base = self._epilogueStagingReg(elementIdx, 0, 0)
+    ledger = getattr(self.parentWriter.states, "subtileStagingLedger", None)
+    if ledger is None:
+      ledger = []
+      self.parentWriter.states.subtileStagingLedger = ledger
+    ledger.append((elementIdx, base))
+    __import__("sys").stderr.write(
+      f"[EPILOGUE_STAGING_LEDGER] element={elementIdx} stagingBase=ValuC+{base} "
+      f"(sumIdx={self.ss.elementSumIdx[elementIdx]})\n")
+
   def _popSubtileAccVgprReads(self, elementIdx: int) -> Module:
     """PostLoopStoreInNll weave (4d-3b): pop ONE element's accvgpr_read items.
 
@@ -4039,10 +4077,10 @@ class GlobalWriteBatchWriter:
     """
     module = Module(f"weaveAccVgprRead_elt{elementIdx}")
     regsPerScalar = self.parentWriter.states.bpeCinternal // self.parentWriter.states.bpr
+    self._recordStagingLedger(elementIdx)
     for vi in range(self.gwvw):
       for rIdx in range(0, regsPerScalar):
-        dstIdx = self.ss.elementSumIdx[elementIdx]*regsPerScalar + regsPerScalar*vi + rIdx \
-                 - self.parentWriter.states.c.startVgprValu
+        dstIdx = self._epilogueStagingReg(elementIdx, vi, rIdx)
         readInst = replaceHolder(self.codeAccVgprRead.popFirstItem(), dstIdx)
         pairCapture = self._weaveCapturePair(
           self.parentWriter.states.subtileWeavePairCounter)
