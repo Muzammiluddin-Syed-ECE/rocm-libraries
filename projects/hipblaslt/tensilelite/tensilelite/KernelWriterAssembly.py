@@ -16397,9 +16397,16 @@ class KernelWriterAssembly(KernelWriter):
           break
     self.codes.accVgprRead = mapAcctoArchRegs(kernel, self.states.maxLimitAgprs, write=False, spilledVgprBase=spilledVgprBase)
 
-    # ValuC base marker (serialized subtile store reads accs into a small window)
+    # ValuC base marker (serialized subtile store reads accs into a small window).
+    # NOTE: this is a first-fit checkout, so the ValuC anchor (and hence every
+    # symbolic ValuC+N) depends on pool state at this point. Across the WEAVE_PACKVALC
+    # two-pass re-emit the pool differs, so this base shifts (e.g. 100 -> 96) even
+    # though the absolute staging quads (elementSumIdx) are unchanged. Stash it so the
+    # dead-ValuC pack lease, computed in pass-1 ValuC coordinates, can be re-anchored
+    # to pass-2's base and still target the same absolute (dead) staging register.
     fusedStartVgprValu = self.vgprPool.checkOutAligned(1, 4, tag="fusedStore_startVgprValu")
     self.states.c.startVgprValu = fusedStartVgprValu
+    self.states.subtileFusedStartVgprValuLast = fusedStartVgprValu
     module.add(RegSet("v", "vgprValuC", fusedStartVgprValu))
 
     # --- NonEdge guard SGPRs (normally allocated at post-loop L5159-5165, after

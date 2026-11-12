@@ -4736,7 +4736,25 @@ class GlobalWriteBatchWriter:
                                 or __import__("os").environ.get("WEAVE_PACKVALC")):
       _lease = getattr(self.parentWriter.states, "subtileWovenPackPlan", None)
       if _lease and pairIdx in _lease:
-        return _lease[pairIdx]   # int (ring-style) or (kind, base) lease tuple
+        _q = _lease[pairIdx]   # int (ring-style) or (kind, base) lease tuple
+        # ValuC leases are expressed in the pass-1 ValuC frame (the anchor
+        # startVgprValu the plan was computed against). The pass-2 re-emit may have a
+        # different first-fit anchor, so ValuC+base now names a different absolute
+        # register. Re-anchor by (pass1Anchor - currentAnchor) so the lease lands on
+        # the SAME absolute (dead) staging quad the planner proved free. Operand ('v')
+        # and ring (int) leases are absolute and must NOT be shifted.
+        if isinstance(_q, tuple) and _q[0] == 'c':
+          _anchor = getattr(self.parentWriter.states, "subtileWovenPackPlanAnchorSVV", None)
+          _cur = self.parentWriter.states.c.startVgprValu
+          if _anchor is not None and _anchor != _cur:
+            _rebased = _q[1] + _anchor - _cur
+            if __import__("os").environ.get("WEAVE_PACKVALC"):
+              __import__("sys").stderr.write(
+                f"[WEAVE_PACKVALC] reanchor pair={pairIdx} lease ValuC+{_q[1]} "
+                f"(anchor={_anchor}) -> ValuC+{_rebased} (cur={_cur}); "
+                f"absReg={_cur + _rebased}\n")
+            return ('c', _rebased)
+        return _q
     ring  = self.cvtVgprStruct.vgprPairPackRing
     if ring < 0:
       return self.cvtVgprStruct.vgprBf16Temp

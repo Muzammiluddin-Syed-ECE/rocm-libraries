@@ -5145,6 +5145,13 @@ class LogicalScheduler:
                         f"[WEAVE_PACK{'VALC' if _valcMode else 'FREE'}] two-pass re-emit: leasing "
                         f"pack quads for {len(_packPlan)} pairs -> {sorted(_packPlan.items())[:6]}...\n")
                     writer.states.subtileWovenPackPlan = _packPlan
+                    # Pass-1 ValuC anchor (startVgprValu at the pass-1 emission the plan
+                    # was computed against). A ValuC pack lease ('c',base) is expressed in
+                    # THIS frame; the pass-2 re-emit below sets a possibly-different anchor
+                    # (first-fit), so _pairPackQuad re-anchors the lease by (anchor - current)
+                    # to keep it on the same absolute (dead) staging register.
+                    writer.states.subtileWovenPackPlanAnchorSVV = \
+                        getattr(writer.states, "subtileFusedStartVgprValuLast", None)
                     writer.states.subtileWeaveMfmaGroups = \
                         copy.deepcopy(weaveGroups) if weaveGroups is not None else None
                     writer.states.subtileWeaveLookahead = 0
@@ -5160,6 +5167,7 @@ class LogicalScheduler:
                         storeModule,
                         int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)))
                     writer.states.subtileWovenPackPlan = None
+                    writer.states.subtileWovenPackPlanAnchorSVV = None
                 # Planner appends the gap MFMAs after Phase1 (mfma, mfma, step-1,
                 # mfma, mfma, step-2). Spread the convert VALU into those MFMA
                 # issue shadows (2 v_cvt_pk per gap), matching main-loop ds_read.
