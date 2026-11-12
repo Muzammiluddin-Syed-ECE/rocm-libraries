@@ -89,6 +89,35 @@ class _SlotPlacer:
             for item in self._placed[slot]
         )
 
+    def intervalInsts(self, interval: int):
+        width = self.slotsPerInterval
+        return [item[1] for slot in self._placed[interval * width:(interval + 1) * width]
+                for item in slot if not isinstance(item[1], TextBlock)]
+
+    def overfullIntervals(self) -> int:
+        """Gaps with two direct-to-LDS loads, plus gaps over their slots."""
+        count = 0
+        for interval in range(self.totalSlots // self.slotsPerInterval):
+            insts = self.intervalInsts(interval)
+            count += sum(_isDtlLoad(inst) for inst in insts) > 1
+            count += len(insts) > self.slotsPerInterval
+        return count
+
+    def longestDtlRun(self) -> int:
+        run = longest = 0
+        for begin in range(0, self.totalSlots, self.slotsPerInterval):
+            run = run + 1 if self._intervalHasDtlLoad(begin) else 0
+            longest = max(longest, run)
+        return longest
+
+    def snapshot(self):
+        return ([list(slot) for slot in self._placed], list(self._firstPos),
+                list(self._lastPos))
+
+    def restore(self, saved):
+        self._placed = [list(slot) for slot in saved[0]]
+        self._firstPos, self._lastPos = list(saved[1]), list(saved[2])
+
     def adjustLimit(self, limit: int, inst) -> int:
         for adj in self._adjusters:
             limit = adj(self, limit, inst)
@@ -3583,6 +3612,154 @@ def _requestBundles(requests):
     return bundles, pending
 
 
+def _evenly(gaps, count):
+    return [gaps[index * len(gaps) // count] for index in range(count)]
+
+
+def _halfDisjointPlacer(intervals, numModules, orders, minGapDsReadToWait,
+                        earliestWriteShadow, mfmaBase, validators=()):
+    """The rules, placer and load-run validator of a half-disjoint schedule.
+
+    validators go ahead of the shared ones.
+    """
+    spi = _MXFP8_FOLLOWER_SLOTS
+    rules = _SchedulingRules(
+        totalSlots=intervals * spi, minGapDsReadToWait=minGapDsReadToWait,
+        allowReadsAcrossWait=True)
+    rules.earliestWriteShadow = earliestWriteShadow or {}
+    rules.mfmaBase = mfmaBase
+    adjusters = [rules.deferLiveSourceWrite] if rules.earliestWriteShadow else []
+    dtlRun = rules.maxDtlRun(_MXFP8_MAX_DTL_RUN)
+    placer = _SlotPlacer(
+        intervals, numModules, orders,
+        validators=list(validators) + [
+            rules.oneDsReadPerInterval, rules.oneDtlLoadPerInterval,
+            rules.noDsReadOrValuInFirstSlot, rules.minGapDsReadBeforeWait,
+            rules.minGapDsReadToWait, rules.noM0WithBufferLoad,
+            rules.noValuWithDtl, dtlRun,
+        ],
+        preferences=[rules.valuNeedsLeader, rules.dtlAvoidsDsRead],
+        adjusters=adjusters,
+        onPlace=rules.trackPlacement,
+        slotsPerInterval=spi,
+        maxPerSlot=1,
+        dataDsReadCap=(_MXFP8_DATA_DS_READS, _MXFP8_DATA_DS_READ_OVERFLOW),
+        maxInstructionsPerInterval=spi)
+    return rules, placer, dtlRun
+
+
+def _placeOpener(placer, syncItems, end):
+    """Place the half's opening wait, drain and barrier.
+
+    Returns the first slot open to the rest of the half: the gap after a
+    barrier's own when one is left before slot end.
+    """
+    spi = placer.slotsPerInterval
+    if syncItems:
+        placer.placePath(syncItems, startLimit=0)
+    opened = _nextPlacementSlot(placer)
+    if any(_isBarrier(inst) for _, inst in syncItems) and opened % spi:
+        rounded = (opened // spi + 1) * spi
+        if rounded < end - spi:
+            opened = rounded
+    return opened
+
+
+def _tailEnd(placer, shadowReads, begin, pending):
+    """The gap past which no load goes: the items after the last load
+    need empty slots behind its m0 and load."""
+    spi = placer.slotsPerInterval
+    intervals = placer.totalSlots // spi
+
+    def emptySlots(interval):
+        return spi - shadowReads[interval] - sum(
+            map(len, placer._placed[interval * spi:(interval + 1) * spi]))
+
+    end = intervals
+    while end > begin and emptySlots(end - 1) - 2 + sum(
+            map(emptySlots, range(end, intervals))) < len(pending):
+        end -= 1
+    return end
+
+
+def _loadGaps(placer, begin, end, closed, reads):
+    """Gaps in [begin, end) outside closed with this many ds_reads and
+    room for a request."""
+    spi = placer.slotsPerInterval
+    gaps = []
+    for interval in range(begin, end):
+        insts = placer.intervalInsts(interval)
+        if (not closed(interval) and sum(map(_isDsRead, insts)) == reads
+                and not any(_isWaitCnt(x) or _isBarrier(x) or _isVALU(x) for x in insts)
+                and len(insts) <= spi - 2):
+            gaps.append(interval)
+    return gaps
+
+
+def _tieredLoadTargets(loadGaps, count):
+    """count load gaps: the gaps with no ds_read first, and only the loads
+    left over take gaps with one read, then two. Returns (gaps, most reads
+    beside a load), or None when no tier has room."""
+    chosen = []
+    for reads in range(_MXFP8_DATA_DS_READ_OVERFLOW + 1) if count else ():
+        gaps, need = loadGaps(reads), count - len(chosen)
+        if len(gaps) >= need:
+            return sorted(chosen + _evenly(gaps, need)), reads
+        chosen += gaps
+    return None
+
+
+def _placeChained(placer, rules, bundles, pending, opened, targets):
+    """Place the request bundles in order, each from its target gap on."""
+    spi = placer.slotsPerInterval
+    limit = opened
+    for bundle, target in zip(bundles, targets):
+        start = max(limit, target * spi)
+        # Address updates ahead of a request issue after the previous
+        # load, so only m0 and its load wait for the target gap.
+        if (rules.dtlDsReadLimit is not None and len(bundle) > 2
+                and _isM0Update(bundle[-2][1])):
+            lead, bundle = bundle[:-2], bundle[-2:]
+            placer.placePath(lead, startLimit=limit)
+            start = max(start, max(placer._lastPos[mid] for mid, _ in lead) + 1)
+        placer.placePath(bundle, startLimit=start, atomicDtl=True)
+        limit = max(placer._lastPos[mid] for mid, _ in bundle) + 1
+    if pending:
+        placer.placePath(pending, startLimit=limit)
+
+
+def _placeFirstFitting(placer, rules, dtlRun, attempts, place):
+    """Place the requests by each (targets, readLimit, capped) in turn,
+    from the same start, until one keeps every gap within its limits and
+    the load-run cap. An attempt without the cap drops it and always
+    fits. Returns whether an attempt fit.
+    """
+    saved = placer.snapshot(), dict(rules.__dict__)
+    before = placer.overfullIntervals()
+    for targets, readLimit, capped in attempts:
+        placer.restore(saved[0])
+        rules.__dict__.update(saved[1])
+        rules.dtlDsReadLimit = readLimit
+        if not capped:
+            placer._validators.remove(dtlRun)
+        place(targets)
+        if not capped or (placer.overfullIntervals() <= before and (
+                readLimit is None or placer.longestDtlRun() <= _MXFP8_MAX_DTL_RUN)):
+            return True
+    return False
+
+
+def _addLoadsAheadToVmcnt(scheduled):
+    """Add the buffer loads ahead of each VMEM wait to its count."""
+    bufLoadCount = 0
+    for inst in scheduled.flatitems():
+        if _isBufferLoad(inst):
+            bufLoadCount += 1
+        elif _isWaitCnt(inst) and inst.vlcnt >= 0:
+            if getattr(inst, "adjustVmcnt", True):
+                inst.vlcnt += bufLoadCount
+
+
 def _scheduleHalfDisjointCell(
         emittedModules, pathOrders, preMfmaOrders, mfmas,
         minGapDsReadToWait, earliestWriteShadow=None, mfmaBase=0,
@@ -3652,37 +3829,10 @@ def _scheduleHalfDisjointCell(
             _detachComments(items, anchors)
             for items in (syncItems, reads, requests, others))
 
-    rules = _SchedulingRules(
-        totalSlots=(len(mfmas) - 1) * spi,
-        minGapDsReadToWait=minGapDsReadToWait,
-        allowReadsAcrossWait=True)
-    rules.earliestWriteShadow = earliestWriteShadow or {}
-    rules.mfmaBase = mfmaBase
-    adjusters = [rules.deferLiveSourceWrite] if rules.earliestWriteShadow else []
-    dtlRun = rules.maxDtlRun(_MXFP8_MAX_DTL_RUN)
-    placer = _SlotPlacer(
+    rules, placer, dtlRun = _halfDisjointPlacer(
         len(mfmas) - 1, len(emittedModules), list(preMfmaOrders) + list(pathOrders),
-        validators=[
-            rules.oneDsReadPerInterval, rules.oneDtlLoadPerInterval,
-            rules.noDsReadOrValuInFirstSlot, rules.minGapDsReadBeforeWait,
-            rules.minGapDsReadToWait, rules.noM0WithBufferLoad,
-            rules.noValuWithDtl, dtlRun,
-        ],
-        preferences=[rules.valuNeedsLeader, rules.dtlAvoidsDsRead],
-        adjusters=adjusters,
-        onPlace=rules.trackPlacement,
-        slotsPerInterval=spi,
-        maxPerSlot=1,
-        dataDsReadCap=(_MXFP8_DATA_DS_READS, _MXFP8_DATA_DS_READ_OVERFLOW),
-        maxInstructionsPerInterval=spi)
-
-    if syncItems:
-        placer.placePath(syncItems, startLimit=0)
-    opened = _nextPlacementSlot(placer)
-    if any(_isBarrier(inst) for _, inst in syncItems) and opened % spi:
-        rounded = (opened // spi + 1) * spi
-        if rounded < placer.totalSlots - spi:
-            opened = rounded
+        minGapDsReadToWait, earliestWriteShadow, mfmaBase)
+    opened = _placeOpener(placer, syncItems, placer.totalSlots)
     if reads:
         placer.placePath(
             _orderReadsAroundLiveSourceWrites(
@@ -3693,12 +3843,8 @@ def _scheduleHalfDisjointCell(
     intervals = len(mfmas) - 1
     firstInterval = opened // spi
 
-    def intervalInsts(interval):
-        return [item[1] for slot in placer._placed[interval * spi:(interval + 1) * spi]
-                for item in slot if not isinstance(item[1], TextBlock)]
-
     def loadable(interval):
-        insts = intervalInsts(interval)
+        insts = placer.intervalInsts(interval)
         return (not any(_isWaitCnt(x) or _isBarrier(x) or _isVALU(x) for x in insts)
                 and len(insts) <= spi - 2)
 
@@ -3711,11 +3857,11 @@ def _scheduleHalfDisjointCell(
         opensHalf = any(_isBarrier(inst) for _, inst in syncItems)
         reservedShadows, scaleShadows[:] = placeScaleShadowReads(
             scaleShadows,
-            [[inst for _, inst in prefix]] + [intervalInsts(i) for i in range(intervals)],
+            [[inst for _, inst in prefix]] + [placer.intervalInsts(i) for i in range(intervals)],
             firstInterval + 1 if opensHalf else 0, base=mfmaBase - 1,
             tiers=[tier for tier in _SCALE_SHADOW_TIERS if not tier[0]])
         spare = sum(
-            loadable(interval) and sum(map(_isDsRead, intervalInsts(interval)))
+            loadable(interval) and sum(map(_isDsRead, placer.intervalInsts(interval)))
             <= _MXFP8_DATA_DS_READ_OVERFLOW
             for interval in range(firstInterval, intervals)) - len(bundles)
         for gap, _entry in reservedShadows:
@@ -3728,104 +3874,37 @@ def _scheduleHalfDisjointCell(
                 spare -= 1
             shadowReads[interval] += 1
 
-    def emptySlots(interval):
-        return spi - shadowReads[interval] - sum(
-            map(len, placer._placed[interval * spi:(interval + 1) * spi]))
-
-    # The items after the last load need empty slots behind its m0 and load.
-    tailEnd = intervals
-    while tailEnd > firstInterval and emptySlots(tailEnd - 1) - 2 + sum(
-            map(emptySlots, range(tailEnd, intervals))) < len(pending):
-        tailEnd -= 1
-
-    def loadGaps(reads):
-        """Gaps after the barrier with this many ds_reads and room for a request."""
-        return [
-            interval for interval in range(firstInterval, tailEnd)
-            if not shadowReads[interval] and loadable(interval)
-            and sum(map(_isDsRead, intervalInsts(interval))) == reads]
-
-    def evenly(gaps, count):
-        return [gaps[index * len(gaps) // count] for index in range(count)]
+    tailEnd = _tailEnd(placer, shadowReads, firstInterval, pending)
 
     def placeRequestsAndOthers(targets):
-        limit = opened
-        for bundle, target in zip(bundles, targets):
-            start = max(limit, target * spi)
-            # Address updates ahead of a request issue after the previous
-            # load, so only m0 and its load wait for the target gap.
-            if (rules.dtlDsReadLimit is not None and len(bundle) > 2
-                    and _isM0Update(bundle[-2][1])):
-                lead, bundle = bundle[:-2], bundle[-2:]
-                placer.placePath(lead, startLimit=limit)
-                start = max(start, max(placer._lastPos[mid] for mid, _ in lead) + 1)
-            placer.placePath(bundle, startLimit=start, atomicDtl=True)
-            limit = max(placer._lastPos[mid] for mid, _ in bundle) + 1
-        if pending:
-            placer.placePath(pending, startLimit=limit)
+        _placeChained(placer, rules, bundles, pending, opened, targets)
         if others:
             placer.placePath(others, startLimit=opened)
-
-    def overfullIntervals():
-        count = 0
-        for begin in range(0, placer.totalSlots, spi):
-            insts = [item[1] for slot in placer._placed[begin:begin + spi]
-                     for item in slot if not isinstance(item[1], TextBlock)]
-            count += sum(_isDtlLoad(inst) for inst in insts) > 1
-            count += len(insts) > spi
-        return count
-
-    def longestDtlRun():
-        run = longest = 0
-        for begin in range(0, placer.totalSlots, spi):
-            run = run + 1 if placer._intervalHasDtlLoad(begin) else 0
-            longest = max(longest, run)
-        return longest
 
     # Requests first take the gaps the reads left free, and only the
     # requests left over take gaps with one read, then two, under the run
     # cap. The run cap only spreads loads that fit. When that forces a
     # second load or an extra instruction into some gap, or a longer run,
     # requests are spaced over every gap, with the cap and then without it.
-    attempts, chosen = [], []
-    for reads in range(_MXFP8_DATA_DS_READ_OVERFLOW + 1) if bundles else ():
-        gaps, need = loadGaps(reads), len(bundles) - len(chosen)
-        if len(gaps) >= need:
-            attempts.append((sorted(chosen + evenly(gaps, need)), reads, True))
-            break
-        chosen += gaps
-    spaced = evenly(
+    tiered = _tieredLoadTargets(
+        lambda reads: _loadGaps(placer, firstInterval, tailEnd,
+                                lambda gap: shadowReads[gap], reads),
+        len(bundles))
+    spaced = _evenly(
         [interval for interval in range(firstInterval, max(intervals, firstInterval + 1))
          if interval >= intervals or not shadowReads[interval]] or [firstInterval],
         len(bundles))
-    attempts += [(spaced, None, True), (spaced, None, False)]
-    saved = ([list(slot) for slot in placer._placed], list(placer._firstPos),
-             list(placer._lastPos), dict(rules.__dict__))
-    before = overfullIntervals()
-    for targets, readLimit, capped in attempts:
-        placer._placed = [list(slot) for slot in saved[0]]
-        placer._firstPos, placer._lastPos = list(saved[1]), list(saved[2])
-        rules.__dict__.update(saved[3])
-        rules.dtlDsReadLimit = readLimit
-        if not capped:
-            placer._validators.remove(dtlRun)
-        placeRequestsAndOthers(targets)
-        if not capped or (overfullIntervals() <= before and (
-                readLimit is None or longestDtlRun() <= _MXFP8_MAX_DTL_RUN)):
-            break
+    _placeFirstFitting(
+        placer, rules, dtlRun,
+        ([(*tiered, True)] if tiered else []) + [(spaced, None, True), (spaced, None, False)],
+        placeRequestsAndOthers)
     _attachComments(placer, anchors)
 
     scheduled = Module()
     for _, inst in prefix:
         scheduled.add(inst)
     scheduled.add(placer.assemble(mfmas))
-    bufLoadCount = 0
-    for inst in scheduled.flatitems():
-        if _isBufferLoad(inst):
-            bufLoadCount += 1
-        elif _isWaitCnt(inst) and inst.vlcnt >= 0:
-            if getattr(inst, "adjustVmcnt", True):
-                inst.vlcnt += bufLoadCount
+    _addLoadsAheadToVmcnt(scheduled)
     return scheduled
 
 
@@ -4183,14 +4262,6 @@ def _scheduleHalfDisjointHalf(
     intervals = len(mfmas) - 1
     seams = {starts[c] - 1: c for c in range(1, len(cells)) if split[c][1]}
 
-    rules = _SchedulingRules(
-        totalSlots=intervals * spi, minGapDsReadToWait=minGapDsReadToWait,
-        allowReadsAcrossWait=True)
-    rules.earliestWriteShadow = earliestWriteShadow or {}
-    rules.mfmaBase = mfmaBase
-    adjusters = [rules.deferLiveSourceWrite] if rules.earliestWriteShadow else []
-    dtlRun = rules.maxDtlRun(_MXFP8_MAX_DTL_RUN)
-
     def outsideSeams(placer, pos, inst):
         return pos // spi not in seams
 
@@ -4201,7 +4272,7 @@ def _scheduleHalfDisjointHalf(
         if not shadowReads[gap] or not (
                 _isDsRead(inst) or _isDtlLoad(inst) or _isM0Update(inst)):
             return True
-        return _isDsRead(inst) and sum(map(_isDsRead, intervalInsts(gap))) + (
+        return _isDsRead(inst) and sum(map(_isDsRead, placer.intervalInsts(gap))) + (
             shadowReads[gap]) < _MXFP8_DATA_DS_READS
 
     crossCellReads = crossCellReads and not any(
@@ -4214,48 +4285,23 @@ def _scheduleHalfDisjointHalf(
         return not _isDsRead(inst) or all(
             fence - gap >= minGapDsReadToWait for fence in seams if fence > gap)
 
-    placer = _SlotPlacer(
-        intervals, len(modules), orders,
-        validators=[outsideSeams, besideScaleShadows] + (
-            [clearOfLaterFences] if crossCellReads else []) + [
-            rules.oneDsReadPerInterval, rules.oneDtlLoadPerInterval,
-            rules.noDsReadOrValuInFirstSlot, rules.minGapDsReadBeforeWait,
-            rules.minGapDsReadToWait, rules.noM0WithBufferLoad,
-            rules.noValuWithDtl, dtlRun,
-        ],
-        preferences=[rules.valuNeedsLeader, rules.dtlAvoidsDsRead],
-        adjusters=adjusters,
-        onPlace=rules.trackPlacement,
-        slotsPerInterval=spi,
-        maxPerSlot=1,
-        dataDsReadCap=(_MXFP8_DATA_DS_READS, _MXFP8_DATA_DS_READ_OVERFLOW),
-        maxInstructionsPerInterval=spi)
+    rules, placer, dtlRun = _halfDisjointPlacer(
+        intervals, len(modules), orders, minGapDsReadToWait, earliestWriteShadow,
+        mfmaBase, [outsideSeams, besideScaleShadows] + (
+            [clearOfLaterFences] if crossCellReads else []))
 
     syncItems = split[0][0]
-    if syncItems:
-        placer.placePath(syncItems, startLimit=0)
-    opened = _nextPlacementSlot(placer)
-    if any(_isBarrier(inst) for _, inst in syncItems) and opened % spi:
-        rounded = (opened // spi + 1) * spi
-        if rounded < ends[0] * spi - spi:
-            opened = rounded
+    opened = _placeOpener(placer, syncItems, ends[0] * spi)
     for gap, c in seams.items():
         for j, item in enumerate(split[c][1]):
             placer.place(gap * spi + min(j, spi - 1), item)
     cellOpen = [opened] + [starts[c] * spi for c in range(1, len(cells))]
     firstInterval = opened // spi
 
-    def intervalInsts(interval):
-        return [item[1] for slot in placer._placed[interval * spi:(interval + 1) * spi]
-                for item in slot if not isinstance(item[1], TextBlock)]
-
-    def emptySlots(interval):
-        return spi - shadowReads[interval] - sum(
-            map(len, placer._placed[interval * spi:(interval + 1) * spi]))
-
     def memoryGap(interval):
         return interval not in seams and not any(
-            _isWaitCnt(x) or _isBarrier(x) or _isVALU(x) for x in intervalInsts(interval))
+            _isWaitCnt(x) or _isBarrier(x) or _isVALU(x)
+            for x in placer.intervalInsts(interval))
 
     # As in the cell scheduler, a refresh keeps a gap the reads and loads
     # could take only while the half has such gaps to spare, one per load
@@ -4265,7 +4311,7 @@ def _scheduleHalfDisjointHalf(
     # to share a gap with a load.
     if scaleShadows:
         shadowGaps = [[inst for _, inst in split[0][1]]] + [
-            intervalInsts(i) for i in range(intervals)]
+            placer.intervalInsts(i) for i in range(intervals)]
         shadowStart = firstInterval + 1 if any(
             _isBarrier(inst) for _, inst in syncItems) else 0
         shadowTiers = [tier for tier in _SCALE_SHADOW_TIERS if not tier[0]]
@@ -4303,19 +4349,10 @@ def _scheduleHalfDisjointHalf(
     requests = [item for c in range(len(cells)) for item in split[c][3]]
     bundles, pending = _requestBundles(requests)
 
-    def tailFrom(begin):
-        # The items after the last load need empty slots behind its m0 and load.
-        end = intervals
-        while end > begin and emptySlots(end - 1) - 2 + sum(
-                map(emptySlots, range(end, intervals))) < len(pending):
-            end -= 1
-        return end
-
     eligible = [
-        interval for interval in range(firstInterval, tailFrom(firstInterval))
-        if interval not in seams and not shadowReads[interval] and not any(
-            _isWaitCnt(x) or _isBarrier(x) or _isVALU(x)
-            for x in intervalInsts(interval))]
+        interval for interval in range(
+            firstInterval, _tailEnd(placer, shadowReads, firstInterval, pending))
+        if memoryGap(interval) and not shadowReads[interval]]
     # Each item's earliest gap; a cell's reads are planned in groups of
     # equal floor, which keep their path order.
     floors = [[-(-cellOpen[c] // spi)] * len(readPaths[c]) for c in range(len(cells))]
@@ -4380,20 +4417,11 @@ def _scheduleHalfDisjointHalf(
         if readPaths[c]:
             placeReads(c, readTargets.get(c) if plan is not None else None)
 
-    tailEnd = tailFrom(firstInterval)
+    tailEnd = _tailEnd(placer, shadowReads, firstInterval, pending)
 
     def loadGaps(reads):
-        """Gaps after the barrier with this many ds_reads and room for a request."""
-        return [
-            interval for interval in range(firstInterval, tailEnd)
-            if interval not in seams and not shadowReads[interval]
-            and sum(map(_isDsRead, intervalInsts(interval))) == reads
-            and not any(_isWaitCnt(x) or _isBarrier(x) or _isVALU(x)
-                        for x in intervalInsts(interval))
-            and len(intervalInsts(interval)) <= spi - 2]
-
-    def evenly(gaps, count):
-        return [gaps[index * len(gaps) // count] for index in range(count)]
+        return _loadGaps(placer, firstInterval, tailEnd,
+                         lambda gap: gap in seams or shadowReads[gap], reads)
 
     # Scalar ALU leave the stream's chain only when no other path of the
     # half shares a register with them; waits and barriers stay ahead of
@@ -4450,7 +4478,7 @@ def _scheduleHalfDisjointHalf(
             for gap in range(max(low // spi, firstInterval), high // spi + 1):
                 if gap in seams or shadowReads[gap]:
                     continue
-                insts = intervalInsts(gap)
+                insts = placer.intervalInsts(gap)
                 for p in range(max(low, gap * spi),
                                min(high, gap * spi + spi - 1) - len(items) + 2):
                     if all(not placer._placed[p + t] and placer._canPlace(p + t, inst)
@@ -4478,48 +4506,14 @@ def _scheduleHalfDisjointHalf(
         return True
 
     def placeRequestsAndOthers(targets):
-        placeChained(targets)
+        _placeChained(placer, rules, bundles, pending, opened, targets)
         if units is not None:
-            chained = ([list(slot) for slot in placer._placed], list(placer._firstPos),
-                       list(placer._lastPos))
+            chained = placer.snapshot()
             if not moveScalarUnits():
-                placer._placed = chained[0]
-                placer._firstPos, placer._lastPos = chained[1], chained[2]
+                placer.restore(chained)
         for c in range(len(cells)):
             if split[c][4]:
                 placer.placePath(split[c][4], startLimit=cellOpen[c])
-
-    def placeChained(targets):
-        limit = opened
-        for bundle, target in zip(bundles, targets):
-            start = max(limit, target * spi)
-            # Address updates ahead of a request issue after the previous
-            # load, so only m0 and its load wait for the target gap.
-            if (rules.dtlDsReadLimit is not None and len(bundle) > 2
-                    and _isM0Update(bundle[-2][1])):
-                lead, bundle = bundle[:-2], bundle[-2:]
-                placer.placePath(lead, startLimit=limit)
-                start = max(start, max(placer._lastPos[mid] for mid, _ in lead) + 1)
-            placer.placePath(bundle, startLimit=start, atomicDtl=True)
-            limit = max(placer._lastPos[mid] for mid, _ in bundle) + 1
-        if pending:
-            placer.placePath(pending, startLimit=limit)
-
-    def overfullIntervals():
-        count = 0
-        for begin in range(0, placer.totalSlots, spi):
-            insts = [item[1] for slot in placer._placed[begin:begin + spi]
-                     for item in slot if not isinstance(item[1], TextBlock)]
-            count += sum(_isDtlLoad(inst) for inst in insts) > 1
-            count += len(insts) > spi
-        return count
-
-    def longestDtlRun():
-        run = longest = 0
-        for begin in range(0, placer.totalSlots, spi):
-            run = run + 1 if placer._intervalHasDtlLoad(begin) else 0
-            longest = max(longest, run)
-        return longest
 
     # The joint plan goes first. Otherwise, as in the cell scheduler,
     # requests take the gaps the reads left free and only the ones left
@@ -4544,28 +4538,21 @@ def _scheduleHalfDisjointHalf(
                 options, key=lambda g: (g not in free, abs(g - target), g)))
         return result, int(any(g not in free for g in result))
 
-    attempts, chosen = [], []
     planned = snapped(plan[1]) if plan is not None and bundles else None
-    if planned is not None:
-        attempts.append((planned[0], planned[1], True))
-    for reads in range(_MXFP8_DATA_DS_READ_OVERFLOW + 1) if bundles else ():
-        gaps, need = loadGaps(reads), len(bundles) - len(chosen)
-        if len(gaps) >= need:
-            attempts.append((sorted(chosen + evenly(gaps, need)), reads, True))
-            break
-        chosen += gaps
+    attempts = [(planned[0], planned[1], True)] if planned is not None else []
+    tiered = _tieredLoadTargets(loadGaps, len(bundles))
+    if tiered:
+        attempts.append((*tiered, True))
     open_ = [g for g in range(firstInterval, max(intervals, firstInterval + 1))
              if g not in seams and (g >= intervals or not shadowReads[g])] or [firstInterval]
-    spaced = evenly(open_, len(bundles)) if bundles else []
+    spaced = _evenly(open_, len(bundles))
     attempts += [(spaced, None, True), (spaced, None, False)]
-    saved = ([list(slot) for slot in placer._placed], list(placer._firstPos),
-             list(placer._lastPos), dict(rules.__dict__))
-    before = overfullIntervals()
+    saved = placer.snapshot(), dict(rules.__dict__)
+    before = placer.overfullIntervals()
 
     def attempt(targets, readLimit, capped):
-        placer._placed = [list(slot) for slot in saved[0]]
-        placer._firstPos, placer._lastPos = list(saved[1]), list(saved[2])
-        rules.__dict__.update(saved[3])
+        placer.restore(saved[0])
+        rules.__dict__.update(saved[1])
         rules.dtlDsReadLimit = readLimit
         if capped and dtlRun not in placer._validators:
             placer._validators.append(dtlRun)
@@ -4578,8 +4565,8 @@ def _scheduleHalfDisjointHalf(
     # schedules, which measure faster there than any joint packing.
     for targets, readLimit, capped in attempts:
         attempt(targets, readLimit, capped)
-        if capped and overfullIntervals() <= before and (
-                readLimit is None or longestDtlRun() <= _MXFP8_MAX_DTL_RUN):
+        if capped and placer.overfullIntervals() <= before and (
+                readLimit is None or placer.longestDtlRun() <= _MXFP8_MAX_DTL_RUN):
             break
     else:
         return None
@@ -4625,14 +4612,7 @@ def _scheduleHalfDisjointHalf(
         _relaxCrossedFences(
             keyed, cellOf,
             {id(inst): c for c in seams.values() for _, inst in split[c][1]})
-
-    bufLoadCount = 0
-    for inst in scheduled.flatitems():
-        if _isBufferLoad(inst):
-            bufLoadCount += 1
-        elif _isWaitCnt(inst) and inst.vlcnt >= 0:
-            if getattr(inst, "adjustVmcnt", True):
-                inst.vlcnt += bufLoadCount
+    _addLoadsAheadToVmcnt(scheduled)
     return scheduled
 
 
@@ -4933,13 +4913,7 @@ def instructionSchedule(emittedModules, multiDU: bool = False,
 
     # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
     # that the scheduler placed before it within this subIterK.
-    bufLoadCount = 0
-    for inst in scheduled.flatitems():
-        if _isBufferLoad(inst):
-            bufLoadCount += 1
-        elif _isWaitCnt(inst) and inst.vlcnt >= 0:
-            if getattr(inst, 'adjustVmcnt', True):
-                inst.vlcnt += bufLoadCount
+    _addLoadsAheadToVmcnt(scheduled)
 
     return scheduled
 
