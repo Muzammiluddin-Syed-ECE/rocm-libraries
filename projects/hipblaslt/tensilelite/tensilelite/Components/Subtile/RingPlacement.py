@@ -7,14 +7,15 @@ TENSILE_MXFP8_RING=1. The two bodies of the K loop form one ring of MFMA gaps wi
 four halves, each opened by today's barrier. The load plan has already given every
 direct-to-LDS load and every ds_read its half; this module picks the gap of each:
 
-- Loads go on a uniform grid over the half's load gaps, one per gap, so their spacing
-  is the half's gap count over its load count.
+- Loads go on a uniform grid over the half's load gaps, one per gap (two where loads
+  outnumber gaps), so their spacing is the half's gap count over its load count.
 - Every ds_read has a window: from its floor (the half's barrier, the last MFMA that
   reads its destination's old contents, the scale-source retain distance) to its
   deadline (RING_READ_LEAD_MFMAS ahead of its first consumer, and ahead of the fence
   that drains its cell). Reads take a uniform grid of their own, kept off the load
   gaps, at most RING_READS_PER_GAP to a gap, earliest deadline first.
-- One ds_read always goes in the barrier gap.
+- One ds_read goes in the barrier gap when a chain head's window covers it
+  (RingHalf.barrierRead is cleared when none does).
 - Reads that can only fit on load targets keep them; the loads then spread over the
   load gaps left free.
 
@@ -28,6 +29,7 @@ from typing import Dict, List, Optional, Sequence, Set
 
 RING_READ_LEAD_MFMAS = 6
 RING_READS_PER_GAP = 2
+RING_LOADS_PER_GAP = 2
 
 
 class RingInfeasible(Exception):
@@ -63,12 +65,18 @@ class RingHalf:
 
 
 def ringLoadTargets(loadGaps: Sequence[int], count: int) -> List[int]:
-    """count gaps of loadGaps, one at the middle of each of count equal shares."""
+    """count gaps of loadGaps, one at the middle of each of count equal shares.
+
+    With more loads than gaps the loads spread evenly, at most RING_LOADS_PER_GAP
+    to a gap.
+    """
     if count <= 0:
         return []
-    if len(loadGaps) < count:
-        raise RingInfeasible(f"{count} loads over {len(loadGaps)} load gaps")
     n = len(loadGaps)
+    if n * RING_LOADS_PER_GAP < count:
+        raise RingInfeasible(f"{count} loads over {n} load gaps")
+    if n < count:
+        return [loadGaps[k * n // count] for k in range(count)]
     return [loadGaps[(2 * k + 1) * n // (2 * count)] for k in range(count)]
 
 
@@ -150,12 +158,11 @@ def ringReadTargets(half: RingHalf, loadTargets: Sequence[int]) -> List[RingRead
             heads.setdefault(read.chain, read)
         candidates = [r for r in heads.values()
                       if r.floor <= half.barrierGap <= r.deadline]
-        if not candidates or half.barrierGap in half.readBlocked:
-            raise RingInfeasible(
-                f"no ds_read window covers the barrier gap {half.barrierGap}: chain heads "
-                + ", ".join(f"{r.name} [{r.floor}, {r.deadline}]" for r in heads.values()))
-        take(half.barrierGap, min(candidates, key=lambda r: (r.deadline, reads.index(r))),
-             True)
+        if candidates and half.barrierGap not in half.readBlocked:
+            take(half.barrierGap,
+                 min(candidates, key=lambda r: (r.deadline, reads.index(r))), True)
+        else:
+            half.barrierRead = False
 
     passes = (
         lambda g: min(grid.get(g, 0) - used.get(g, 0), free(g)),

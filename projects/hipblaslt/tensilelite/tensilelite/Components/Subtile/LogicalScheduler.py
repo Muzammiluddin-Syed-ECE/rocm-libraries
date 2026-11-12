@@ -206,10 +206,6 @@ class MFMATileRange:
 
 BALANCE_MIN_LEAD_MFMAS = 6
 BALANCE_MIN_HALF_MFMAS = 28
-# The ring placement (SchedulerConfig.ringPlacement) gives every load its own gap and
-# keeps its reads off the load gaps, at most two to a gap and RING_READ_LEAD_MFMAS
-# ahead of their consumers; a half needs this many MFMA gaps per A/B load for that.
-RING_MIN_GAPS_PER_LOAD = 4
 
 
 def planHalfDisjointBalance(firstHalfMfmas, secondHalfMfmas, wrapTiles, ownTiles,
@@ -1052,8 +1048,9 @@ class LogicalScheduler:
         """Why the ring placement does not apply, or None when it does.
 
         The body must split into two halves of two partitions each (a 2x2 grid)
-        with equal MFMA counts of at least BALANCE_MIN_HALF_MFMAS and equal A/B
-        load counts, and give every load at least RING_MIN_GAPS_PER_LOAD MFMAs.
+        with equal MFMA counts, and neither half may have more A/B loads than
+        MFMA gaps. Anything tighter is for the placer to find out: a half it
+        cannot place raises RingInfeasible and the kernel keeps today's schedule.
         """
         cfg = self.config
         if not cfg.ringPlacement:
@@ -1064,6 +1061,16 @@ class LogicalScheduler:
             return "not dual-period"
         if cfg.numPartitionsM != 2 or cfg.numPartitionsN != 2:
             return "not 2x2 partitions"
+        mfmas, loads, _reads = self.ringHalfCounts()
+        if mfmas[0] != mfmas[1]:
+            return f"half MFMAs {mfmas[0]}/{mfmas[1]}"
+        if max(loads) > mfmas[0]:
+            return f"{max(loads)} loads in {mfmas[0]} MFMAs"
+        return None
+
+    def ringHalfCounts(self) -> Tuple[List[int], List[int], List[int]]:
+        """MFMAs, A/B buffer loads and A/B tile reads of each half of a half-disjoint body."""
+        cfg = self.config
         half = cfg.numPartitions // 2
         mfmas = [0, 0]
         for pi in range(cfg.numPartitions):
@@ -1072,13 +1079,20 @@ class LogicalScheduler:
         loads = [0, 0]
         for (tensor, _start), h in self._halfLoadHalf.items():
             loads[h] += max(1, int(cfg.grLoadsPerAtom.get(tensor, 1)))
-        if mfmas[0] != mfmas[1] or mfmas[0] < BALANCE_MIN_HALF_MFMAS:
-            return f"half MFMAs {mfmas[0]}/{mfmas[1]}"
-        if loads[0] != loads[1]:
-            return f"half loads {loads[0]}/{loads[1]}"
-        if mfmas[0] < RING_MIN_GAPS_PER_LOAD * loads[0]:
-            return f"{loads[0]} loads in {mfmas[0]} MFMAs"
-        return None
+        reads = [0, 0]
+        for pi, slots in enumerate(self._partitions or ()):
+            for slot in slots:
+                for lr in slot.lrs:
+                    if lr.tensor in ('A', 'B'):
+                        reads[pi // half] += lr.tiles.tileId_end - lr.tiles.tileId_start
+        return mfmas, loads, reads
+
+    def ringSlack(self) -> Tuple[float, float]:
+        """How tight the ring placement is, lower is looser: loads per MFMA gap of the
+        fuller half, then reads per gap left to reads (those not taken by loads)."""
+        mfmas, loads, reads = self.ringHalfCounts()
+        return (max(l / max(1, m) for l, m in zip(loads, mfmas)),
+                max(r / max(1, m - l) for r, l, m in zip(reads, loads, mfmas)))
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -5525,14 +5539,8 @@ class LogicalScheduler:
         # than one partition together, so its loads and reads share the
         # half's MFMA gaps.
         half_cells = {}
-        ring = False
-        if schedule and label.startswith("MAINLOOP") and self.config.ringPlacement:
-            reason = self.ringSkipReason()
-            ring = reason is None
-            if label == "MAINLOOP_C0":
-                print(f"[mxfp8-ring] {'applied' if ring else 'skipped: ' + reason} "
-                      f"tiles {self.config.numMFMATilesM}x{self.config.numMFMATilesN} "
-                      f"partitions {self.config.partitionSizesM}x{self.config.partitionSizesN}")
+        ring = bool(schedule and label.startswith("MAINLOOP") and self.config.ringPlacement
+                    and self.ringSkipReason() is None)
         if (schedule and self.halfDisjoint and label.startswith("MAINLOOP")
                 and injectAfterPartition is None and injectBeforeSlot is None):
             numP = len(emitted_3d)
@@ -5791,8 +5799,7 @@ class LogicalScheduler:
                 and self.config.dualPeriodScale):
             dropDominatedLgkmWaits(module)
         if self.halfDisjoint and label.startswith("MAINLOOP"):
-            if not ring:
-                deferBalancedCurrentCellWait(module)
+            deferBalancedCurrentCellWait(module)
             issueSaluFirst(module)
             keepValuBehindLeader(module)
         return module

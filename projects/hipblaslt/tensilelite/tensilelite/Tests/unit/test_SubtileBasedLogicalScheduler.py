@@ -7907,11 +7907,29 @@ class TestRingPlacement:
         with pytest.raises(RingInfeasible, match="full"):
             ringReadTargets(RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0, reads=[
                 RingRead(0, 1, c, f"r{c}") for c in range(5)]), [])
-        with pytest.raises(RingInfeasible, match="barrier gap"):
-            ringReadTargets(RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0, reads=[
-                RingRead(1, 9, 0, "r")]), [])
         with pytest.raises(RingInfeasible):
-            ringLoadTargets([1, 2], 3)
+            ringLoadTargets([1, 2], 5)
+
+    def test_barrier_gap_read_is_best_effort(self):
+        from tensilelite.Components.Subtile.RingPlacement import (
+            RingHalf, RingRead, ringReadTargets)
+        half = RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0,
+                        reads=[RingRead(1, 9, 0, "r")])
+        reads = ringReadTargets(half, [])
+        assert not half.barrierRead
+        assert 1 <= reads[0].target <= 9
+        blocked = RingHalf(gaps=10, barrierGap=0, loadGaps=[], loadCount=0,
+                           reads=[RingRead(0, 9, 0, "r")], readBlocked={0})
+        assert ringReadTargets(blocked, [])[0].target > 0 and not blocked.barrierRead
+
+    def test_loads_beyond_the_gaps_spread_two_to_a_gap(self):
+        from collections import Counter
+        from tensilelite.Components.Subtile.RingPlacement import ringLoadTargets
+        assert ringLoadTargets([1, 2, 3], 3) == [1, 2, 3]
+        targets = ringLoadTargets([1, 3, 5, 7], 6)
+        assert len(targets) == 6 and targets == sorted(targets)
+        assert set(targets) == {1, 3, 5, 7} and max(Counter(targets).values()) == 2
+        assert Counter(ringLoadTargets([1, 2], 4)) == {1: 2, 2: 2}
 
 
 class TestRingHalfSchedule:
@@ -8003,7 +8021,7 @@ class TestRingHalfSchedule:
 
 
 class TestRingGate:
-    """The ring placement applies to 2x2 partition grids with even, long enough halves."""
+    """The ring placement applies to 2x2 partition grids with even halves."""
 
     @staticmethod
     def _sched(m=8, n=10, ring=True, order="n-major", **kw):
@@ -8035,10 +8053,134 @@ class TestRingGate:
         assert self._sched(half_disjoint=False).ringSkipReason() == "not half-disjoint"
         # 10x8 n-major splits M 6/4: 48/32 MFMAs.
         assert self._sched(10, 8, size_m=6).ringSkipReason() == "half MFMAs 48/32"
-        # 4x4 tiles: 8 MFMAs per half.
-        assert self._sched(4, 4).ringSkipReason() == "half MFMAs 8/8"
-        # 4x16 tiles, 2/2 x 8/8: 10 loads in a 32-MFMA half.
-        assert self._sched(4, 16).ringSkipReason() == "10 loads in 32 MFMAs"
+
+    def test_short_or_load_heavy_even_halves_apply(self):
+        # 4x4 tiles: 8 MFMAs per half; 4x16 tiles, 2/2 x 8/8: 10 loads in each
+        # 32-MFMA half. Whether they place is for RingPlacement to find out.
+        assert self._sched(4, 4).ringSkipReason() is None
+        s = self._sched(4, 16)
+        assert s.ringSkipReason() is None
+        mfmas, loads, _reads = s.ringHalfCounts()
+        assert mfmas == [32, 32] and loads == [10, 10]
+
+    def test_more_loads_than_gaps_skips(self, monkeypatch):
+        s = self._sched()
+        monkeypatch.setattr(s, "ringHalfCounts", lambda: ([8, 8], [5, 9], [8, 8]))
+        assert s.ringSkipReason() == "9 loads in 8 MFMAs"
+
+    def test_slack_of_sol102(self):
+        s = self._sched()
+        mfmas, loads, reads = s.ringHalfCounts()
+        assert mfmas == [40, 40]
+        assert s.ringSlack() == (max(loads) / 40,
+                                 max(r / (40 - l) for r, l in zip(reads, loads)))
+
+
+class TestRingWalkChoice:
+    """Kernel._chooseRingWalk ranks the walks with even halves by ringSlack and
+    _getKernelSource regenerates a kernel whose ring placement raised."""
+
+    class _Sched:
+        def __init__(self, cfg):
+            self.config = cfg
+
+        def build(self):
+            pass
+
+        def ringSkipReason(self):
+            return self.config["reason"]
+
+        def ringSlack(self):
+            return self.config["slack"]
+
+    def _choose(self, monkeypatch, walks, failed=None, default="n-major", forced=None):
+        from types import SimpleNamespace
+        from tensilelite.Components.Subtile import Kernel as K
+        monkeypatch.setattr(K, "LogicalScheduler", self._Sched)
+        if forced:
+            monkeypatch.setenv("TENSILE_MXFP8_RING_WALK", forced)
+        else:
+            monkeypatch.delenv("TENSILE_MXFP8_RING_WALK", raising=False)
+        writer = SimpleNamespace(mxfp8RingFailed=failed or {})
+
+        def config(walk, ringPlacement=False):
+            assert ringPlacement
+            reason, slack = walks[walk]
+            return {"walk": walk, "reason": reason, "slack": slack}
+        scheduler, note = K._chooseRingWalk(writer, config, default)
+        return (scheduler.config["walk"] if scheduler else None), note, writer.mxfp8RingWalk
+
+    def test_looser_walk_wins(self, monkeypatch):
+        walk, note, tried = self._choose(monkeypatch, {
+            "n-major": (None, (0.3, 0.6)), "m-major": (None, (0.3, 0.5))})
+        assert walk == tried == "m-major" and note.startswith("applied m-major (")
+
+    def test_tie_keeps_the_default_walk(self, monkeypatch):
+        walk, note, _ = self._choose(monkeypatch, {
+            "n-major": (None, (0.3, 0.5)), "m-major": (None, (0.3, 0.5))})
+        assert walk == "n-major" and "tie with m-major" in note
+
+    def test_failed_walk_hands_over_then_falls_back(self, monkeypatch):
+        walks = {"n-major": (None, (0.2, 0.5)), "m-major": (None, (0.3, 0.5))}
+        walk, note, _ = self._choose(monkeypatch, walks, {"n-major": "B0: window full"})
+        assert walk == "m-major" and "after n-major: B0: window full" in note
+        walk, note, tried = self._choose(
+            monkeypatch, walks, {"n-major": "x", "m-major": "y"})
+        assert walk is None and tried is None
+        assert note == "fallback: n-major: x; m-major: y"
+
+    def test_no_even_walk_skips(self, monkeypatch):
+        walk, note, _ = self._choose(monkeypatch, {
+            "n-major": ("half MFMAs 48/32", None), "m-major": ("not 2x2 partitions", None)})
+        assert walk is None
+        assert note == "skipped: n-major: half MFMAs 48/32; m-major: not 2x2 partitions"
+
+    def test_forced_walk(self, monkeypatch):
+        walks = {"n-major": (None, (0.2, 0.5)), "m-major": (None, (0.3, 0.5))}
+        assert self._choose(monkeypatch, walks, forced="m-major")[0] == "m-major"
+
+    def test_kernel_source_regenerates_after_ring_infeasible(self):
+        from types import SimpleNamespace
+        from tensilelite.KernelWriter import KernelWriter
+        from tensilelite.Components.Subtile.RingPlacement import RingInfeasible
+        inits, walks = [], iter(["n-major", "m-major", None])
+
+        def body(kernel, tPA, tPB):
+            walk = next(walks)
+            writer.mxfp8RingWalk = walk
+            if walk is not None:
+                raise RingInfeasible(f"{walk} does not fit")
+            return 0, f"s_endpgm // after {sorted(writer.mxfp8RingFailed)}\n"
+        writer = SimpleNamespace(
+            _initKernel=lambda kernel, tPA, tPB: inits.append(1),
+            _registerKernelArgs=lambda kernel: None,
+            states=SimpleNamespace(kernelName="k"), kernelArgDefs=[], stringIdx=0,
+            kernelBodySubtile=body,
+            debugConfig=SimpleNamespace(forceGenerateKernel=False))
+        kernel = {"UseSubtileImpl": True, "TileProcessingStrategy": "None",
+                  "MacroTile0": 256, "MacroTile1": 256, "DepthU": 128, "NumThreads": 256}
+        source = KernelWriter._getKernelSource(writer, kernel)
+        assert "after ['m-major', 'n-major']" in source and len(inits) == 3
+        assert writer.mxfp8RingFailed == {"n-major": "n-major does not fit",
+                                          "m-major": "m-major does not fit"}
+
+    def test_kernel_source_reraises_without_a_ring_walk(self):
+        from types import SimpleNamespace
+        from tensilelite.KernelWriter import KernelWriter
+        from tensilelite.Components.Subtile.RingPlacement import RingInfeasible
+
+        def body(kernel, tPA, tPB):
+            raise RingInfeasible("no walk")
+        writer = SimpleNamespace(
+            _initKernel=lambda kernel, tPA, tPB: None,
+            _registerKernelArgs=lambda kernel: None,
+            states=SimpleNamespace(kernelName="k"), kernelArgDefs=[], stringIdx=0,
+            kernelBodySubtile=body,
+            debugConfig=SimpleNamespace(forceGenerateKernel=False))
+        kernel = {"UseSubtileImpl": True, "TileProcessingStrategy": "None",
+                  "MacroTile0": 256, "MacroTile1": 256, "DepthU": 128, "NumThreads": 256}
+        with pytest.raises(RingInfeasible, match="no walk"):
+            KernelWriter._getKernelSource(writer, kernel)
 
 
 class TestInsertRingConsumerWaits:

@@ -1406,6 +1406,57 @@ def _emitDualPeriodTailScaleSrdAlignment(kernel, unrollIdx, scaleTiA, scaleTiB):
   return module
 
 
+RING_WALKS = ("n-major", "m-major")
+
+
+def _chooseRingWalk(writer, schedulerConfig, defaultOrder):
+  """The built ring scheduler of the walk to try next and its log note, or None and
+  the note when no walk is left (the kernel then keeps its default walk, ring off).
+
+  A walk is a candidate when its 2x2 halves pass ringSkipReason (n-major splits M,
+  m-major splits N). Candidates rank by ringSlack, then defaultOrder first. A walk
+  whose placement raised RingInfeasible is in writer.mxfp8RingFailed: the kernel
+  writer regenerates the kernel without it. TENSILE_MXFP8_RING_WALK restricts the
+  candidates to one walk.
+  """
+  failed = getattr(writer, "mxfp8RingFailed", None) or {}
+  forced = os.environ.get("TENSILE_MXFP8_RING_WALK")
+  walks = sorted(RING_WALKS, key=lambda walk: walk != defaultOrder)
+  candidates, skipped = [], []
+  for walk in walks:
+    if forced and walk != forced:
+      continue
+    scheduler = LogicalScheduler(schedulerConfig(walk, ringPlacement=True))
+    scheduler.build()
+    reason = scheduler.ringSkipReason()
+    if reason is not None:
+      skipped.append(f"{walk}: {reason}")
+    elif walk not in failed:
+      candidates.append((scheduler.ringSlack(), walks.index(walk), walk, scheduler))
+  writer.mxfp8RingWalk = None
+  tried = "; ".join(f"{walk}: {why}" for walk, why in failed.items())
+  if not candidates:
+    if failed:
+      return None, f"fallback: {tried}"
+    return None, f"skipped: {'; '.join(skipped)}"
+  candidates.sort(key=lambda c: (c[0], c[1]))
+  slack, _rank, walk, scheduler = candidates[0]
+  writer.mxfp8RingWalk = walk
+  def fmt(s):
+    return f"loads/gap {s[0]:.3f} reads/read-gap {s[1]:.3f}"
+  if len(candidates) > 1:
+    other = candidates[1]
+    if other[0] == slack:
+      why = f"{fmt(slack)}, tie with {other[2]}"
+    else:
+      why = f"{fmt(slack)} vs {other[2]} {fmt(other[0])}"
+  else:
+    why = fmt(slack) + "".join(f"; {s}" for s in skipped)
+  if failed:
+    why += f"; after {tried}"
+  return scheduler, f"applied {walk} ({why})"
+
+
 def mainLoop(writer, kernel):
   module = Module()
   tensorParametersA = writer.tPA
@@ -1551,7 +1602,7 @@ def mainLoop(writer, kernel):
       ringPlacement = (schedulerPartitionPrefetch
                        and os.environ.get("TENSILE_MXFP8_RING", "0") == "1")
 
-      def schedulerConfig(partitionOrder):
+      def schedulerConfig(partitionOrder, ringPlacement=False):
         return MFMASchedulerConfig(
           numMFMATilesM=M,
           numMFMATilesN=N,
@@ -1587,16 +1638,13 @@ def mainLoop(writer, kernel):
           tailPartitionSizeM=tailPartitionSizeM,
         )
 
-      scheduler = LogicalScheduler(schedulerConfig(schedulerPartitionOrder))
-      scheduler.build()
-      # The ring needs halves of equal MFMA counts. Where the n-major halves
-      # (split along M) are uneven, the m-major ones (split along N) may not be.
-      if (ringPlacement and schedulerPartitionOrder == "n-major"
-              and scheduler.ringSkipReason() is not None):
-        mMajor = LogicalScheduler(schedulerConfig("m-major"))
-        mMajor.build()
-        if mMajor.ringSkipReason() is None:
-          scheduler = mMajor
+      scheduler = None
+      if ringPlacement:
+        scheduler, ringNote = _chooseRingWalk(
+            writer, schedulerConfig, schedulerPartitionOrder)
+      if scheduler is None:
+        scheduler = LogicalScheduler(schedulerConfig(schedulerPartitionOrder))
+        scheduler.build()
 
       numVgpr = scheduler.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)
       if vgprUsed + numVgpr <= vgprBudget:
@@ -1636,6 +1684,11 @@ def mainLoop(writer, kernel):
     module.add(SNop(waitState=0, comment="nop after SSetReg"))
 
   module.add(scheduler.emitMainAndExitLoops(writer, kernel, tensorParametersA, tensorParametersB))
+  if ringPlacement:
+    cfg = scheduler.config
+    print(f"[mxfp8-ring] {ringNote} tiles {cfg.numMFMATilesM}x{cfg.numMFMATilesN} "
+          f"partitions {cfg.partitionSizesM}x{cfg.partitionSizesN} "
+          f"kernel {writer.states.kernelName}", flush=True)
 
   # gfx1250: disable expert scheduling mode after NLL.
   if writer.states.archCaps.get("HasWmmaArbStallBit", False):

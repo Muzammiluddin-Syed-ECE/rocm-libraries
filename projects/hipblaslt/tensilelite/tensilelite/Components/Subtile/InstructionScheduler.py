@@ -4329,10 +4329,9 @@ def _scheduleHalfDisjointHalf(
         if rounded < ends[0] * spi - spi:
             opened = rounded
     shadowFirst = opened // spi
-    if ring:
-        # The ring's barrier-gap ds_read issues right behind the barrier.
-        if not barrierAtTop or syncEnd % spi == 0:
-            raise RingInfeasible("no room for a ds_read in the barrier gap")
+    # The ring's barrier-gap ds_read issues right behind the barrier, where there is room.
+    barrierRead = ring and barrierAtTop and syncEnd % spi != 0
+    if barrierRead:
         opened = syncEnd
     for gap, c in seams.items():
         for j, item in enumerate(split[c][1]):
@@ -4522,7 +4521,8 @@ def _scheduleHalfDisjointHalf(
         half = RingHalf(
             gaps=intervals, barrierGap=firstInterval, loadGaps=loadGapList,
             loadCount=len(bundles), reads=reads, readBlocked=blocked,
-            reserved={g: n for g, n in enumerate(shadowReads) if n})
+            reserved={g: n for g, n in enumerate(shadowReads) if n},
+            barrierRead=barrierRead)
         ringReadTargets(half, loadTargets)
         loadTargets = ringLoadsClearOfReads(loadGapList, loadTargets, reads)
         targets = {}
@@ -4555,9 +4555,6 @@ def _scheduleHalfDisjointHalf(
         for (_c, deadline, name), gap in zip(ringDeadlines, landed):
             if gap > deadline:
                 raise RingInfeasible(f"{name}: placed at gap {gap} past its deadline {deadline}")
-        if firstInterval not in landed:
-            raise RingInfeasible(
-                f"no ds_read landed in the barrier gap of the half at MFMA {mfmaBase}")
 
     tailEnd = tailFrom(firstInterval)
 
@@ -4956,7 +4953,8 @@ def instructionScheduleHalf(
     to the MFMA cadence (_issueExcess) wins.
     The C0-entry scale refreshes the winner reserves leave ``scaleShadows``.
     With ring only the joint schedule with cross-cell reads is built, on the
-    RingPlacement targets; a half it does not fit raises RingInfeasible.
+    RingPlacement targets; a half it does not fit raises RingInfeasible, and the
+    kernel writer regenerates the whole kernel on another walk or without the ring.
     """
     cells = []
     for emitted in emittedLists:

@@ -56,6 +56,7 @@ from .Components.StreamK import StreamKKernelState
 from .Components.CustomSchedule import customMainLoopSchedule
 from .Components.ClusterLoad import ClusterLoadTDM
 from .Components.Subtile.Kernel import *
+from .Components.Subtile.RingPlacement import RingInfeasible
 from .Components.Subtile.SubtileLdsLayout import applyLdsLayout
 from .Components.DecouplePGR import decouplePGRBlocks, decoupledSingleBuffered, dcpLdsSide, dcpLateFillIncrements
 from .Components.DecouplePGR import tdmWaveIssueOrder, decoupledThickGateRelaxation, dcpThickGateFromTokenPasses, dcpThickGateUncoveredSites, dcpIsFillLabel, DCP_TENSORCNT_RE, DCP_THICK_GATE_TEXT, DCP_THICK_GATE_TOKENS
@@ -12350,35 +12351,48 @@ class KernelWriter(PersistentKernelState, StreamKKernelState, metaclass=abc.ABCM
   def _getKernelSource(self, kernel: Solution):
     """
     Returns the source of the kernel, either C++ or assembly.
+
+    TENSILE_MXFP8_RING=1: a ring walk whose placement raises RingInfeasible is
+    recorded and the kernel is generated again from scratch, on the next walk or,
+    with none left, with the ring off (Subtile.Kernel._chooseRingWalk).
     """
     fileString = ""
-    tensorParametersA = {}
-    tensorParametersB = {}
-    self._initKernel(kernel, tensorParametersA, tensorParametersB)
+    self.mxfp8RingFailed = {}
+    while True:
+      self.mxfp8RingWalk = None
+      tensorParametersA = {}
+      tensorParametersB = {}
+      self._initKernel(kernel, tensorParametersA, tensorParametersB)
 
-    self._registerKernelArgs(kernel)
-    gridX = "TilesXYBatchGSU"
-    if isPersistent(kernel):
-      gridX = "PersistentGrid" if isPersistentDataParallel(kernel) else ("PersistentWithBatch" if kernel["ProblemType"]["NumIndicesC"] > 2 else "PersistentNoBatch")
-    kernel["CustomKernel"] = {
-      "name": self.states.kernelName,
-      "args": self.kernelArgDefs,
-      "macrotile": [kernel["MacroTile0"], kernel["MacroTile1"], kernel["DepthU"]],
-      "threads": [kernel["NumThreads"], 1, 1],
-      "grid": [gridX, "One", "One"],
-      "workspaceType": "None",
-      "workspaceSizePerElemC": 0,
-      "workspaceSizePerElemBias": 0,
-      "generated": True,
-    }
-    from .CustomKernels import validateCustomPersistentArgs
-    validateCustomPersistentArgs(kernel)
+      self._registerKernelArgs(kernel)
+      gridX = "TilesXYBatchGSU"
+      if isPersistent(kernel):
+        gridX = "PersistentGrid" if isPersistentDataParallel(kernel) else ("PersistentWithBatch" if kernel["ProblemType"]["NumIndicesC"] > 2 else "PersistentNoBatch")
+      kernel["CustomKernel"] = {
+        "name": self.states.kernelName,
+        "args": self.kernelArgDefs,
+        "macrotile": [kernel["MacroTile0"], kernel["MacroTile1"], kernel["DepthU"]],
+        "threads": [kernel["NumThreads"], 1, 1],
+        "grid": [gridX, "One", "One"],
+        "workspaceType": "None",
+        "workspaceSizePerElemC": 0,
+        "workspaceSizePerElemBias": 0,
+        "generated": True,
+      }
+      from .CustomKernels import validateCustomPersistentArgs
+      validateCustomPersistentArgs(kernel)
 
-    self.stringIdx = 0
-    if not kernel["UseSubtileImpl"]:
-      (error, kb) = self.kernelBody(kernel, tensorParametersA, tensorParametersB)
-    else:
-      (error, kb) = self.kernelBodySubtile(kernel, tensorParametersA, tensorParametersB)
+      self.stringIdx = 0
+      try:
+        if not kernel["UseSubtileImpl"]:
+          (error, kb) = self.kernelBody(kernel, tensorParametersA, tensorParametersB)
+        else:
+          (error, kb) = self.kernelBodySubtile(kernel, tensorParametersA, tensorParametersB)
+        break
+      except RingInfeasible as e:
+        if self.mxfp8RingWalk is None or self.mxfp8RingWalk in self.mxfp8RingFailed:
+          raise
+        self.mxfp8RingFailed[self.mxfp8RingWalk] = str(e)
 
     fileString += str(kb)
 
