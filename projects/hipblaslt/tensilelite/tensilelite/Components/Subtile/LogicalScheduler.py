@@ -5413,6 +5413,36 @@ class LogicalScheduler:
                 _sys.stderr.write(
                     f"[WEAVE_PLACE] placed={len(_rows)} pairs_used={len(set(_pairSeq))} "
                     f"order_inversions={_inv} idx->pair[:24]={_pairSeq[:24]}\n")
+            if __import__("os").environ.get("WEAVE_FREELIST"):
+                # Free-list schedule: as the store drains pair-by-pair (ascending gap
+                # position), each woven MFMA retires its operand VGPRs -- its last reader
+                # executes at its gap -- so the pool of free VGPRs grows monotonically.
+                # INERT here (nothing acquires), so plain-woven assembly is unchanged; this
+                # is the pool the fold path draws its blend/pack quads from. free_at_pair[k]
+                # = VGPRs already retired strictly before pair k's drain position.
+                _sys = __import__("sys")
+                def _opoffs(_p):
+                    _o = []
+                    for _c in self._plsinOperands(_p, self._PLSIN_MFMA_SOURCES):
+                        for _kk in (self._plsinRegisterKeys(_c) or ()):
+                            if _kk is not None and _kk[1] is None:  # resolved VGPR offset
+                                _o.append(_kk[2])
+                    return _o
+                _gapAnchor = {id(_g): _ap for _ap, _g in candidates}
+                _retire = {}
+                for _p in qualifying:
+                    _g = capturePlan.get(id(_p))
+                    _pos = _gapAnchor.get(id(_g)) if _g is not None else None
+                    if _pos is None:
+                        continue
+                    for _off in _opoffs(_p):
+                        _retire[_off] = max(_retire.get(_off, -1), _pos)
+                _pairPos = sorted({_ap for _ap, _g in candidates})
+                _curve = [sum(1 for _r in _retire.values() if _r < _P) for _P in _pairPos]
+                _mono = all(_curve[_i] >= _curve[_i-1] for _i in range(1, len(_curve)))
+                _sys.stderr.write(
+                    f"[WEAVE_FREELIST] pairs={len(_pairPos)} pool_regs={len(_retire)} "
+                    f"monotonic={_mono} free_at_pair={_curve}\n")
             plans.append(capturePlan)
 
         moved = {id(inst) for inst in allInsts}
