@@ -1034,7 +1034,18 @@ class StaticGrid(WorkAssignment):
         module = Module("StaticGrid closeLoop")
         partition = Component.TileProcessingStrategy.find(writer).staticPartition()
         module.add(SCmpGeU32(src0=sgpr(partition.cursor), src1=sgpr(partition.bound), comment="Check whether assigned work is exhausted"))
-        module.add(writer.longBranchScc0(Label(writer.rapPersistentLoopEntryLabel(kernel), ""), posNeg=-1))
+        entry = Label(writer.rapPersistentLoopEntryLabel(kernel), "")
+        if not writer.persistentBackEdgeSyncsLds(kernel):
+            module.add(writer.longBranchScc0(entry, posNeg=-1))
+            return module
+        # Only the taken back edge pays for the sync; the exit path skips it.
+        noBranch = Label(writer.labels.getUniqueNamePrefix("NoBranch"), "")
+        module.add(SCBranchSCC1(labelName=noBranch.getLabelName(), comment="Only branch on scc0"))
+        module.add(SWaitCnt(dscnt=0, comment="finish this tile's LDS reads before the next tile's DirectToLds loads"))
+        module.add(SBarrier(comment="sync before persistent re-entry"))
+        with writer.allocTmpSgpr(3, tag="StaticGrid_closeLoop") as tmp:
+            module.add(SLongBranchNegative(entry, tmp))
+        module.add(noBranch)
         return module
 
 
@@ -1113,6 +1124,8 @@ class DynamicWorkQueue(WorkAssignment):
 
     def closeLoop(self, writer, kernel):
         module = Module("DynamicWorkQueue closeLoop")
+        if writer.persistentBackEdgeSyncsLds(kernel):
+            module.add(SWaitCnt(dscnt=0, comment="finish this tile's LDS reads before the next tile's DirectToLds loads"))
         module.add(SBarrier(comment="Sync before work-queue persistent re-entry"))
         with writer.allocTmpSgpr(3, tag="DynamicWorkQueue_closeLoop") as tmp:
             module.add(SLongBranchNegative(Label("PersistentLoopStart", ""), tmp))
