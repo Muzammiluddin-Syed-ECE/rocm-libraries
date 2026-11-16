@@ -19409,10 +19409,13 @@ class KernelWriterAssembly(KernelWriter):
         pairRing = self.vgprPool.checkOutAligned(4 * (pairQuads - 1), 2, tag="subtilePairPackRing") \
                    if pairQuads > 1 else -1
         # Address ring for the STAGGERED store only. A deferred buffer_store(n-1) must read
-        # pair (n-1)'s address while Phase1(n) writes its own; one slot per extra pack quad.
-        # Gated on STAGGER_STORE so the default build is byte-identical (no extra checkout).
-        pairAddrRing = self.vgprPool.checkOut(pairQuads - 1, tag="subtilePairAddrRing") \
-                       if (pairQuads > 1 and os.environ.get("STAGGER_STORE")) else -1
+        # pair (n-1)'s address while Phase1(n) writes its own. This is a 2-deep ring (1 extra
+        # VGPR) allocated whenever staggering on a permlane16 subtile kernel -- INDEPENDENT of
+        # the pack ring depth (pairQuads may be 1 on budget-tight kernels, but the address must
+        # still double-buffer for the deferred store to overlap). Gated on STAGGER_STORE so the
+        # default build is byte-identical.
+        pairAddrRing = self.vgprPool.checkOut(1, tag="subtilePairAddrRing") \
+                       if (permForRing and os.environ.get("STAGGER_STORE")) else -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \

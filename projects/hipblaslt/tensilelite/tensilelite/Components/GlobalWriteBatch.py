@@ -4882,9 +4882,12 @@ class GlobalWriteBatchWriter:
     ring = self.cvtVgprStruct.vgprPairAddrRing
     if ring < 0:
       return self.cvtVgprStruct.vgprAddrScratch
-    quads = self.cvtVgprStruct.numPairPackQuads
-    slot  = self.parentWriter.states.subtilePairPackSlot % quads
-    return self.cvtVgprStruct.vgprAddrScratch if slot == 0 else ring + (slot - 1)
+    # 2-deep rotation (slot 0 = vgprAddrScratch, slot 1 = ring), INDEPENDENT of the pack-ring
+    # depth numPairPackQuads (which may be 1 on budget-tight kernels). Two adjacent deferred
+    # pairs land on different address slots so Phase1(n+1) does not overwrite pair n's address
+    # before its deferred store issues -- enabling the store/compute overlap.
+    slot = self.parentWriter.states.subtilePairPackSlot % 2
+    return self.cvtVgprStruct.vgprAddrScratch if slot == 0 else ring
 
   def _staggerStoreActive(self) -> bool:
     """Block 4 software-pipelined store: defer each pair's buffer_store by one pair
