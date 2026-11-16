@@ -5682,6 +5682,13 @@ class LogicalScheduler:
                 _pairPos = sorted({_ap for _ap, _g in candidates})
                 _curve = []
                 _acq = []                                   # per-pair acquired quad base (or -1)
+                # STAGGERED store: pair k's pack quad is held live until pair k+1's deferred
+                # store, so pairs k and k+1 are CONCURRENTLY live. Defer give_back by one pair
+                # so two consecutive pairs never receive the same base (which would let
+                # Phase1(k+1)'s cvt clobber pending Phase2b(k)). Non-stagger keeps the original
+                # acquire-then-immediately-give-back (one live quad).
+                _stagger = bool(__import__("os").environ.get("STAGGER_STORE"))
+                _prevHeld = None
                 for _P in _pairPos:
                     _curve.append(_fl.free_count())        # pool as pair _P begins to drain
                     # try to draw one 2-aligned quad from the pool available BEFORE this pair
@@ -5689,12 +5696,19 @@ class LogicalScheduler:
                     _qb = _fl.acquire_quad()
                     _acq.append(_qb if _qb is not None else -1)
                     if _qb is not None:
-                        _fl.give_back(_qb)
+                        if _stagger:
+                            if _prevHeld is not None:
+                                _fl.give_back(_prevHeld)   # free pair (k-1) only now (held 1 pair)
+                            _prevHeld = _qb
+                        else:
+                            _fl.give_back(_qb)
                     for _p in _byPos.get(_P, ()):          # this pair's MFMAs now execute
                         for _off in _opoffs(_p):
                             _readerCount[_off] -= 1
                             if _readerCount[_off] == 0:    # last reader done -> retire
                                 _fl.release([_off])
+                if _stagger and _prevHeld is not None:
+                    _fl.give_back(_prevHeld)               # drain the last held quad
                 # cross-check against the direct schedule (retire position = max reader pos)
                 _retire = {}
                 for _pos, _p in _placed:
@@ -5770,10 +5784,23 @@ class LogicalScheduler:
                                 _viol.append((_pidx, _off, "not-an-operand"))
                             elif _death >= _leasePos:
                                 _viol.append((_pidx, _off, f"death@{_death}>=lease@{_leasePos}"))
+                    # CONCURRENT-LEASE DISJOINTNESS (staggered store only): pair k holds its pack
+                    # quad live until pair k+1's deferred store, so adjacent pairs are live AT ONCE
+                    # and must NOT share a base, else Phase1(k+1)'s cvt clobbers pending Phase2b(k).
+                    # Non-stagger has one live quad, where reuse is fine -- so only check under STAGGER.
+                    _concViol = []
+                    if __import__("os").environ.get("STAGGER_STORE"):
+                        _leasedIdx = sorted(_packPlan.keys())
+                        for _i in range(1, len(_leasedIdx)):
+                            _pA, _pB = _leasedIdx[_i - 1], _leasedIdx[_i]
+                            if _pB == _pA + 1:          # adjacent pairIdx -> concurrently live
+                                _bA, _bB = _packPlan[_pA], _packPlan[_pB]
+                                if not set(range(_bA, _bA + 4)).isdisjoint(range(_bB, _bB + 4)):
+                                    _concViol.append((_pA, _pB, _bA, _bB))
                     _sys.stderr.write(
                         f"[WEAVE_LEASE_CHECK] leased_pairs={len(_packPlan)} "
-                        f"{'PASS' if not _viol else 'VIOLATION'} "
-                        f"violations={_viol[:12]}\n")
+                        f"{'PASS' if not _viol and not _concViol else 'VIOLATION'} "
+                        f"violations={_viol[:12]} concurrent_overlap={_concViol[:12]}\n")
                 if __import__("os").environ.get("WEAVE_FREELIST"):
                     _sys.stderr.write(
                         f"[WEAVE_FREELIST] pairs={len(_pairPos)} pool_regs={len(_retire)} "

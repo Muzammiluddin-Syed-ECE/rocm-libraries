@@ -251,6 +251,7 @@ class GlobalWriteBatchWriter:
     self._subtileAllStoresEndLabel = None # end-of-all-stores label (N cbranch target)
     self._subtileCloadPrevD1 = -1         # sentinel: last d1 group seen in C load guard
     self._subtilePendingSrdDInc = None    # deferred SrdD incToNextRow (emitted after N-group label)
+    self._pendingPhase2b = None           # staggered store: deferred buffer_store (addrCalc,tt0,forceSlc,vPack,vAddrSlot,pairIdx)
     # Absolute row addressing: the SrdD row advance is dropped and each store
     # names its own row through soffset. See _subtileStoreSoffset.
     self._subtileAbsRowAddr = parentWriter.states.subtileAbsRowAddr
@@ -2659,6 +2660,10 @@ class GlobalWriteBatchWriter:
                 storeCodeModule.add(afterPairedLabel)
               else:
                 if _weavePairIdx is not None and self._weaveMfmaGroups() is not None:
+                  # Staggered store: flush the PREVIOUS pair's deferred buffer_store before
+                  # prepping this pair (flush-first). Empty on the fill pair (nothing pending).
+                  if self._staggerStoreActive() and _weavePairIdx >= self._staggerStartPair():
+                    storeCodeModule.add(self._commitPendingPhase2b())
                   tmpStoreCode = self._emit16bitSubtilePairedStoreWoven(partnerAddrCalc, sumIdx0, sumIdx1, prefixOffset, _weavePairIdx, tt0 - 1, blockIdxM=blockIdxM, blockIdxN=blockIdxN, forceSlc=fusedA2APushPass)
                 else:
                   tmpStoreCode = self._emit16bitSubtilePairedStore(partnerAddrCalc, sumIdx0, sumIdx1, prefixOffset, tt0 - 1, blockIdxM=blockIdxM, blockIdxN=blockIdxN, forceSlc=fusedA2APushPass)
@@ -2668,6 +2673,11 @@ class GlobalWriteBatchWriter:
               self.storesIssued += 1
             else:
               # sba=1 orphan (no sba=0 partner in this batch — split by batch boundary).
+              # Staggered store: drain any pending deferred buffer_store first — the scalar
+              # store below reuses slot-0 (vgprBf16Temp/vgprAddrScratch) still held by the
+              # deferred store. Unconditional (before the OOB guard, which may skip the scalar).
+              if getattr(self, "_pendingPhase2b", None) is not None:
+                storeCodeModule.add(self._commitPendingPhase2b())
               blockIdxM = tt0
               blockIdxN = element[0]
               if self._weaveMode and not self._weaveReadBeforeEpilogue:
@@ -2692,6 +2702,10 @@ class GlobalWriteBatchWriter:
             if not partnerExists:
               # Orphan element (no sba=1 partner in this batch): scalar 16bit store now.
               # Guard against OOB wave groups (same as paired store path).
+              # Staggered store: drain any pending deferred buffer_store first (scalar store
+              # reuses slot-0 regs the deferred store still holds). Unconditional.
+              if getattr(self, "_pendingPhase2b", None) is not None:
+                storeCodeModule.add(self._commitPendingPhase2b())
               blockIdxM = tt0
               blockIdxN = element[0]
               if self._weaveMode and not self._weaveReadBeforeEpilogue:
@@ -3884,6 +3898,13 @@ class GlobalWriteBatchWriter:
     Must be called once after all elements have been emitted to close out the last
     N group and anchor the N-cbranch target past all stores.
     """
+    # Staggered store: drain the last deferred buffer_store BEFORE the N-group label and
+    # the SrdD increment (a deferred store must not cross a row advance). This is the
+    # primary batch-end drain; the pipeline must be empty when this batch object is torn down.
+    if getattr(self, "_pendingPhase2b", None) is not None:
+      targetModule.add(self._commitPendingPhase2b())
+    assert getattr(self, "_pendingPhase2b", None) is None, \
+      "staggered store: undrained Phase2b at batch end"
     if self._subtileNGroupSkipLabel is not None:
       targetModule.add(self._subtileNGroupSkipLabel)
       self._subtileNGroupSkipLabel = None
@@ -4343,10 +4364,12 @@ class GlobalWriteBatchWriter:
     (permlane + buffer_store) stays after the convert has filled vPack.
     """
     module = Module("16bitSubtilePairedStoreWoven")
+    staggered = self._staggerStoreActive() and pairIdx >= self._staggerStartPair()
     vPack = self._pairPackQuad(pairIdx)
+    vAddrSlot = self._pairAddrSlot(pairIdx) if staggered else None
     phase1 = self._emit16bitSubtilePairedStorePhase1(
       addrCalc, sumIdx0, sumIdx1, prefixOffset, tt0=tt0, blockIdxM=blockIdxM, blockIdxN=blockIdxN,
-      vPackOverride=vPack)
+      vPackOverride=vPack, vAddrScratchOverride=vAddrSlot)
     module.add(phase1)
     gap = Module(f"PlsinGap_pair{pairIdx}")
     self._weaveEmitGroup(gap, pairIdx + self._weaveLookahead())
@@ -4356,12 +4379,20 @@ class GlobalWriteBatchWriter:
       phase1Items = list(phase1.flatitems())
       pairCapture["gap"] = gap
       pairCapture["gapAnchor"] = phase1Items[-1] if phase1Items else None
-    module.add(self._emit16bitSubtilePairedStorePhase2(addrCalc, tt0=tt0, forceSlc=forceSlc,
-                                                       vPackOverride=vPack))
+    if staggered:
+      # Phase2a: permlane only (no buffer_store). Keeps the name "16bitSubtilePairedStorePhase2"
+      # so the convert-interleave still fires. The buffer_store is deferred to the next pair
+      # (flushed by _commitPendingPhase2b at the call site) -- this is the one-iteration hold.
+      module.add(self._emit16bitSubtilePairedStorePhase2(addrCalc, tt0=tt0, forceSlc=forceSlc,
+                                                         vPackOverride=vPack, emitStore=False))
+      self._pendingPhase2b = (addrCalc, tt0, forceSlc, vPack, vAddrSlot, pairIdx)
+    else:
+      module.add(self._emit16bitSubtilePairedStorePhase2(addrCalc, tt0=tt0, forceSlc=forceSlc,
+                                                         vPackOverride=vPack))
     self._advancePairPackQuad()
     return module
 
-  def _emit16bitSubtilePairedStorePhase1(self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, interior: bool = False, vPackOverride=None) -> Module:
+  def _emit16bitSubtilePairedStorePhase1(self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, interior: bool = False, vPackOverride=None, vAddrScratchOverride=None) -> Module:
     """Phase 1 (issue) of the paired dwordx4 store — see _emit16bitSubtilePairedStore.
 
     Emits, with NO s_barrier and NO buffer_store:
@@ -4390,7 +4421,7 @@ class GlobalWriteBatchWriter:
 
     vPermAddr    = self.cvtVgprStruct.vgprPermAddr
     vLGDelta     = self.cvtVgprStruct.vgprLaneGroupDelta
-    vAddrScratch = self.cvtVgprStruct.vgprAddrScratch
+    vAddrScratch = self.cvtVgprStruct.vgprAddrScratch if vAddrScratchOverride is None else vAddrScratchOverride
     addrDVgpr    = addrCalc.addrDVgpr
 
     typeStr = "fp16" if isFp16 else "bf16"
@@ -4466,6 +4497,10 @@ class GlobalWriteBatchWriter:
     nGroupInvariant = bool(self.ss.optSingleColVgpr and self.ss.optSrdIncForRow
                            and getattr(self.ss, "singleColDAddrUpdated", False))
     addrAlreadyLive = (hoistAddr
+                       and vAddrScratchOverride is None   # staggered stores rotate addr slots:
+                                                          # each pair must recompute into its own
+                                                          # slot (byte-neutral), never reuse a
+                                                          # hoisted base that lives in a different slot
                        and (self.parentWriter.states.subtileHoistedAddrArm
                             == self.parentWriter.states.subtileStoreArmId)
                        and self.parentWriter.states.subtileHoistedAddrDVgpr == addrDVgpr
@@ -4503,7 +4538,7 @@ class GlobalWriteBatchWriter:
     """NonTemporalD for the fused store's D writes."""
     return int(self.kernel["NonTemporalD"])
 
-  def _emit16bitSubtilePairedStorePhase2(self, addrCalc, tt0: int = 0, pending_lgkm=None, interior: bool = False, forceSlc: bool = False, vPackOverride=None) -> Module:
+  def _emit16bitSubtilePairedStorePhase2(self, addrCalc, tt0: int = 0, pending_lgkm=None, interior: bool = False, forceSlc: bool = False, vPackOverride=None, emitStore: bool = True) -> Module:
     """Phase 2 (consume) of the paired dwordx4 store — see _emit16bitSubtilePairedStore.
 
     Emits, with NO s_barrier:
@@ -4558,6 +4593,16 @@ class GlobalWriteBatchWriter:
       module.add(VPermlane32SwapB32(dst=self._vPackReg(vPack, 0), src=self._vPackReg(vPack, 2), comment="swap dwords 0↔2"))
       module.add(VPermlane32SwapB32(dst=self._vPackReg(vPack, 1), src=self._vPackReg(vPack, 3), comment="swap dwords 1↔3"))
 
+    if not emitStore:
+      # Staggered store: Phase2a stops here. The pack quad is now fully permlaned and
+      # buffer_store-ready; the buffer_store is deferred to the next iteration via
+      # _emit16bitSubtilePairedStorePhase2b. The module name stays
+      # "16bitSubtilePairedStorePhase2" so _rewriteOneWovenPair's convert-interleave
+      # (matched by child-module name) still fires for this pair.
+      assert not any(isinstance(i, SBarrier) for i in module.flatitems()), \
+        "PostLoopStoreInNll Phase2a must be barrier-free"
+      return module
+
     if useAlign8:
       module.add(self.getEdgeMovInstType()(EXEC(), sgpr(self._pairedStoreMaskSgpr, self.laneSGPRC), "apply exec mask"))
 
@@ -4589,6 +4634,41 @@ class GlobalWriteBatchWriter:
 
     assert not any(isinstance(i, SBarrier) for i in module.flatitems()), \
       "PostLoopStoreInNll Phase2 must be barrier-free (no s_barrier in the MFMA-interleaved store)"
+    return module
+
+  def _emit16bitSubtilePairedStorePhase2b(self, addrCalc, tt0: int = 0, forceSlc: bool = False,
+                                          vPackOverride=None, vAddrScratchOverride=None) -> Module:
+    """Phase2b (STAGGERED store only): the deferred buffer_store_dwordx4 split off from
+    Phase2. Emitted as a SIBLING module named "16bitSubtilePairedStorePhase2b" (outside
+    the woven module) so the convert-interleave is untouched. Consumes the fully-permlaned
+    vPack and the per-pair address slot captured from the pair's Phase1/Phase2a.
+    Only reached on the full-tile permlane16 arm (useAlign8 is False there), so no exec
+    mask is involved. WAR s_nop kept defensively (byte-neutral to memory)."""
+    module = Module("16bitSubtilePairedStorePhase2b")
+    ntd = self._epilogueNtd()
+    isGlc = bool(ntd & 0x1)
+    isSlc = bool((ntd & 0x2) or forceSlc)
+    isNT  = bool(ntd & 0x4)
+    vPack        = self.cvtVgprStruct.vgprBf16Temp if vPackOverride is None else vPackOverride
+    vAddrScratch = self.cvtVgprStruct.vgprAddrScratch if vAddrScratchOverride is None else vAddrScratchOverride
+    bpeCurr = self.parentWriter.states.bpeCexternal
+    bpeDest = self.parentWriter.states.bpeCexternalGSU1
+    globalOffset = addrCalc.globalOffset * bpeDest // bpeCurr
+    module.addComment1("buffer_store_dwordx4 (deferred): write 8 16bit values (4 dwords, 2-aligned src)")
+    _soff, _soffTmp = self._subtileStoreSoffset(module, addrCalc)
+    module.add(BufferStoreB128(
+      src=self._vPackReg(vPack, 0, 4),
+      vaddr=vgpr(vAddrScratch),
+      saddr=sgpr("SrdD", 4),
+      soffset=_soff,
+      mubuf=MUBUFModifiers(offen=True, offset12=globalOffset, glc=isGlc, slc=isSlc, nt=isNT),
+      comment=f"16bit paired dwordx4 store (deferred) tt0={tt0},{tt0+1}"
+    ))
+    if _soffTmp is not None:
+      self._epilogScratchFree(_soffTmp)
+    module.add(SNop(waitState=0, comment="1 wait state: WAR hazard between deferred store src and next pack dst"))
+    assert not any(isinstance(i, SBarrier) for i in module.flatitems()), \
+      "PostLoopStoreInNll Phase2b must be barrier-free"
     return module
 
   # -------------------------------------------------------------------------
@@ -4774,6 +4854,48 @@ class GlobalWriteBatchWriter:
     """Whether consecutive paired stores land on different quads."""
     return self.cvtVgprStruct.vgprPairPackRing >= 0 and \
            self.cvtVgprStruct.numPairPackQuads > 1
+
+  def _pairAddrSlot(self, pairIdx=None):
+    """Single vgpr holding this paired store's adjusted D address. Rotated in
+    lockstep with _pairPackQuad (same subtilePairPackSlot counter) so a deferred
+    buffer_store(n-1) keeps pair (n-1)'s address while Phase1(n) writes pair n's.
+    Slot 0 is the existing vgprAddrScratch, so the non-staggered path is unchanged."""
+    ring = self.cvtVgprStruct.vgprPairAddrRing
+    if ring < 0:
+      return self.cvtVgprStruct.vgprAddrScratch
+    quads = self.cvtVgprStruct.numPairPackQuads
+    slot  = self.parentWriter.states.subtilePairPackSlot % quads
+    return self.cvtVgprStruct.vgprAddrScratch if slot == 0 else ring + (slot - 1)
+
+  def _staggerStoreActive(self) -> bool:
+    """Block 4 software-pipelined store: defer each pair's buffer_store by one pair
+    so one fully-prepared pack quad is held live across a full iteration (setup for
+    the Block 5 fold). Full-tile arm only (no align8 mask / OOB branches crossing the
+    phase boundary); permlane16 only; excludes ValuC-rewriting epilogues. Env-gated
+    default-off -> byte-identical."""
+    return (self._weaveMode
+            and self._fusedFullTileNoGuards()
+            and getattr(self, "_permlane16Active", False)
+            and not self._weaveReadBeforeEpilogue
+            and bool(__import__("os").environ.get("STAGGER_STORE")))
+
+  def _staggerStartPair(self) -> int:
+    """First pairIdx at which staggering begins (mid-stream). Pairs < T are regular
+    self-contained stores; pair T is a prep-only fill run; pairs > T are staggered."""
+    return int(__import__("os").environ.get("STAGGER_START", "0") or "0")
+
+  def _commitPendingPhase2b(self):
+    """Flush the deferred buffer_store from the previous staggered pair. Returns the
+    sibling Phase2b Module (or an empty Module on the fill pair / when none pending)
+    and clears the pending state. Emitted OUTSIDE the woven module so the convert
+    interleave (_rewriteOneWovenPair, matched by child-module name) is untouched."""
+    pending = getattr(self, "_pendingPhase2b", None)
+    if pending is None:
+      return Module("16bitSubtilePairedStorePhase2bEmpty")
+    addrCalc, tt0, forceSlc, vPack, vAddrSlot, _pairIdx = pending
+    self._pendingPhase2b = None
+    return self._emit16bitSubtilePairedStorePhase2b(addrCalc, tt0=tt0, forceSlc=forceSlc,
+                                                    vPackOverride=vPack, vAddrScratchOverride=vAddrSlot)
 
   def _emit16bitSubtileScalarStore(self, addrCalc, sumIdx0: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, interior: bool = False, forceSlc: bool = False) -> Module:
     """Emit a 16bit store for an orphan subtile element with no partner.
