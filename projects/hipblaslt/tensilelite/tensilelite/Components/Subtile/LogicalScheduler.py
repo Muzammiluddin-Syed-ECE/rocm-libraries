@@ -5542,9 +5542,52 @@ class LogicalScheduler:
             # candidates is built in store-pair order == ascending anchorPos, so the
             # in-order scan's last qualifying gap is the ALAP (highest-anchor) one.
             capturePlan = {}
+            # Placement policy. Default ALAP (last qualifying gap): maximises each
+            # MFMA->accRead separation. WEAVE_REORDER flips to ASAP (earliest
+            # qualifying gap): each terminal MFMA -- hence each A-tile it reads --
+            # runs as early as the requiredCycles bar allows, so the operand tile
+            # retires at a low gap position and the fold free-list (which releases a
+            # VGPR the instant its last reader runs) has a LARGER pool at the later
+            # pairs. Same qualifying set (a producer is placeable iff ANY gap
+            # qualifies, true under both policies) and same requiredCycles bar, so
+            # the woven count and correctness are unchanged; only retirement timing
+            # moves earlier. candidates is ascending-anchorPos, so first-qualifying
+            # == earliest. Writers sharing one acc still get one gap (same readPos +
+            # candidates -> same pick under either policy).
+            _reorderAsap = bool(__import__("os").environ.get("WEAVE_REORDER"))
+            # BANDED reorder (WEAVE_BAND): cluster each A-tile's terminal MFMAs into a
+            # contiguous gap-band, tiles ordered by Abase ascending (band 0 = earliest
+            # gaps). Goal: a tile retires when its band ends -> incremental A-tile
+            # retirement, so the fold free-list grows earlier WITHOUT the ASAP collapse
+            # (each band still spans several gaps; all gaps stay occupied). A producer
+            # whose readPos forbids every gap in its band (its earliest-column reader
+            # needs an earlier gap than the band provides) falls back to the ALAP pick
+            # -- this fallback is exactly where the structural floor shows up: tiles in
+            # LATE bands cannot fully cluster because their early-readPos readers are
+            # anchored to the early gaps.
+            _band = bool(__import__("os").environ.get("WEAVE_BAND"))
+            _bandOf = {}   # pairIdx -> band index; _tileBand: Abase -> band index
+            if _band:
+                def _aBaseP(_p):
+                    _ks = self._plsinRegisterKeys(getattr(_p, "a", None)) or ()
+                    return _ks[0][2] if _ks and _ks[0] is not None else -1
+                import re as _reb
+                def _pairOfB(_g):
+                    _m = _reb.search(r"pair(\d+)", getattr(_g, "name", "") or "")
+                    return int(_m.group(1)) if _m else -1
+                _tiles = sorted({_aBaseP(p) for p in qualifying})
+                _nb = max(1, len(_tiles))
+                _tileBand = {t: i for i, t in enumerate(_tiles)}
+                _candPairsSorted = sorted({_pairOfB(g) for _, g in candidates if _pairOfB(g) >= 0})
+                # split the sorted gap pairIdxs into _nb contiguous bands
+                _bandPairs = {}
+                for _i, _pi in enumerate(_candPairsSorted):
+                    _b = (_i * _nb) // max(1, len(_candPairsSorted))
+                    _bandPairs.setdefault(_b, []).append(_pi)
             for producer in qualifying:
                 readPos = consumers[id(producer)]
                 chosen = None
+                chosenBand = None   # banded pick (latest qualifying gap within the tile's band)
                 for anchorPos, gap in candidates:
                     if anchorPos >= readPos:
                         continue
@@ -5554,6 +5597,14 @@ class LogicalScheduler:
                                        if isinstance(item, Instruction))
                     if instsBetween >= requiredCycles:
                         chosen = gap
+                        if _reorderAsap:
+                            break
+                        if _band:
+                            _b = _tileBand.get(_aBaseP(producer))
+                            if _b is not None and _pairOfB(gap) in set(_bandPairs.get(_b, ())):
+                                chosenBand = gap   # latest qualifying gap inside the band
+                if _band and chosenBand is not None:
+                    chosen = chosenBand
                 if chosen is not None:
                     capturePlan[id(producer)] = chosen
             if __import__("os").environ.get("WEAVE_PLACE"):
@@ -5573,6 +5624,34 @@ class LogicalScheduler:
                 _sys.stderr.write(
                     f"[WEAVE_PLACE] placed={len(_rows)} pairs_used={len(set(_pairSeq))} "
                     f"order_inversions={_inv} idx->pair[:24]={_pairSeq[:24]}\n")
+                _sys.stderr.write(f"[WEAVE_PLACE] FULL idx->pair={_pairSeq}\n")
+                # Per producer in allInsts order: (idx, A-reg base, readPos, chosen pair).
+                # A-reg base identifies the A-tile each terminal MFMA reads -- shows how
+                # ALAP groups each tile's MFMAs across gaps.
+                def _aBase(_p):
+                    _ks = self._plsinRegisterKeys(getattr(_p, "a", None)) or ()
+                    return _ks[0][2] if _ks and _ks[0] is not None else -1
+                def _attrBase(_p, _attr):
+                    _ks = self._plsinRegisterKeys(getattr(_p, _attr, None)) or ()
+                    return _ks[0][2] if _ks and _ks[0] is not None else -1
+                _detail = sorted((_instIdx.get(id(_p), -1), _aBase(_p),
+                                  consumers.get(id(_p), -1), _pairOf(capturePlan[id(_p)]))
+                                 for _p in qualifying if id(_p) in capturePlan)
+                _sys.stderr.write(
+                    "[WEAVE_PLACE] (idx,Abase,readPos,pair)=" +
+                    " ".join(f"({_a},{_b},{_c},{_d})" for _a, _b, _c, _d in _detail) + "\n")
+                # Per-class operand bases (a/b/mxsa/mxsb) so scale lifetimes are visible.
+                _detail2 = sorted((_instIdx.get(id(_p), -1),
+                                   _attrBase(_p, "a"), _attrBase(_p, "b"),
+                                   _attrBase(_p, "mxsa"), _attrBase(_p, "mxsb"),
+                                   _pairOf(capturePlan[id(_p)]))
+                                  for _p in qualifying if id(_p) in capturePlan)
+                _sys.stderr.write(
+                    "[WEAVE_PLACE] (idx,a,b,mxsa,mxsb,pair)=" +
+                    " ".join(f"({r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]})" for r in _detail2) + "\n")
+                # gap pair -> anchor position (store order of the gaps themselves)
+                _gapPos = sorted((_pairOf(_g), _ap) for _ap, _g in candidates)
+                _sys.stderr.write(f"[WEAVE_PLACE] gap pair->anchorPos={_gapPos}\n")
             if (__import__("os").environ.get("WEAVE_FREELIST")
                     or __import__("os").environ.get("WEAVE_PACKFREE")
                     or __import__("os").environ.get("WEAVE_PACKVALC")):
@@ -5637,6 +5716,64 @@ class LogicalScheduler:
                     if _acq[_i] >= 0 and _P in _posToPair:
                         _packPlan[_posToPair[_P]] = _acq[_i]
                 self._wovenPackPlans.append(_packPlan)
+                if __import__("os").environ.get("WEAVE_DEADENTRY"):
+                    # Dead-on-entry holes: VGPRs inside the operand window that the WHOLE
+                    # store region never reads or writes (full def/use via _epilogueDefUse,
+                    # which -- unlike _opoffs's MFMA-sources-only view -- also catches bias
+                    # adds and the buffer_store vdata). These are free scratch the operand
+                    # free-list MISSES, because it only seeds the pool from operands that are
+                    # read by a placed MFMA and then retire; a reg with ZERO store uses never
+                    # gets a reader-count, so it is never offered. Reported so we can decide
+                    # whether to seed the pool with them (e.g. unused scale regs).
+                    _storeTouched = set()
+                    for _it7 in flat:
+                        if not hasattr(_it7, "getParams"):
+                            continue
+                        _w7, _r7 = self._epilogueDefUse(_it7)
+                        for _k7 in _w7:
+                            if _k7[1] is None:
+                                _storeTouched.add(_k7[2])
+                        for _k7 in _r7:
+                            if _k7[1] is None:
+                                _storeTouched.add(_k7[2])
+                    if _retire:
+                        _lo, _hi = min(_retire), max(_retire)
+                        _holes = [o for o in range(_lo, _hi + 1)
+                                  if o not in _retire and o not in _storeTouched]
+                        _sys.stderr.write(
+                            f"[WEAVE_DEADENTRY] operand_window=[{_lo},{_hi}] "
+                            f"pool_regs={len(_retire)} store_touched_in_window="
+                            f"{sum(1 for o in range(_lo,_hi+1) if o in _storeTouched)} "
+                            f"dead_holes={_holes}\n")
+                if (__import__("os").environ.get("WEAVE_LEASE_CHECK")
+                        or __import__("os").environ.get("WEAVE_FREELIST")):
+                    # LEASE SAFETY: the free-list must never hand a pair a quad that any
+                    # later-or-equal MFMA still reads. Under a given MFMA order an operand
+                    # dies at its LAST reader (_retire[off] = max anchor over readers); a
+                    # lease of [base,base+4) at pair-position leasePos is safe iff every one
+                    # of those 4 regs died STRICTLY before leasePos. This is the order-aware
+                    # liveness guarantee -- it must hold for ALAP and for any reorder (banded
+                    # etc.) we try next. Prints VIOLATION with the offending reg + the reader
+                    # anchor that outlives the lease; green = the accounting respects order.
+                    _pairToPos = {}
+                    for _ap2, _g2 in candidates:
+                        _m2 = _re.search(r"pair(\d+)", getattr(_g2, "name", "") or "")
+                        if _m2 is not None:
+                            _pairToPos[int(_m2.group(1))] = _ap2
+                    _viol = []
+                    for _pidx, _base in _packPlan.items():
+                        _leasePos = _pairToPos.get(_pidx, -1)
+                        for _j in range(4):
+                            _off = _base + _j
+                            _death = _retire.get(_off, None)
+                            if _death is None:
+                                _viol.append((_pidx, _off, "not-an-operand"))
+                            elif _death >= _leasePos:
+                                _viol.append((_pidx, _off, f"death@{_death}>=lease@{_leasePos}"))
+                    _sys.stderr.write(
+                        f"[WEAVE_LEASE_CHECK] leased_pairs={len(_packPlan)} "
+                        f"{'PASS' if not _viol else 'VIOLATION'} "
+                        f"violations={_viol[:12]}\n")
                 if __import__("os").environ.get("WEAVE_FREELIST"):
                     _sys.stderr.write(
                         f"[WEAVE_FREELIST] pairs={len(_pairPos)} pool_regs={len(_retire)} "
