@@ -4342,6 +4342,8 @@ class GlobalWriteBatchWriter:
       forceSlc:     force the slc bit regardless of NonTemporalD.
     """
     module = Module("16bitSubtilePairedStore")
+    if __import__("os").environ.get("STAGGER_MARK"):
+      module.add(SNop(waitState=10, comment="STAGGER_MARK arm=10 NON-WOVEN paired store"))
     # Composed from Phase1 (pack/address) + Phase2 (shuffle/store).  On the fallback
     # LDS path the split lets PLSIN interleave MFMAs across the ~88-cycle
     # ds_bpermute latency; the gfx950 permlane16 path has no lgkmcnt dependency.
@@ -4364,7 +4366,16 @@ class GlobalWriteBatchWriter:
     (permlane + buffer_store) stays after the convert has filled vPack.
     """
     module = Module("16bitSubtilePairedStoreWoven")
+    if __import__("os").environ.get("STAGGER_MARK"):
+      module.add(SNop(waitState=9, comment="STAGGER_MARK arm=9 WOVEN store (staggered)"))
     staggered = self._staggerStoreActive() and pairIdx >= self._staggerStartPair()
+    if __import__("os").environ.get("STAGGER_DIAG"):
+      __import__("sys").stderr.write(
+        f"[STAGGER_DIAG] woven pair={pairIdx} staggered={staggered} "
+        f"weaveMode={self._weaveMode} fullTile={self._fusedFullTileNoGuards()} "
+        f"perm16={getattr(self,'_permlane16Active',False)} "
+        f"readBeforeEpi={self._weaveReadBeforeEpilogue} "
+        f"STAGGER_STORE={bool(__import__('os').environ.get('STAGGER_STORE'))}\n")
     vPack = self._pairPackQuad(pairIdx)
     vAddrSlot = self._pairAddrSlot(pairIdx) if staggered else None
     phase1 = self._emit16bitSubtilePairedStorePhase1(
@@ -4656,6 +4667,14 @@ class GlobalWriteBatchWriter:
     globalOffset = addrCalc.globalOffset * bpeDest // bpeCurr
     module.addComment1("buffer_store_dwordx4 (deferred): write 8 16bit values (4 dwords, 2-aligned src)")
     _soff, _soffTmp = self._subtileStoreSoffset(module, addrCalc)
+    if __import__("os").environ.get("STAGGER_CANARY"):
+      # DIAGNOSTIC ONLY: skip the deferred buffer_store. If the staggered (PLSIN) arm
+      # actually executes for the traced shape, output tiles go unwritten -> --verify
+      # MUST FAIL. If --verify still PASSES, this arm is dead code for the shape.
+      if _soffTmp is not None:
+        self._epilogScratchFree(_soffTmp)
+      module.add(SNop(waitState=0, comment="STAGGER_CANARY: deferred store skipped"))
+      return module
     module.add(BufferStoreB128(
       src=self._vPackReg(vPack, 0, 4),
       vaddr=vgpr(vAddrScratch),
@@ -4873,10 +4892,16 @@ class GlobalWriteBatchWriter:
     the Block 5 fold). Full-tile arm only (no align8 mask / OOB branches crossing the
     phase boundary); permlane16 only; excludes ValuC-rewriting epilogues. Env-gated
     default-off -> byte-identical."""
+    # Bias/SAV/activation epilogues (_weaveReadBeforeEpilogue) rewrite ValuC before the
+    # cvt. The held quad is a POST-cvt bf16 pack quad in the dedicated ring (or a retired
+    # OPERAND lease) -- not a ValuC accumulator -- so a later pair's ValuC rewrite cannot
+    # clobber it. The ONLY unsafe case is the ValuC-lease path (WEAVE_PACKVALC), where the
+    # held quad aliases a ValuC slot; exclude only that combination, not bias in general.
+    _valcLease = bool(__import__("os").environ.get("WEAVE_PACKVALC"))
     return (self._weaveMode
             and self._fusedFullTileNoGuards()
             and getattr(self, "_permlane16Active", False)
-            and not self._weaveReadBeforeEpilogue
+            and not (self._weaveReadBeforeEpilogue and _valcLease)
             and bool(__import__("os").environ.get("STAGGER_STORE")))
 
   def _staggerStartPair(self) -> int:
