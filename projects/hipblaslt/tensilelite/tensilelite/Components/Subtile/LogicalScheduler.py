@@ -5173,6 +5173,7 @@ class LogicalScheduler:
                     writer.states.subtilePairPackSlot = _packSlot0
                     storeModule = writer.buildSubtileFusedStore(kernel, writer.tPA, writer.tPB)
                     self._pinToPass1 = True
+                    self._activePackPlan = _packPlan
                     try:
                         self._planCapturedTerminalMfmas(
                             fusedEmitted, writer.states.subtileWeaveCaptureInstances,
@@ -5180,6 +5181,7 @@ class LogicalScheduler:
                             int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)))
                     finally:
                         self._pinToPass1 = False
+                        self._activePackPlan = None
                     writer.states.subtileWovenPackPlan = None
                     writer.states.subtileWovenPackPlanAnchorSVV = None
                 elif _leaseMode:
@@ -5511,6 +5513,13 @@ class LogicalScheduler:
         # to its pass-1 gap or an earlier one (earlier = operand retires sooner = lease still
         # valid), and a producer pass 1 left in the loop stays there.
         _pinned = bool(getattr(self, "_pinToPass1", False)) and applyMoves
+        # physical VGPR -> earliest pairIdx that was leased it as part of a pack quad
+        _leasedBy = {}
+        if _pinned:
+            for _pp, _base in (getattr(self, "_activePackPlan", None) or {}).items():
+                if isinstance(_base, int):
+                    for _r in range(_base, _base + 4):
+                        _leasedBy[_r] = min(_leasedBy.get(_r, _pp), _pp)
         if not applyMoves:
             self._pass1Placement = {}
         import re as _rePin
@@ -5615,9 +5624,16 @@ class LogicalScheduler:
                 readPos = consumers[id(producer)]
                 chosen = None
                 chosenBand = None   # banded pick (latest qualifying gap within the tile's band)
-                _pin = self._pass1Placement.get(id(producer)) if _pinned else None
+                _pin = self._pass1Placement.get((len(plans), id(producer))) if _pinned else None
                 if _pinned and _pin is None:
                     continue
+                if _pinned and _leasedBy:
+                    # Hard guarantee, independent of how well the passes line up: a producer
+                    # must run before any pair that was leased one of its operand registers.
+                    for _c in self._plsinOperands(producer, self._PLSIN_MFMA_SOURCES):
+                        for _kk in (self._plsinRegisterKeys(_c) or ()):
+                            if _kk is not None and _kk[1] is None and _kk[2] in _leasedBy:
+                                _pin = min(_pin, _leasedBy[_kk[2]] - 1)
                 for anchorPos, gap in candidates:
                     if anchorPos >= readPos:
                         continue
@@ -5687,7 +5703,8 @@ class LogicalScheduler:
             if not applyMoves:
                 for _p in qualifying:
                     if id(_p) in capturePlan:
-                        self._pass1Placement[id(_p)] = _pairOfGap(capturePlan[id(_p)])
+                        # keyed per capture: every capture plans the same producers
+                        self._pass1Placement[(len(plans), id(_p))] = _pairOfGap(capturePlan[id(_p)])
             if __import__("os").environ.get("WEAVE_PLACE"):
                 # Ground-truth placement dump for the forward-allocator recreate experiment.
                 # Per producer (allInsts order): index, consumer (store read) position, and
