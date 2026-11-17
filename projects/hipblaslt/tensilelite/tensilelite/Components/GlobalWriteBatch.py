@@ -4285,6 +4285,12 @@ class GlobalWriteBatchWriter:
           pendingInc = None
         prevN = blockIdxN
 
+    plainFold = usePermlane16 and self._plainFoldActive()
+    foldedSecond = set()   # elementIdx of the sba=1 element of a pair already stored by a fold
+    bpeCurr = self.parentWriter.states.bpeCexternal
+    bpeDest = self.parentWriter.states.bpeCexternalGSU1
+    nE = len(self.batchElements)
+
     for elementIdx, element in enumerate(self.batchElements):
       tt0 = element[1]
       blockIdxN = element[0]
@@ -4294,11 +4300,26 @@ class GlobalWriteBatchWriter:
         partnerElementIdx = elementIdx - 1
         partnerExists = (partnerElementIdx >= 0 and
                          self.batchElements[partnerElementIdx][1] == tt0 - 1)
+        if partnerExists and elementIdx in foldedSecond:
+          continue
         if partnerExists:
           flushAtTransition(blockIdxN)
           partnerAddrCalc = self.ss.elementAddr[partnerElementIdx]
           sumIdx0 = self.ss.elementSumIdx[partnerElementIdx]
           sumIdx1 = self.ss.elementSumIdx[elementIdx]
+          # DPP fold with the next pair of this N-group when the two are the halves of
+          # the same 128B lines (both in this batch, 64B apart).
+          b0, b1 = elementIdx + 1, elementIdx + 2
+          if (plainFold and ((tt0 - 1) // 2) % 2 == self._foldLineStartParity() and b1 < nE
+              and self.batchElements[b0][0] == blockIdxN and self.batchElements[b0][1] == tt0 + 1
+              and self.batchElements[b1][0] == blockIdxN and self.batchElements[b1][1] == tt0 + 2
+              and self.ss.elementAddr[b0].addrDVgpr == partnerAddrCalc.addrDVgpr
+              and (self.ss.elementAddr[b0].globalOffset - partnerAddrCalc.globalOffset) * bpeDest // bpeCurr == 64):
+            mod.add(self._emitPlainFoldPair(partnerAddrCalc, sumIdx0, sumIdx1,
+                                            self.ss.elementAddr[b0], self.ss.elementSumIdx[b0],
+                                            self.ss.elementSumIdx[b1], prefixOffset, tt0 - 1, blockIdxN, forceSlc))
+            foldedSecond.add(b1)
+            continue
           issuePaired(partnerAddrCalc, sumIdx0, sumIdx1, tt0 - 1, blockIdxN)
         else:
           flushAtTransition(blockIdxN)
@@ -5088,6 +5109,72 @@ class GlobalWriteBatchWriter:
                          self.cvtVgprStruct.vgprAddrScratch, "staged hold flushed")
     return module
 
+  def _emitFoldBlendAndStores(self, module, addrCalcA, tt0A, forceSlc, H, X, W, marker, markerText,
+                              rebuildMask):
+    """In-place DPP blend of two permlaned pack quads and the two full-line stores.
+    H = pair A's quad (m-rows 0-31), X = pair B's quad (m-rows 32-63), W = a scratch vgpr
+    name, T = vgprFoldTmp, address = vgprAddrScratch (only read). Afterwards X holds the
+    odd n-columns (stored first) and H the even n-columns. Needs full EXEC. rebuildMask:
+    re-derive VCC before the second store (the staged store cuts a scheduler unit there)."""
+    T = self.cvtVgprStruct.vgprFoldTmp
+    addr = self.cvtVgprStruct.vgprAddrScratch
+    if __import__("os").environ.get("STAGGER_MARK"):
+      module.add(SNop(waitState=marker, comment=f"STAGGER_MARK={marker} {markerText}"))
+    module.add(VAndB32(dst=vgpr(T), src0=1, src1=vgpr("Serial"), comment="lane parity"))
+    module.add(VCmpEQU32(dst=VCC(), src0=vgpr(T), src1=0, comment="VCC = even lanes"))
+    for k in range(4):
+      rA = self._vPackReg(H, k)
+      rB = self._vPackReg(X, k)
+      module.add(VMovB32(dst=vgpr(T), src=rA, dpp=DPPModifiers(quad_perm=[1,1,3,3]),
+                         comment=f"fold d{k}: save A odd n-cols into even lanes"))
+      module.add(VCndMaskB32(dst=rA, src0=rB, src1=rA, src2=VCC(), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
+                             comment=f"fold d{k}: store1 even<-A odd<-B[0,0,2,2]"))
+      module.add(VCndMaskB32(dst=rB, src0=rB, src1=vgpr(T), src2=VCC(),
+                             comment=f"fold d{k}: store2 even<-A[1,1,3,3] odd<-B"))
+    module.add(VAddU32(dst=vgpr(W), src0=vgpr(addr), src1=hex(64), comment="addr + 64B"))
+    module.add(VMovB32(dst=vgpr(T), src=vgpr(addr), dpp=DPPModifiers(quad_perm=[1,1,3,3]),
+                       comment="fold voff2: addr perm [1,1,3,3]"))
+    module.add(VCndMaskB32(dst=vgpr(T), src0=vgpr(W), src1=vgpr(T), src2=VCC(),
+                           comment="fold voff2: even<-perm addr, odd<-addr+64"))
+    self._stagedStoreNow(module, addrCalcA, tt0A, forceSlc, X, T, "fold store 2")
+    if rebuildMask:
+      # unit S1: nothing but H is carried in, so rebuild the mask and the voffset here.
+      module.add(VAndB32(dst=vgpr(T), src0=1, src1=vgpr("Serial"), comment="lane parity"))
+      module.add(VCmpEQU32(dst=VCC(), src0=vgpr(T), src1=0, comment="VCC = even lanes"))
+    module.add(VMovB32(dst=vgpr(T), src=vgpr(addr), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
+                       comment="fold voff1: addr perm [0,0,2,2]"))
+    module.add(VAddU32(dst=vgpr(T), src0=vgpr(T), src1=hex(64), comment="fold voff1: perm addr + 64B"))
+    module.add(VCndMaskB32(dst=vgpr(T), src0=vgpr(T), src1=vgpr(addr), src2=VCC(),
+                           comment="fold voff1: even<-addr, odd<-perm addr+64"))
+    self._stagedStoreNow(module, addrCalcA, tt0A, forceSlc, H, T, "fold store 1")
+
+  def _plainFoldActive(self) -> bool:
+    """Fold on the plain (non-fused) paired store's guard-free interior body."""
+    env = __import__("os").environ
+    return (bool(env.get("STAGGER_FOLD")) and env.get("STAGGER_FOLD_PLAIN") != "off"
+            and getattr(self, "_permlane16Active", False)
+            and not self.parentWriter.states.subtileFusedFullTileStore
+            and getattr(self.cvtVgprStruct, "vgprFoldTmp", -1) >= 0)
+
+  def _emitPlainFoldPair(self, addrA, sA0, sA1, addrB, sB0, sB1, prefixOffset, tt0A, blockIdxN, forceSlc) -> Module:
+    """Interior body of the plain store: fold pair A (tt0A, tt0A+1) with pair B (tt0A+2,
+    tt0A+3) of the same N-group. Both are in this batch with their epilogues already
+    applied; EXEC is full and there are no guards. Pair B is packed in place into its own
+    ValuC registers, so no register is added."""
+    module = Module("16bitSubtilePlainFold")
+    H = self.cvtVgprStruct.vgprBf16Temp
+    X = ('c', sB0 - prefixOffset)
+    W = "ValuC+" + str(sB1 - prefixOffset)
+    for (ac, s0, s1, t, q) in ((addrA, sA0, sA1, tt0A, H), (addrB, sB0, sB1, tt0A + 2, X)):
+      module.add(self._emit16bitSubtilePairedStorePhase1(
+        ac, s0, s1, prefixOffset, tt0=t, blockIdxM=t, blockIdxN=blockIdxN, interior=True, vPackOverride=q))
+      module.add(self._emit16bitSubtilePairedStorePhase2(ac, tt0=t, interior=True, forceSlc=forceSlc,
+                                                         vPackOverride=q, emitStore=False))
+    self._emitFoldBlendAndStores(module, addrA, tt0A, forceSlc, H, X, W, marker=16,
+                                 markerText="plain-path fold blend", rebuildMask=False)
+    module.add(SNop(waitState=0, comment="1 wait state: WAR hazard between store src and next pack dst"))
+    return module
+
   def _emitStagedFoldPair(self, addrCalc, sumIdx0, sumIdx1, prefixOffset, tt0, blockIdxM, blockIdxN, forceSlc) -> Module:
     """Staged fused store with the DPP fold. The scheduler later cuts the stage into units
     (one per buffer_store, plus the cut tag below) and scatters them between MFMAs, where
@@ -5132,34 +5219,8 @@ class GlobalWriteBatchWriter:
     if hold is not None:
       a, tt0A = hold["addrCalc"], hold["tt0"]
       prep(X)
-      if __import__("os").environ.get("STAGGER_MARK"):
-        module.add(SNop(waitState=14, comment="STAGGER_MARK=14 staged fold blend"))
-      module.add(VAndB32(dst=vgpr(T), src0=1, src1=vgpr("Serial"), comment="lane parity"))
-      module.add(VCmpEQU32(dst=VCC(), src0=vgpr(T), src1=0, comment="VCC = even lanes"))
-      for k in range(4):
-        rA = self._vPackReg(H, k)
-        rB = self._vPackReg(X, k)
-        module.add(VMovB32(dst=vgpr(T), src=rA, dpp=DPPModifiers(quad_perm=[1,1,3,3]),
-                           comment=f"fold d{k}: save A odd n-cols into even lanes"))
-        module.add(VCndMaskB32(dst=rA, src0=rB, src1=rA, src2=VCC(), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
-                               comment=f"fold d{k}: store1 even<-A odd<-B[0,0,2,2]"))
-        module.add(VCndMaskB32(dst=rB, src0=rB, src1=vgpr(T), src2=VCC(),
-                               comment=f"fold d{k}: store2 even<-A[1,1,3,3] odd<-B"))
-      module.add(VAddU32(dst=vgpr(W), src0=vgpr(addr), src1=hex(64), comment="addr + 64B"))
-      module.add(VMovB32(dst=vgpr(T), src=vgpr(addr), dpp=DPPModifiers(quad_perm=[1,1,3,3]),
-                         comment="fold voff2: addr perm [1,1,3,3]"))
-      module.add(VCndMaskB32(dst=vgpr(T), src0=vgpr(W), src1=vgpr(T), src2=VCC(),
-                             comment="fold voff2: even<-perm addr, odd<-addr+64"))
-      self._stagedStoreNow(module, a, tt0A, forceSlc, X, T, "fold store 2")   # ends unit B
-      # unit S1: nothing but H is carried in, so rebuild the mask and the voffset here.
-      module.add(VAndB32(dst=vgpr(T), src0=1, src1=vgpr("Serial"), comment="lane parity"))
-      module.add(VCmpEQU32(dst=VCC(), src0=vgpr(T), src1=0, comment="VCC = even lanes"))
-      module.add(VMovB32(dst=vgpr(T), src=vgpr(addr), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
-                         comment="fold voff1: addr perm [0,0,2,2]"))
-      module.add(VAddU32(dst=vgpr(T), src0=vgpr(T), src1=hex(64), comment="fold voff1: perm addr + 64B"))
-      module.add(VCndMaskB32(dst=vgpr(T), src0=vgpr(T), src1=vgpr(addr), src2=VCC(),
-                             comment="fold voff1: even<-addr, odd<-perm addr+64"))
-      self._stagedStoreNow(module, a, tt0A, forceSlc, H, T, "fold store 1")
+      self._emitFoldBlendAndStores(module, a, tt0A, forceSlc, H, X, W, marker=14,
+                                   markerText="staged fold blend", rebuildMask=True)
       states.subtileStagedHold = None
       return module
 
