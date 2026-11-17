@@ -2678,6 +2678,10 @@ class GlobalWriteBatchWriter:
                     storeCodeModule.add(self._emitStaggerFold(_prevPending, self._pendingPhase2b))
                   elif _prevPending is not None:
                     storeCodeModule.add(self._commitPendingPhase2b(_prevPending))  # store(K-1) after prep(K)
+                elif self._stagedFoldActive():
+                  storeCodeModule.add(self._emitStagedFoldPair(
+                    partnerAddrCalc, sumIdx0, sumIdx1, prefixOffset, tt0 - 1,
+                    blockIdxM, blockIdxN, fusedA2APushPass))
                 else:
                   tmpStoreCode = self._emit16bitSubtilePairedStore(partnerAddrCalc, sumIdx0, sumIdx1, prefixOffset, tt0 - 1, blockIdxM=blockIdxM, blockIdxN=blockIdxN, forceSlc=fusedA2APushPass)
                   storeCodeModule.add(tmpStoreCode)
@@ -3913,6 +3917,8 @@ class GlobalWriteBatchWriter:
     # often its own batch), so it is drained only when the LAST batch closes. The store
     # (and any SrdD row advance held behind it) goes out before this batch's labels.
     _lastBatch = self.batchIdx >= self.numBatches - 1
+    if _lastBatch and getattr(self.parentWriter.states, "subtileStagedHold", None) is not None:
+      targetModule.add(self._flushStagedHold())
     if _lastBatch:
       if self._pendingPhase2b is not None:
         targetModule.add(self._commitPendingPhase2b())
@@ -5044,6 +5050,132 @@ class GlobalWriteBatchWriter:
     # store 2 = quad B / slot B, still at A's offset and soffset: pending.
     self._pendingPhase2b = (addrA, tt0A, forceSlc, qB, aB, idxB,
                             {"blockIdxN": metaB["blockIdxN"], "folded": True})
+    return module
+
+  STAGED_UNIT_CUT = "[plsin-unit-cut]"
+
+  def _stagedFoldActive(self) -> bool:
+    """Fold on the STAGED fused store (block-scheduled tiles). Needs the 2-quad pack ring
+    (one hold quad per stage parity) and the fold temp; no register beyond those -- an
+    extra one comes off the store batch size and can drop it to single elements."""
+    c = self.cvtVgprStruct
+    return (bool(__import__("os").environ.get("STAGGER_FOLD"))
+            and bool(getattr(self.parentWriter.states, "subtileStoreStages", 0))
+            and self._fusedFullTileNoGuards()
+            and getattr(self, "_permlane16Active", False)
+            and getattr(c, "vgprFoldTmp", -1) >= 0
+            and getattr(c, "vgprPairPackRing", -1) >= 0)
+
+  def _stagedStoreNow(self, module, addrCalc, tt0, forceSlc, vPack, vAddr, tag):
+    ntd = self._epilogueNtd()
+    bpeCurr = self.parentWriter.states.bpeCexternal
+    bpeDest = self.parentWriter.states.bpeCexternalGSU1
+    _soff, _soffTmp = self._subtileStoreSoffset(module, addrCalc)
+    module.add(BufferStoreB128(
+      src=self._vPackReg(vPack, 0, 4), vaddr=vgpr(vAddr), saddr=sgpr("SrdD", 4), soffset=_soff,
+      mubuf=MUBUFModifiers(offen=True, offset12=addrCalc.globalOffset * bpeDest // bpeCurr,
+                           glc=bool(ntd & 0x1), slc=bool((ntd & 0x2) or forceSlc), nt=bool(ntd & 0x4)),
+      comment=f"16bit paired dwordx4 store ({tag}) tt0={tt0},{tt0+1}"))
+    if _soffTmp is not None:
+      self._epilogScratchFree(_soffTmp)
+
+  def _flushStagedHold(self) -> Module:
+    """A held pair whose line partner never came: store it unblended."""
+    hold = self.parentWriter.states.subtileStagedHold
+    self.parentWriter.states.subtileStagedHold = None
+    module = Module("16bitSubtileStagedHoldFlush")
+    self._stagedStoreNow(module, hold["addrCalc"], hold["tt0"], hold["forceSlc"], hold["H"],
+                         self.cvtVgprStruct.vgprAddrScratch, "staged hold flushed")
+    return module
+
+  def _emitStagedFoldPair(self, addrCalc, sumIdx0, sumIdx1, prefixOffset, tt0, blockIdxM, blockIdxN, forceSlc) -> Module:
+    """Staged fused store with the DPP fold. The scheduler later cuts the stage into units
+    (one per buffer_store, plus the cut tag below) and scatters them between MFMAs, where
+    units of the NEIGHBOURING stage can land between them. So the only register live
+    across units is the hold quad H, private to the stage parity. Everything else is
+    used inside one unit: X (pair B packed in place into its own, now dead, ValuC staging
+    registers), W (another dead ValuC register of pair B), the temp T and VCC.
+      unit A : prep A -> H                      (no store)
+      unit B : prep B -> X, blend (H<-store1, X<-store2), store 2
+      unit S1: rebuild store-1 voffset, store 1 from H
+    Lane geometry and blend as _emitStaggerFold."""
+    states = self.parentWriter.states
+    c = self.cvtVgprStruct
+    stage = states.subtileStoreStageHighWater
+    odd = stage % 2
+    H = c.vgprPairPackRing if odd else c.vgprBf16Temp
+    X = ('c', sumIdx0 - prefixOffset)                 # cvt_pk in place: d_k reads only regs >= k
+    W = "ValuC+" + str(sumIdx1 - prefixOffset)        # dead once pair B is packed
+    T = c.vgprFoldTmp
+    addr = c.vgprAddrScratch
+    bpeCurr = states.bpeCexternal
+    bpeDest = states.bpeCexternalGSU1
+    module = Module("16bitSubtileStagedFold")
+    hold = states.subtileStagedHold
+
+    def prep(vPack):
+      module.add(self._emit16bitSubtilePairedStorePhase1(
+        addrCalc, sumIdx0, sumIdx1, prefixOffset, tt0=tt0, blockIdxM=blockIdxM, blockIdxN=blockIdxN,
+        vPackOverride=vPack))
+      module.add(self._emit16bitSubtilePairedStorePhase2(addrCalc, tt0=tt0, forceSlc=forceSlc,
+                                                         vPackOverride=vPack, emitStore=False))
+
+    if hold is not None:
+      a = hold["addrCalc"]
+      partner = (hold["stage"] == stage and hold["blockIdxN"] == blockIdxN
+                 and tt0 == hold["tt0"] + 2 and a.addrDVgpr == addrCalc.addrDVgpr
+                 and a.coordOffset1 == addrCalc.coordOffset1
+                 and (addrCalc.globalOffset - a.globalOffset) * bpeDest // bpeCurr == 64)
+      if not partner:
+        module.add(self._flushStagedHold())
+        hold = None
+    if hold is not None:
+      a, tt0A = hold["addrCalc"], hold["tt0"]
+      prep(X)
+      if __import__("os").environ.get("STAGGER_MARK"):
+        module.add(SNop(waitState=14, comment="STAGGER_MARK=14 staged fold blend"))
+      module.add(VAndB32(dst=vgpr(T), src0=1, src1=vgpr("Serial"), comment="lane parity"))
+      module.add(VCmpEQU32(dst=VCC(), src0=vgpr(T), src1=0, comment="VCC = even lanes"))
+      for k in range(4):
+        rA = self._vPackReg(H, k)
+        rB = self._vPackReg(X, k)
+        module.add(VMovB32(dst=vgpr(T), src=rA, dpp=DPPModifiers(quad_perm=[1,1,3,3]),
+                           comment=f"fold d{k}: save A odd n-cols into even lanes"))
+        module.add(VCndMaskB32(dst=rA, src0=rB, src1=rA, src2=VCC(), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
+                               comment=f"fold d{k}: store1 even<-A odd<-B[0,0,2,2]"))
+        module.add(VCndMaskB32(dst=rB, src0=rB, src1=vgpr(T), src2=VCC(),
+                               comment=f"fold d{k}: store2 even<-A[1,1,3,3] odd<-B"))
+      module.add(VAddU32(dst=vgpr(W), src0=vgpr(addr), src1=hex(64), comment="addr + 64B"))
+      module.add(VMovB32(dst=vgpr(T), src=vgpr(addr), dpp=DPPModifiers(quad_perm=[1,1,3,3]),
+                         comment="fold voff2: addr perm [1,1,3,3]"))
+      module.add(VCndMaskB32(dst=vgpr(T), src0=vgpr(W), src1=vgpr(T), src2=VCC(),
+                             comment="fold voff2: even<-perm addr, odd<-addr+64"))
+      self._stagedStoreNow(module, a, tt0A, forceSlc, X, T, "fold store 2")   # ends unit B
+      # unit S1: nothing but H is carried in, so rebuild the mask and the voffset here.
+      module.add(VAndB32(dst=vgpr(T), src0=1, src1=vgpr("Serial"), comment="lane parity"))
+      module.add(VCmpEQU32(dst=VCC(), src0=vgpr(T), src1=0, comment="VCC = even lanes"))
+      module.add(VMovB32(dst=vgpr(T), src=vgpr(addr), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
+                         comment="fold voff1: addr perm [0,0,2,2]"))
+      module.add(VAddU32(dst=vgpr(T), src0=vgpr(T), src1=hex(64), comment="fold voff1: perm addr + 64B"))
+      module.add(VCndMaskB32(dst=vgpr(T), src0=vgpr(T), src1=vgpr(addr), src2=VCC(),
+                             comment="fold voff1: even<-addr, odd<-perm addr+64"))
+      self._stagedStoreNow(module, a, tt0A, forceSlc, H, T, "fold store 1")
+      states.subtileStagedHold = None
+      return module
+
+    tt0PerStage = getattr(states, "subtileStoreTt0PerStage", 0)
+    lineStart = ((tt0 // 2) % 2 == self._foldLineStartParity()
+                 and tt0PerStage and (tt0 + 3) // tt0PerStage == tt0 // tt0PerStage)
+    if lineStart:
+      prep(H)
+      last = [i for i in module.flatitems() if isinstance(i, VPermlane16SwapB32)][-1]
+      last.comment = (last.comment or "") + " " + self.STAGED_UNIT_CUT
+      states.subtileStagedHold = {"addrCalc": addrCalc, "tt0": tt0, "blockIdxN": blockIdxN,
+                                  "stage": stage, "H": H, "forceSlc": forceSlc}
+      return module
+    # no line partner in this stage: self-contained store on the scratch quad
+    prep(X)
+    self._stagedStoreNow(module, addrCalc, tt0, forceSlc, X, addr, "staged, unfolded")
     return module
 
   def _commitPendingPhase2b(self, pending=None):

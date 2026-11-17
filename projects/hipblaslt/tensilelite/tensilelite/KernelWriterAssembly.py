@@ -16618,6 +16618,7 @@ class KernelWriterAssembly(KernelWriter):
     self.states.subtileStoreStageHighWater = 0
     self.states.subtilePairPackSlot = 0
     self.states.subtilePendingPhase2b = None     # staggered store: buffer_store deferred across batches
+    self.states.subtileStagedHold = None         # staged-store fold: pair A held for its line partner
     self.states.subtileDeferredSrdDIncs = []     # SrdD row advances held behind that store
     self.states.subtileHoistedAddrArm = -1
     self.states.subtileHoistedAddrDVgpr = -1

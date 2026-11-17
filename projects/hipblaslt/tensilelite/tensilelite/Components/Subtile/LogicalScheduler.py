@@ -6089,7 +6089,10 @@ class LogicalScheduler:
         units, cur = [], []
         for item in stage.flatitems():
             cur.append(item)
-            if isinstance(item, (BufferStoreB64, BufferStoreB128)):
+            # Staged fold: a held pair's prep is a unit of its own with no store; the
+            # emitter tags its last instruction.
+            if isinstance(item, (BufferStoreB64, BufferStoreB128)) \
+                    or "[plsin-unit-cut]" in (getattr(item, "comment", "") or ""):
                 units.append(cur)
                 cur = []
         if cur:
