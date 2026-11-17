@@ -5172,10 +5172,14 @@ class LogicalScheduler:
                     writer.states.subtileHoistedStoreInit = None
                     writer.states.subtilePairPackSlot = _packSlot0
                     storeModule = writer.buildSubtileFusedStore(kernel, writer.tPA, writer.tPB)
-                    self._planCapturedTerminalMfmas(
-                        fusedEmitted, writer.states.subtileWeaveCaptureInstances,
-                        storeModule,
-                        int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)))
+                    self._pinToPass1 = True
+                    try:
+                        self._planCapturedTerminalMfmas(
+                            fusedEmitted, writer.states.subtileWeaveCaptureInstances,
+                            storeModule,
+                            int(writer.states.archCaps.get("MfmaToAccReadLatency", 0)))
+                    finally:
+                        self._pinToPass1 = False
                     writer.states.subtileWovenPackPlan = None
                     writer.states.subtileWovenPackPlanAnchorSVV = None
                 elif _leaseMode:
@@ -5499,6 +5503,20 @@ class LogicalScheduler:
         # (the free-list) instead of the dedicated pack ring. Consumed by the caller's
         # second emit pass + _pairPackQuad. Empty unless the env flag is set.
         self._wovenPackPlans = []
+        # Lease two-pass: the pack leases are computed from pass 1's placement
+        # (applyMoves=False). Pass 2 re-emits the store with the leases applied (and, under
+        # STAGGER_FOLD, the fold blends), which changes instruction counts; a free re-plan
+        # could put a reader in a LATER gap than the lease plan assumed and have it read an
+        # operand already leased as a pack quad. So pass 2 is pinned: a producer may only go
+        # to its pass-1 gap or an earlier one (earlier = operand retires sooner = lease still
+        # valid), and a producer pass 1 left in the loop stays there.
+        _pinned = bool(getattr(self, "_pinToPass1", False)) and applyMoves
+        if not applyMoves:
+            self._pass1Placement = {}
+        import re as _rePin
+        def _pairOfGap(_g):
+            _m = _rePin.search(r"pair(\d+)", getattr(_g, "name", "") or "")
+            return int(_m.group(1)) if _m else -1
         self._wovenPackValcPlans = []   # per capture: {pairIdx: ('c', valcBase)} ValuC leases
         for capture in captures:
             consumers = {}
@@ -5569,7 +5587,7 @@ class LogicalScheduler:
             # -- this fallback is exactly where the structural floor shows up: tiles in
             # LATE bands cannot fully cluster because their early-readPos readers are
             # anchored to the early gaps.
-            _band = bool(__import__("os").environ.get("WEAVE_BAND"))
+            _band = bool(__import__("os").environ.get("WEAVE_BAND")) and not _pinned
             # WEAVE_BAND_CAP=N: capacity-limited variant. Uncapped banding piles every
             # late reader of a tile into the band's last gap; the convert-interleave
             # can only isolate 3 MFMAs per gap (4 cvt_pk in two groups), so N=3 keeps
@@ -5597,8 +5615,13 @@ class LogicalScheduler:
                 readPos = consumers[id(producer)]
                 chosen = None
                 chosenBand = None   # banded pick (latest qualifying gap within the tile's band)
+                _pin = self._pass1Placement.get(id(producer)) if _pinned else None
+                if _pinned and _pin is None:
+                    continue
                 for anchorPos, gap in candidates:
                     if anchorPos >= readPos:
+                        continue
+                    if _pin is not None and _pairOfGap(gap) > _pin:
                         continue
                     # Instructions, not cycles: a conservative stand-in, since each issues
                     # in at least one cycle, so N of them span at least N cycles.
@@ -5661,6 +5684,10 @@ class LogicalScheduler:
                             for _p in _groups[_k]:
                                 capturePlan[id(_p)] = _gapObj[_tgt]
                         break
+            if not applyMoves:
+                for _p in qualifying:
+                    if id(_p) in capturePlan:
+                        self._pass1Placement[id(_p)] = _pairOfGap(capturePlan[id(_p)])
             if __import__("os").environ.get("WEAVE_PLACE"):
                 # Ground-truth placement dump for the forward-allocator recreate experiment.
                 # Per producer (allInsts order): index, consumer (store read) position, and
