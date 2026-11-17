@@ -19421,8 +19421,10 @@ class KernelWriterAssembly(KernelWriter):
         # default build is byte-identical.
         pairAddrRing = self.vgprPool.checkOut(1, tag="subtilePairAddrRing") \
                        if (permForRing and os.environ.get("STAGGER_STORE")) else -1
+        # The fold temp does not depend on the stagger: the staged-store and plain-store
+        # folds work without it (only the woven-store fold needs the stagger).
         foldTmp = self.vgprPool.checkOut(1, tag="subtileFoldTmp") \
-                  if (pairAddrRing >= 0 and os.environ.get("STAGGER_FOLD")) else -1
+                  if (permForRing and os.environ.get("STAGGER_FOLD")) else -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
