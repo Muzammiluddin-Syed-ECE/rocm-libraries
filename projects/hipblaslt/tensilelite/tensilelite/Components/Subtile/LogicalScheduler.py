@@ -5117,6 +5117,8 @@ class LogicalScheduler:
             writer.states.subtileWeaveLookahead = 0
             writer.states.subtileWeavePairCounter = 0
             writer.states.subtileWeaveEmitted = set()
+            writer.states.subtilePendingPhase2b = None
+            writer.states.subtileDeferredSrdDIncs = []
             writer.states.subtileWeaveCaptureInstances = [] if weaveGroups is not None else None
             writer.states.subtileWeaveCaptureCurrent = None
             # 4d-3a/3b: build the real beta0/NonEdge D store exactly once, then use
@@ -5163,6 +5165,8 @@ class LogicalScheduler:
                     writer.states.subtileWeaveLookahead = 0
                     writer.states.subtileWeavePairCounter = 0
                     writer.states.subtileWeaveEmitted = set()
+                    writer.states.subtilePendingPhase2b = None
+                    writer.states.subtileDeferredSrdDIncs = []
                     writer.states.subtileWeaveCaptureInstances = [] if weaveGroups is not None else None
                     writer.states.subtileWeaveCaptureCurrent = None
                     writer.states.subtileHoistedStoreInit = None

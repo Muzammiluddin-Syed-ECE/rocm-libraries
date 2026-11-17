@@ -16617,6 +16617,8 @@ class KernelWriterAssembly(KernelWriter):
     self.states.subtileStoreTt0PerStage = 0
     self.states.subtileStoreStageHighWater = 0
     self.states.subtilePairPackSlot = 0
+    self.states.subtilePendingPhase2b = None     # staggered store: buffer_store deferred across batches
+    self.states.subtileDeferredSrdDIncs = []     # SrdD row advances held behind that store
     self.states.subtileHoistedAddrArm = -1
     self.states.subtileHoistedAddrDVgpr = -1
     self.states.subtileHoistedAddrBlockN = -1
@@ -20133,6 +20135,8 @@ class KernelWriterAssembly(KernelWriter):
           self.states.subtileWeaveMfmaGroups = deepcopy(_weaveMaster)
           self.states.subtileWeaveEmitted = set()
           self.states.subtileWeavePairCounter = 0
+          self.states.subtilePendingPhase2b = None
+          self.states.subtileDeferredSrdDIncs = []
         mulAlpha = self.codes.mulAlphaMultipleBuffer if (kernel["_GlobalAccumulation"] == 'MultipleBuffer' or kernel["_GlobalAccumulation"] == 'MultipleBufferSingleKernel') else self.codes.mulAlphaOther
         codeMulAlpha = deepcopy(mulAlpha) if self.states.serializedStore else None
 
