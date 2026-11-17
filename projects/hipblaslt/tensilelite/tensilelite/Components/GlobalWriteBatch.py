@@ -2660,14 +2660,21 @@ class GlobalWriteBatchWriter:
                 storeCodeModule.add(afterPairedLabel)
               else:
                 if _weavePairIdx is not None and self._weaveMfmaGroups() is not None:
-                  # Staggered store: flush the PREVIOUS pair's deferred buffer_store before
-                  # prepping this pair (flush-first). Empty on the fill pair (nothing pending).
-                  if self._staggerStoreActive() and _weavePairIdx >= self._staggerStartPair():
-                    storeCodeModule.add(self._commitPendingPhase2b())
+                  # Staggered store (FLUSH-LAST): emit THIS pair's prep first, then flush the
+                  # PREVIOUS pair's deferred buffer_store AFTER it. The store then reads a quad
+                  # HELD across this pair's prep (cvt+gap+permlane) -- a one-iteration pipeline
+                  # hold, which is both the store/compute overlap AND the held half the fold's
+                  # blend needs. (flush-first -- store before prep -- gave ZERO hold: the store
+                  # sat adjacent to its own permlane, so it read fresh data, not a held quad.)
+                  _staggerThis = self._staggerStoreActive() and _weavePairIdx >= self._staggerStartPair()
+                  _prevPending = getattr(self, "_pendingPhase2b", None) if _staggerThis else None
                   tmpStoreCode = self._emit16bitSubtilePairedStoreWoven(partnerAddrCalc, sumIdx0, sumIdx1, prefixOffset, _weavePairIdx, tt0 - 1, blockIdxM=blockIdxM, blockIdxN=blockIdxN, forceSlc=fusedA2APushPass)
+                  storeCodeModule.add(tmpStoreCode)   # prep(K) + stash self._pendingPhase2b = K
+                  if _prevPending is not None:
+                    storeCodeModule.add(self._commitPendingPhase2b(_prevPending))  # store(K-1) AFTER prep(K)
                 else:
                   tmpStoreCode = self._emit16bitSubtilePairedStore(partnerAddrCalc, sumIdx0, sumIdx1, prefixOffset, tt0 - 1, blockIdxM=blockIdxM, blockIdxN=blockIdxN, forceSlc=fusedA2APushPass)
-                storeCodeModule.add(tmpStoreCode)
+                  storeCodeModule.add(tmpStoreCode)
               if skipLabel is not None:
                 storeCodeModule.add(skipLabel)
               self.storesIssued += 1
@@ -4656,6 +4663,8 @@ class GlobalWriteBatchWriter:
     Only reached on the full-tile permlane16 arm (useAlign8 is False there), so no exec
     mask is involved. WAR s_nop kept defensively (byte-neutral to memory)."""
     module = Module("16bitSubtilePairedStorePhase2b")
+    if __import__("os").environ.get("STAGGER_MARK"):
+      module.add(SNop(waitState=12, comment="STAGGER_MARK=12 Phase2b deferred-store entry"))
     ntd = self._epilogueNtd()
     isGlc = bool(ntd & 0x1)
     isSlc = bool((ntd & 0x2) or forceSlc)
@@ -4912,16 +4921,19 @@ class GlobalWriteBatchWriter:
     self-contained stores; pair T is a prep-only fill run; pairs > T are staggered."""
     return int(__import__("os").environ.get("STAGGER_START", "0") or "0")
 
-  def _commitPendingPhase2b(self):
-    """Flush the deferred buffer_store from the previous staggered pair. Returns the
-    sibling Phase2b Module (or an empty Module on the fill pair / when none pending)
-    and clears the pending state. Emitted OUTSIDE the woven module so the convert
-    interleave (_rewriteOneWovenPair, matched by child-module name) is untouched."""
-    pending = getattr(self, "_pendingPhase2b", None)
+  def _commitPendingPhase2b(self, pending=None):
+    """Flush a deferred buffer_store sibling Phase2b Module (or an empty Module when none).
+    Emitted OUTSIDE the woven module so the convert interleave (_rewriteOneWovenPair, matched
+    by child-module name) is untouched. With no arg, flushes and clears self._pendingPhase2b
+    (used by the drains). With an explicit `pending` (flush-last at the store call site), emits
+    that captured pair's store WITHOUT touching self._pendingPhase2b, which already holds the
+    CURRENT pair's store awaiting the next iteration's flush."""
+    if pending is None:
+      pending = getattr(self, "_pendingPhase2b", None)
+      self._pendingPhase2b = None
     if pending is None:
       return Module("16bitSubtilePairedStorePhase2bEmpty")
     addrCalc, tt0, forceSlc, vPack, vAddrSlot, _pairIdx = pending
-    self._pendingPhase2b = None
     return self._emit16bitSubtilePairedStorePhase2b(addrCalc, tt0=tt0, forceSlc=forceSlc,
                                                     vPackOverride=vPack, vAddrScratchOverride=vAddrSlot)
 
