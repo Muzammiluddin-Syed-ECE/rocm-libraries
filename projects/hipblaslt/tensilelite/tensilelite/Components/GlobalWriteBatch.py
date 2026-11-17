@@ -30,7 +30,7 @@ from rocisa.instruction import BufferAtomicAddF32, BufferAtomicCmpswapB32, \
   BufferAtomicCmpswapB64, BufferStoreB16, BufferStoreB32, BufferStoreB64, BufferStoreB128, \
   DSBPermuteB32, FlatAtomicCmpswapB32, \
   SAddCU32, SAddU32, SAddU64, SAndB32, \
-  SAndB64, SAtomicDec, SAtomicInc, SBarrier, SBitcmp1B32, SBfmB32, SBfmB64, SBranch, SCBranchExecNZ, SCBranchExecZ, \
+  SAndB64, SAtomicDec, SAtomicInc, SBarrier, SBfmB32, SBfmB64, SBranch, SCBranchExecNZ, SCBranchExecZ, \
   SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpGtU32, SCmpKGtU32, SCSelectB32, SCmpEQI32, SCmpEQU32, SCmpGtI32, SCmpLeI32, SCmpLeU32, SMinU32, SEndpgm, \
   SLShiftLeftB32, SLShiftLeftB64, SLShiftRightB32, SLShiftRightB64, SMovB32, SMovB64, SMulHIU32, SMulI32, \
   SNop, SOrB32, SOrB64, SOrSaveExecB32, SOrSaveExecB64, SSleep, SStoreB128, SSubI32, SSubU32, \
@@ -5082,10 +5082,9 @@ class GlobalWriteBatchWriter:
     """Per-wave fold alignment. With 6/10/14/18 MFMA tiles per wave in M a wave is a whole
     number of 128B lines plus a half, so the two waves stacked in M (wave id bit 0) need
     opposite pairings: bit 0 folds pairs (0,1),(2,3), bit 1 folds (1,2),(3,4). Both run
-    the same code, so every pair boundary gets a blend that the wave which must not fold
-    there branches over. STAGGER_FOLD_RT=off keeps the fixed pairing, =masked uses a
-    branch-free blend masked to the identity (slower), =invert folds the wrong pairs
-    (control experiment)."""
+    the same code, so every pair boundary gets a blend that is masked to the identity in
+    the wave that must not fold there. STAGGER_FOLD_RT=off keeps the fixed pairing,
+    =invert folds the wrong pairs (control experiment)."""
     env = __import__("os").environ
     if not env.get("STAGGER_FOLD") or env.get("STAGGER_FOLD_RT") == "off":
       return False
@@ -5122,43 +5121,6 @@ class GlobalWriteBatchWriter:
     if __import__("os").environ.get("STAGGER_FOLD_RT") == "invert":
       c ^= 1
     module = Module("16bitSubtileRuntimeFold")
-    if __import__("os").environ.get("STAGGER_FOLD_RT") != "masked":
-      # Default: branch over the blend in the wave that must not fold here. Measured: the
-      # masked (branch-free) form below fixes the write traffic just as well but runs a
-      # 24-instruction blend at 4 of 5 boundaries, which costs more than it saves; with the
-      # branch each wave executes only its own two blends per column.
-      sT = self._epilogScratchSgpr(1)
-      skip = Label(self.parentWriter.labels.getNameInc("rtfold_skip"), "")
-      module.add(VReadfirstlaneB32(dst=sgpr(sT), src=vgpr("Serial"), comment="lane 0 serial of this wave"))
-      module.add(SBitcmp1B32(src0=sgpr(sT), src1=6, comment="SCC = wave id bit 0 (position in M)"))
-      self._epilogScratchFree(sT)
-      module.add((SCBranchSCC0 if c else SCBranchSCC1)(
-        labelName=skip.getLabelName(), comment="this wave's line does not start at pair A: no fold here"))
-      if __import__("os").environ.get("STAGGER_MARK"):
-        module.add(SNop(waitState=15, comment="STAGGER_MARK=15 runtime per-wave fold blend (taken)"))
-      module.add(VAndB32(dst=vgpr(T), src0=1, src1=vgpr("Serial"), comment="lane parity"))
-      module.add(VCmpEQU32(dst=VCC(), src0=vgpr(T), src1=0, comment="VCC = even lanes"))
-      for k in range(4):
-        rA = self._vPackReg(qA, k)
-        rB = self._vPackReg(qB, k)
-        module.add(VMovB32(dst=vgpr(T), src=rA, dpp=DPPModifiers(quad_perm=[1,1,3,3]),
-                           comment=f"rt fold d{k}: A odd n-cols into even lanes"))
-        module.add(VCndMaskB32(dst=rA, src0=rB, src1=rA, src2=VCC(), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
-                               comment=f"rt fold d{k}: A <- even A, odd B[0,0,2,2] tt0={tt0A}"))
-        module.add(VCndMaskB32(dst=rB, src0=rB, src1=vgpr(T), src2=VCC(),
-                               comment=f"rt fold d{k}: B <- even A[1,1,3,3], odd B tt0={tt0B}"))
-      module.add(VMovB32(dst=vgpr(T), src=vgpr(aB), dpp=DPPModifiers(quad_perm=[1,1,3,3]),
-                         comment="rt fold slot B: next column's address+64"))
-      module.add(VSubU32(dst=vgpr(T), src0=vgpr(T), src1=hex(64), comment="rt fold slot B: -64 (>= 0)"))
-      module.add(VCndMaskB32(dst=vgpr(aB), src0=vgpr(aB), src1=vgpr(T), src2=VCC(),
-                             comment="rt fold slot B: even <- next column's address"))
-      module.add(VMovB32(dst=vgpr(T), src=vgpr(aA), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
-                         comment="rt fold slot A: previous column's address"))
-      module.add(VAddU32(dst=vgpr(T), src0=vgpr(T), src1=hex(64), comment="rt fold slot A: +64"))
-      module.add(VCndMaskB32(dst=vgpr(aA), src0=vgpr(T), src1=vgpr(aA), src2=VCC(),
-                             comment="rt fold slot A: odd <- previous column's address+64"))
-      module.add(skip)
-      return module
     if __import__("os").environ.get("STAGGER_MARK"):
       module.add(SNop(waitState=15, comment="STAGGER_MARK=15 runtime per-wave fold blend"))
     mS = self._epilogScratchSgpr(self.laneSGPRC)
