@@ -5570,6 +5570,11 @@ class LogicalScheduler:
             # LATE bands cannot fully cluster because their early-readPos readers are
             # anchored to the early gaps.
             _band = bool(__import__("os").environ.get("WEAVE_BAND"))
+            # WEAVE_BAND_CAP=N: capacity-limited variant. Uncapped banding piles every
+            # late reader of a tile into the band's last gap; the convert-interleave
+            # can only isolate 3 MFMAs per gap (4 cvt_pk in two groups), so N=3 keeps
+            # every MFMA separated while still retiring tiles early.
+            _bandCap = int(__import__("os").environ.get("WEAVE_BAND_CAP", "0") or 0) if _band else 0
             _bandOf = {}   # pairIdx -> band index; _tileBand: Abase -> band index
             if _band:
                 def _aBaseP(_p):
@@ -5603,7 +5608,7 @@ class LogicalScheduler:
                         chosen = gap
                         if _reorderAsap:
                             break
-                        if _band:
+                        if _band and not _bandCap:
                             _b = _tileBand.get(_aBaseP(producer))
                             if _b is not None and _pairOfB(gap) in set(_bandPairs.get(_b, ())):
                                 chosenBand = gap   # latest qualifying gap inside the band
@@ -5611,6 +5616,51 @@ class LogicalScheduler:
                     chosen = chosenBand
                 if chosen is not None:
                     capturePlan[id(producer)] = chosen
+            if _bandCap:
+                # Start from ALAP, then per tile (Abase ascending) find the first gap G at or
+                # after its band end by which all its readers fit under the cap, and move its later
+                # readers into the latest free slots <= G. Any earlier gap than the ALAP
+                # one qualifies (more MFMA->read separation). Producers sharing a readPos
+                # share an accumulator and move together.
+                _gapIdx = {id(g): i for i, (_, g) in enumerate(candidates)}
+                _gapObj = [g for _, g in candidates]
+                _placed = [p for p in qualifying if id(p) in capturePlan]
+                _load = {}
+                for _p in _placed:
+                    _gi = _gapIdx[id(capturePlan[id(_p)])]
+                    _load[_gi] = _load.get(_gi, 0) + 1
+                _groups = {}
+                for _p in _placed:
+                    _groups.setdefault(consumers[id(_p)], []).append(_p)
+                def _cur(_k):
+                    return _gapIdx[id(capturePlan[id(_groups[_k][0])])]
+                for _t in _tiles:
+                    _keys = sorted({consumers[id(_p)] for _p in _placed if _aBaseP(_p) == _t})
+                    # Aim for the tile's band end, not earlier: pulling further forward
+                    # than the band needs starves the late stores of MFMAs.
+                    _bandEnd = max((_gapIdx[id(g)] for _, g in candidates
+                                    if _pairOfB(g) in set(_bandPairs.get(_tileBand[_t], ()))),
+                                   default=0)
+                    for _G in range(_bandEnd, len(_gapObj)):
+                        _free = {g: _bandCap - _load.get(g, 0) for g in range(_G + 1)}
+                        _assign = {}
+                        for _k in sorted((k for k in _keys if _cur(k) > _G), reverse=True):
+                            _n = len(_groups[_k])
+                            _tgt = next((g for g in range(_G, -1, -1) if _free[g] >= _n), None)
+                            if _tgt is None:
+                                _assign = None
+                                break
+                            _free[_tgt] -= _n
+                            _assign[_k] = _tgt
+                        if _assign is None:
+                            continue
+                        for _k, _tgt in _assign.items():
+                            _n = len(_groups[_k])
+                            _load[_cur(_k)] -= _n
+                            _load[_tgt] = _load.get(_tgt, 0) + _n
+                            for _p in _groups[_k]:
+                                capturePlan[id(_p)] = _gapObj[_tgt]
+                        break
             if __import__("os").environ.get("WEAVE_PLACE"):
                 # Ground-truth placement dump for the forward-allocator recreate experiment.
                 # Per producer (allInsts order): index, consumer (store read) position, and
