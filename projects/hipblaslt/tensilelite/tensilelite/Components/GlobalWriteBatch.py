@@ -35,7 +35,8 @@ from rocisa.instruction import BufferAtomicAddF32, BufferAtomicCmpswapB32, \
   SLShiftLeftB32, SLShiftLeftB64, SLShiftRightB32, SLShiftRightB64, SMovB32, SMovB64, SMulHIU32, SMulI32, \
   SNop, SOrB32, SOrB64, SOrSaveExecB32, SOrSaveExecB64, SSleep, SStoreB128, SSubI32, SSubU32, \
   SSwapPCB64, SWaitCnt, SWaitAlu, VAShiftRightI32, VAddCCOU32, VAddCOU32, VAddF32, VAddF64, \
-  VAddI32, VAddPKF16, VAddPKF32, VAddU32, VBfeI32, VCmpEQU32, VCmpGEI32, VCmpGtU32, \
+  VAddI32, VAddPKF16, VAddPKF32, VAddU32, VBfeI32, VBfeU32, VCmpEQU32, VCmpGEI32, VCmpGtU32, VCmpLeU32, \
+  VOrB32, VXorB32, VSubU32, \
   VCmpNeU32, VCmpNeU64, VCndMaskB32, VCvtBF8toF32, VCvtF16toF32, VCvtF32toF16, VCvtF32toI32, \
   VCvtFP8toF32, VCvtI32toF32, VCvtPkBF8toF32, VCvtPkF32toBF16, VCvtPkF32toFP16, VCvtPkFP8toF32, \
   VFmaF32, VFmaF64, VFmaPKF32, VFmaMixF32, VAndB32, VLShiftLeftB32, VPermlane16SwapB32, VPermlane32SwapB32, \
@@ -2673,7 +2674,12 @@ class GlobalWriteBatchWriter:
                     _prevPending = None
                   tmpStoreCode = self._emit16bitSubtilePairedStoreWoven(partnerAddrCalc, sumIdx0, sumIdx1, prefixOffset, _weavePairIdx, tt0 - 1, blockIdxM=blockIdxM, blockIdxN=blockIdxN, forceSlc=fusedA2APushPass)
                   storeCodeModule.add(tmpStoreCode)   # prep(K); pending := K
-                  if _prevPending is not None and self._foldPartners(_prevPending, self._pendingPhase2b):
+                  if _prevPending is not None and self._foldPartnersRT(_prevPending, self._pendingPhase2b):
+                    # Runtime per-wave fold: blend that is the identity in the wave that must
+                    # not fold here, then the plain staggered store of K-1.
+                    storeCodeModule.add(self._emitRuntimeFoldBlend(_prevPending, self._pendingPhase2b))
+                    storeCodeModule.add(self._commitPendingPhase2b(_prevPending))
+                  elif _prevPending is not None and self._foldPartners(_prevPending, self._pendingPhase2b):
                     # Fold: blend K-1 and K in place, store 1 now, store 2 stays pending.
                     storeCodeModule.add(self._emitStaggerFold(_prevPending, self._pendingPhase2b))
                   elif _prevPending is not None:
@@ -4395,9 +4401,15 @@ class GlobalWriteBatchWriter:
         f"STAGGER_STORE={bool(__import__('os').environ.get('STAGGER_STORE'))}\n")
     vPack = self._pairPackQuad(pairIdx)
     vAddrSlot = self._pairAddrSlot(pairIdx) if staggered else None
+    # Runtime per-wave fold (wave tiles with 6/10/14/18 MFMA tiles in M): every pair after the
+    # first of its column stores from "address + 64" with the MUBUF offset of the pair before
+    # it, so the same store instruction is right whether this pair ends up plain, the first
+    # half of a fold or the second half (only the address slot's contents differ).
+    _rt = staggered and self._foldRuntimeMode()
+    _rtBias = 64 if (_rt and tt0 >= 2) else 0
     phase1 = self._emit16bitSubtilePairedStorePhase1(
       addrCalc, sumIdx0, sumIdx1, prefixOffset, tt0=tt0, blockIdxM=blockIdxM, blockIdxN=blockIdxN,
-      vPackOverride=vPack, vAddrScratchOverride=vAddrSlot)
+      vPackOverride=vPack, vAddrScratchOverride=vAddrSlot, addrBias=_rtBias)
     module.add(phase1)
     gap = Module(f"PlsinGap_pair{pairIdx}")
     self._weaveEmitGroup(gap, pairIdx + self._weaveLookahead())
@@ -4413,15 +4425,20 @@ class GlobalWriteBatchWriter:
       # (flushed by _commitPendingPhase2b at the call site) -- this is the one-iteration hold.
       module.add(self._emit16bitSubtilePairedStorePhase2(addrCalc, tt0=tt0, forceSlc=forceSlc,
                                                          vPackOverride=vPack, emitStore=False))
-      self._pendingPhase2b = (addrCalc, tt0, forceSlc, vPack, vAddrSlot, pairIdx,
-                              {"blockIdxN": blockIdxN, "folded": False})
+      _meta = {"blockIdxN": blockIdxN, "folded": False}
+      if _rt:
+        _off = addrCalc.globalOffset * self.parentWriter.states.bpeCexternalGSU1 // self.parentWriter.states.bpeCexternal
+        assert _off - _rtBias >= 0, "runtime fold: negative store offset"
+        _meta.update(rt=True, imm=_off - _rtBias,
+                     scratch="ValuC+" + str(sumIdx1 - prefixOffset))
+      self._pendingPhase2b = (addrCalc, tt0, forceSlc, vPack, vAddrSlot, pairIdx, _meta)
     else:
       module.add(self._emit16bitSubtilePairedStorePhase2(addrCalc, tt0=tt0, forceSlc=forceSlc,
                                                          vPackOverride=vPack))
     self._advancePairPackQuad()
     return module
 
-  def _emit16bitSubtilePairedStorePhase1(self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, interior: bool = False, vPackOverride=None, vAddrScratchOverride=None) -> Module:
+  def _emit16bitSubtilePairedStorePhase1(self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int, tt0: int = 0, blockIdxM: int = 0, blockIdxN: int = 0, interior: bool = False, vPackOverride=None, vAddrScratchOverride=None, addrBias: int = 0) -> Module:
     """Phase 1 (issue) of the paired dwordx4 store — see _emit16bitSubtilePairedStore.
 
     Emits, with NO s_barrier and NO buffer_store:
@@ -4545,6 +4562,10 @@ class GlobalWriteBatchWriter:
     else:
       module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(addrDVgpr), src1=vgpr(vRowDelta),
                          comment=f"adjusted D addr = addrDVgpr + {deltaStr}"))
+    if addrBias:
+      assert vAddrScratchOverride is not None and not addrAlreadyLive
+      module.add(VAddU32(dst=vgpr(vAddrScratch), src0=vgpr(vAddrScratch), src1=hex(addrBias),
+                         comment=f"runtime fold: address + {addrBias}B (store offset is the previous pair's)"))
     if hoistAddr:
       self.parentWriter.states.subtileHoistedAddrArm = self.parentWriter.states.subtileStoreArmId
       self.parentWriter.states.subtileHoistedAddrDVgpr = addrDVgpr
@@ -4666,7 +4687,8 @@ class GlobalWriteBatchWriter:
     return module
 
   def _emit16bitSubtilePairedStorePhase2b(self, addrCalc, tt0: int = 0, forceSlc: bool = False,
-                                          vPackOverride=None, vAddrScratchOverride=None) -> Module:
+                                          vPackOverride=None, vAddrScratchOverride=None,
+                                          offsetOverride=None) -> Module:
     """Phase2b (STAGGERED store only): the deferred buffer_store_dwordx4 split off from
     Phase2. Emitted as a SIBLING module named "16bitSubtilePairedStorePhase2b" (outside
     the woven module) so the convert-interleave is untouched. Consumes the fully-permlaned
@@ -4685,6 +4707,8 @@ class GlobalWriteBatchWriter:
     bpeCurr = self.parentWriter.states.bpeCexternal
     bpeDest = self.parentWriter.states.bpeCexternalGSU1
     globalOffset = addrCalc.globalOffset * bpeDest // bpeCurr
+    if offsetOverride is not None:
+      globalOffset = offsetOverride
     module.addComment1("buffer_store_dwordx4 (deferred): write 8 16bit values (4 dwords, 2-aligned src)")
     _soff, _soffTmp = self._subtileStoreSoffset(module, addrCalc)
     if __import__("os").environ.get("STAGGER_CANARY"):
@@ -4986,6 +5010,8 @@ class GlobalWriteBatchWriter:
     Anything else keeps the plain deferred store."""
     if not __import__("os").environ.get("STAGGER_FOLD") or pendA is None or pendB is None:
       return False
+    if self._foldRuntimeMode():
+      return False
     addrA, tt0A, _fA, qA, aA, idxA, metaA = pendA
     addrB, tt0B, _fB, qB, aB, idxB, metaB = pendB
     if metaA["folded"] or self.cvtVgprStruct.vgprFoldTmp < 0:
@@ -5050,6 +5076,82 @@ class GlobalWriteBatchWriter:
     # store 2 = quad B / slot B, still at A's offset and soffset: pending.
     self._pendingPhase2b = (addrA, tt0A, forceSlc, qB, aB, idxB,
                             {"blockIdxN": metaB["blockIdxN"], "folded": True})
+    return module
+
+  def _foldRuntimeMode(self) -> bool:
+    """Per-wave fold alignment. With 6/10/14/18 MFMA tiles per wave in M a wave is a whole
+    number of 128B lines plus a half, so the two waves stacked in M (wave id bit 0) need
+    opposite pairings: bit 0 folds pairs (0,1),(2,3), bit 1 folds (1,2),(3,4). Both run
+    the same code, so every pair boundary gets a blend that is masked to the identity in
+    the wave that must not fold there. STAGGER_FOLD_RT=off keeps the fixed pairing,
+    =invert folds the wrong pairs (control experiment)."""
+    env = __import__("os").environ
+    if not env.get("STAGGER_FOLD") or env.get("STAGGER_FOLD_RT") == "off":
+      return False
+    miwt = self.kernel.get("MIWaveTile") or [0]
+    return (miwt[0] % 4 == 2 and miwt[0] >= 6
+            and getattr(self.cvtVgprStruct, "vgprFoldTmp", -1) >= 0)
+
+  def _foldPartnersRT(self, pendA, pendB) -> bool:
+    if pendA is None or pendB is None or not self._foldRuntimeMode():
+      return False
+    addrA, tt0A, _fA, qA, aA, idxA, metaA = pendA
+    addrB, tt0B, _fB, qB, aB, idxB, metaB = pendB
+    if not metaA.get("rt") or not metaB.get("rt"):
+      return False
+    if tt0B != tt0A + 2 or idxB != idxA + 1 or metaA["blockIdxN"] != metaB["blockIdxN"]:
+      return False
+    if addrA.addrDVgpr != addrB.addrDVgpr or self._deferredSrdDIncs():
+      return False
+    return isinstance(qA, int) and isinstance(qB, int) and abs(qA - qB) >= 4 and aA != aB
+
+  def _emitRuntimeFoldBlend(self, pendA, pendB) -> Module:
+    """Blend of pairs A (held) and B (fresh) that folds only in the wave whose line starts
+    at A, and leaves both quads and both address slots untouched in the other wave.
+      VCC = even lanes when folding, every lane when skipping   (selects "keep A")
+      S   = even lanes when folding, no lane when skipping      (selects "take A's shifted copy")
+    Folding result is _emitStaggerFold's: quad A / slot A = store of the even n-columns,
+    quad B / slot B = store of the odd n-columns. The stores themselves are the ordinary
+    staggered ones; slots start at address+64 for every pair but the first of a column."""
+    _addrA, tt0A, _f, qA, aA, _idxA, _metaA = pendA
+    _addrB, tt0B, _fB, qB, aB, _idxB, metaB = pendB
+    T = self.cvtVgprStruct.vgprFoldTmp
+    W = metaB["scratch"]                    # dead ValuC register of pair B
+    c = (tt0A // 2) & 1
+    if __import__("os").environ.get("STAGGER_FOLD_RT") == "invert":
+      c ^= 1
+    module = Module("16bitSubtileRuntimeFold")
+    if __import__("os").environ.get("STAGGER_MARK"):
+      module.add(SNop(waitState=15, comment="STAGGER_MARK=15 runtime per-wave fold blend"))
+    mS = self._epilogScratchSgpr(self.laneSGPRC)
+    S = sgpr(mS, self.laneSGPRC)
+    module.add(VBfeU32(dst=vgpr(W), src0=vgpr("Serial"), src1=6, src2=1, comment="wave id bit 0 = position in M"))
+    if c:
+      module.add(VXorB32(dst=vgpr(W), src0=1, src1=vgpr(W), comment="0 where this wave folds at this boundary"))
+    module.add(VAndB32(dst=vgpr(T), src0=1, src1=vgpr("Serial"), comment="lane parity"))
+    module.add(VCmpLeU32(dst=VCC(), src0=vgpr(T), src1=vgpr(W), comment="VCC = even lanes | skip"))
+    module.add(VOrB32(dst=vgpr(W), src0=vgpr(T), src1=vgpr(W)))
+    module.add(VCmpEQU32(dst=S, src0=vgpr(W), src1=0, comment="S = even lanes & fold"))
+    for k in range(4):
+      rA = self._vPackReg(qA, k)
+      rB = self._vPackReg(qB, k)
+      module.add(VMovB32(dst=vgpr(T), src=rA, dpp=DPPModifiers(quad_perm=[1,1,3,3]),
+                         comment=f"rt fold d{k}: A odd n-cols into even lanes"))
+      module.add(VCndMaskB32(dst=rA, src0=rB, src1=rA, src2=VCC(), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
+                             comment=f"rt fold d{k}: A <- even A, odd B[0,0,2,2] (skip: A) tt0={tt0A}"))
+      module.add(VCndMaskB32(dst=rB, src0=rB, src1=vgpr(T), src2=S,
+                             comment=f"rt fold d{k}: B <- even A[1,1,3,3], odd B (skip: B) tt0={tt0B}"))
+    module.add(VMovB32(dst=vgpr(T), src=vgpr(aB), dpp=DPPModifiers(quad_perm=[1,1,3,3]),
+                       comment="rt fold slot B: next column's address+64"))
+    module.add(VSubU32(dst=vgpr(T), src0=vgpr(T), src1=hex(64), comment="rt fold slot B: -64 (>= 0)"))
+    module.add(VCndMaskB32(dst=vgpr(aB), src0=vgpr(aB), src1=vgpr(T), src2=S,
+                           comment="rt fold slot B: even <- next column's address (skip: unchanged)"))
+    module.add(VMovB32(dst=vgpr(T), src=vgpr(aA), dpp=DPPModifiers(quad_perm=[0,0,2,2]),
+                       comment="rt fold slot A: previous column's address"))
+    module.add(VAddU32(dst=vgpr(T), src0=vgpr(T), src1=hex(64), comment="rt fold slot A: +64"))
+    module.add(VCndMaskB32(dst=vgpr(aA), src0=vgpr(T), src1=vgpr(aA), src2=VCC(),
+                           comment="rt fold slot A: odd <- previous column's address+64 (skip: unchanged)"))
+    self._epilogScratchFree(mS)
     return module
 
   STAGED_UNIT_CUT = "[plsin-unit-cut]"
@@ -5193,7 +5295,8 @@ class GlobalWriteBatchWriter:
     addrCalc, tt0, forceSlc, vPack, vAddrSlot, _pairIdx, _meta = pending
     module = Module("16bitSubtilePairedStorePhase2bCommit")
     module.add(self._emit16bitSubtilePairedStorePhase2b(addrCalc, tt0=tt0, forceSlc=forceSlc,
-                                                        vPackOverride=vPack, vAddrScratchOverride=vAddrSlot))
+                                                        vPackOverride=vPack, vAddrScratchOverride=vAddrSlot,
+                                                        offsetOverride=_meta.get("imm")))
     incs = self._deferredSrdDIncs()
     for inc in incs:
       module.add(inc)
