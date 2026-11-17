@@ -18681,6 +18681,7 @@ class KernelWriterAssembly(KernelWriter):
     vgprAddrScratch: int = -1     # per-store scratch: holds (addrDVgpr scaled + lane_group*8) without modifying addrDVgpr
     vgprPairPackRing: int = -1    # base of the paired-store pack ring (numPairPackQuads 4-vgpr quads)
     numPairPackQuads: int = 1     # quads in that ring; 1 puts every paired store on vgprBf16Temp
+    vgprFoldTmp: int = -1         # one scratch vgpr for the staggered-store DPP fold blend (STAGGER_FOLD)
     vgprPairAddrRing: int = -1    # base of the paired-store ADDRESS ring (numPairPackQuads-1 single vgprs);
                                   # -1 => every store uses vgprAddrScratch (slot 0). Only allocated under
                                   # the staggered store (STAGGER_STORE), where a deferred buffer_store needs
@@ -19359,6 +19360,7 @@ class KernelWriterAssembly(KernelWriter):
       cvtVgpr        = None
       pairRing       = -1
       pairAddrRing   = -1
+      foldTmp        = -1
       # No hoisted lane math until emitSubtileStoreLaneMath below says otherwise; a
       # stale True would make batches skip a computation that never ran.
       self.states.subtileHoistedLaneGroupDelta = False
@@ -19418,6 +19420,8 @@ class KernelWriterAssembly(KernelWriter):
         # default build is byte-identical.
         pairAddrRing = self.vgprPool.checkOut(1, tag="subtilePairAddrRing") \
                        if (permForRing and os.environ.get("STAGGER_STORE")) else -1
+        foldTmp = self.vgprPool.checkOut(1, tag="subtileFoldTmp") \
+                  if (pairAddrRing >= 0 and os.environ.get("STAGGER_FOLD")) else -1
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
                                                vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
                                                vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
@@ -19425,7 +19429,8 @@ class KernelWriterAssembly(KernelWriter):
                                                vgprAddrScratch=(cvtVgpr+6) if kernel.get("UseSubtileImpl") else -1, \
                                                vgprPairPackRing=pairRing, \
                                                numPairPackQuads=pairQuads, \
-                                               vgprPairAddrRing=pairAddrRing)
+                                               vgprPairAddrRing=pairAddrRing, \
+                                               vgprFoldTmp=foldTmp)
         module.add(self.emitSubtileStoreLaneMath(kernel, cvtVgprStruct))
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4, tag="globalWriteElements_cvtVgpr2")
@@ -19739,6 +19744,8 @@ class KernelWriterAssembly(KernelWriter):
           self.vgprPool.checkIn(pairRing)
         if pairAddrRing >= 0:
           self.vgprPool.checkIn(pairAddrRing)
+        if foldTmp >= 0:
+          self.vgprPool.checkIn(foldTmp)
       # The hoisted values die with the cvtVgpr block.
       self.states.subtileHoistedLaneGroupDelta = False
       self.states.subtileHoistedPermAddr = False
