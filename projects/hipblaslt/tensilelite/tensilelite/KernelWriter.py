@@ -26,6 +26,9 @@ from .ExecutionPolicy import isStreamKSpatialCluster, isPersistent, isPersistent
 from rocisa import rocIsa, countInstruction, countGlobalRead, \
             countLocalRead, countLocalWrite, countWeightedLocalRead, countWeightedLocalWrite, countMFMA, getMFMAs
 from rocisa.instruction import SBitcmp1B32
+from rocisa.instruction import SAndB64, SAndSaveExecB32, SAndSaveExecB64, SOrSaveExecB32, \
+  SOrSaveExecB64, VCmpXEqU32, VCmpXGeU32, VCmpXGtU32, VCmpXInstruction, VCmpXLeU32, \
+  VCmpXLtI32, VCmpXLtU32, VCmpXNeU16, VCmpXNeU32
 
 from rocisa.code import Module, TextBlock, StructuredModule, KernelBody, RegSet
 from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, MemTokenData, sgpr, vgpr
