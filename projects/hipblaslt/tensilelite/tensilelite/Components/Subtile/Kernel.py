@@ -1365,21 +1365,25 @@ def _emitDualPeriodTailScaleSrdAlignment(kernel, unrollIdx, scaleTiA, scaleTiB):
   schedule keeps scale loads two epochs ahead: each load advances the scale
   SRD by one epoch, shrinks Srd+2 by the same amount, and flips the LDS write
   half.  With L complete data-DUs the tail computes DU L, which lives in epoch
-  L//2, phase L%2.  At tail entry the LDS read half already holds epoch L//2,
-  prefetched by the mainloop (or the preloop when L <= 1).
+  L//2, phase L%2.  The tail's own scale load is what puts that epoch in the
+  half the tail reads, unless the loop already left it there.
 
-  Odd L: the SRDs name epoch (L+1)//2 and the write half equals the read
-  half.  Rewind one scale increment (restoring its num_records window) so the
-  tail's load refetches epoch L//2 into the half it reads -- the same bytes
-  already there.  The tail MFMAs encode phase 0, so emit_mask_k shifts each
-  scale dword down one phase on this path to select DU L.
+  Odd L: the SRDs name epoch L//2 + 1 and the write half equals the read
+  half.  That half holds epoch L//2 + 1, prefetched past K, or nothing at all
+  when this workgroup ran a single DepthU (its one preloop epoch went to the
+  other half).  Rewind one scale increment, restoring its num_records window,
+  so the tail's load replaces it with epoch L//2.  The tail MFMAs encode
+  phase 0, so emit_mask_k shifts each scale dword down one phase on this path
+  to select DU L.
 
-  Even L: the SRDs name epoch L//2 + 1, which lies past K, and the write half
-  is the one the tail does not read.  The tail's own scale load is therefore
-  dead: it lands outside the read half, and the tail consumes the prefetched
-  epoch L//2 at phase 0.  Nothing is rewound.  This holds only while the
-  two-epoch lead and the write-half flip do; the tail-scale semantic test
-  pins it.
+  Even L: nothing is rewound.  When this workgroup ran no full DepthU (K <
+  DepthU, or a StreamK workgroup that owns only the tail), the SRDs still
+  name epoch L//2 and the tail's load fills the half it reads.  Otherwise the
+  loop left epoch L//2 in the read half, the SRDs name the next epoch, and the
+  tail's load lands in the half the tail does not read.
+
+  test_every_mfma_reads_the_scales_of_its_depthu pins every one of these
+  cases.
 
   The completed-DepthU parity is bit log2(DepthU) of global K.  The tail is
   the final global K interval under both data-parallel and StreamK execution,
