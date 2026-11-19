@@ -1359,20 +1359,32 @@ def _emitMultiDUTailSrdRewind(writer, kernel, numUnroll, tiA, tiB, scaleTiA, sca
 
 
 def _emitDualPeriodTailScaleSrdAlignment(kernel, unrollIdx, scaleTiA, scaleTiB):
-  """Align dual-period scale SRDs with the residual data-DU.
+  """Point the tail's own scale load at the right epoch on odd DU counts.
 
-  A dual-period scale epoch spans two data DepthU iterations.  Its PGR2
-  prefetch advances each scale SRD at the start of the epoch and shrinks
-  Srd+2 by the same amount.  Consequently, a residual tail after an odd
-  number of complete data-DUs still belongs to the previous scale epoch,
-  while the scale SRDs already name the next epoch.  Rewind one scale
-  increment and restore its num_records window in that case.  After an even
-  number of complete data-DUs the residual starts a new epoch and the SRDs
-  are already aligned.
+  A dual-period scale epoch spans two data DepthU iterations, and the PGR2
+  schedule keeps scale loads two epochs ahead: each load advances the scale
+  SRD by one epoch, shrinks Srd+2 by the same amount, and flips the LDS write
+  half.  With L complete data-DUs the tail computes DU L, which lives in epoch
+  L//2, phase L%2.  At tail entry the LDS read half already holds epoch L//2,
+  prefetched by the mainloop (or the preloop when L <= 1).
+
+  Odd L: the SRDs name epoch (L+1)//2 and the write half equals the read
+  half.  Rewind one scale increment (restoring its num_records window) so the
+  tail's load refetches epoch L//2 into the half it reads -- the same bytes
+  already there.  The tail MFMAs encode phase 0, so emit_mask_k shifts each
+  scale dword down one phase on this path to select DU L.
+
+  Even L: the SRDs name epoch L//2 + 1, which lies past K, and the write half
+  is the one the tail does not read.  The tail's own scale load is therefore
+  dead: it lands outside the read half, and the tail consumes the prefetched
+  epoch L//2 at phase 0.  Nothing is rewound.  This holds only while the
+  two-epoch lead and the write-half flip do; the tail-scale semantic test
+  pins it.
 
   The completed-DepthU parity is bit log2(DepthU) of global K.  The tail is
   the final global K interval under both data-parallel and StreamK execution,
-  so global K is the authoritative phase source.
+  and StreamK starts every workgroup on a whole epoch (skKGranularity), so
+  global K parity equals the parity of this workgroup's DU count.
   """
   assert kernel["DepthU"] > 0 and \
       kernel["DepthU"] & (kernel["DepthU"] - 1) == 0, \
@@ -1387,7 +1399,7 @@ def _emitDualPeriodTailScaleSrdAlignment(kernel, unrollIdx, scaleTiA, scaleTiB):
       comment="dual-period tail: test completed-DepthU parity for scale SRDs"))
   module.add(SCBranchSCC0(
       labelName=aligned.getLabelName(),
-      comment="even completed DepthU count: scale SRDs already aligned"))
+      comment="even completed DepthU count: tail reads the prefetched epoch, no rewind"))
 
   for tc, ti in (("MXSA", scaleTiA), ("MXSB", scaleTiB)):
     if ti is None:
